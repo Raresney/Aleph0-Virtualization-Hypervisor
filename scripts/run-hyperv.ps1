@@ -20,13 +20,19 @@
 .PARAMETER NoSerial
     Do not stream COM1 output after starting the VM. COM1 is still attached,
     so read-serial.ps1 can connect later.
+
+.PARAMETER InjectNmi
+    Gives the VM one vCPU and, as soon as serial shows the guest resumed
+    after its first VMCALL, injects an NMI with Debug-VM. Tests NMI exiting
+    and reinjection; the result appears on serial.
 #>
 param(
     [string]$VMName   = "Aleph0Test",
     [int]$MemoryMB    = 2048,
     [switch]$Release,
     [string]$PipeName = "aleph0-com1",
-    [switch]$NoSerial
+    [switch]$NoSerial,
+    [switch]$InjectNmi
 )
 
 # See run.ps1 for why $ErrorActionPreference is not set to "Stop" globally.
@@ -122,7 +128,10 @@ try {
     Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMHardDiskDrive -VMName $VMName) -ErrorAction Stop
     # Nested virtualization requires static memory.
     Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $false -StartupBytes ($MemoryMB * 1MB) -ErrorAction Stop
-    Set-VMProcessor -VMName $VMName -Count 2 -ExposeVirtualizationExtensions $true -ErrorAction Stop
+    # One vCPU for -InjectNmi: Debug-VM may deliver the NMI to any vCPU, and
+    # only the one running Aleph0's guest turns it into a VM exit.
+    $cpuCount = if ($InjectNmi) { 1 } else { 2 }
+    Set-VMProcessor -VMName $VMName -Count $cpuCount -ExposeVirtualizationExtensions $true -ErrorAction Stop
     # COM1 -> named pipe. Gen 2 VMs have no COM ports in the UI; this is the
     # only way to attach one. The hypervisor's serial logger writes here.
     Set-VMComPort -VMName $VMName -Number 1 -Path "\\.\pipe\$PipeName" -ErrorAction Stop
@@ -132,12 +141,42 @@ try {
 }
 
 # 5. Boot it and open the console (uefi::println writes to ConOut, i.e. the video console)
+# A log left over from the previous run must not trigger the NMI job below.
+$serialLog = Join-Path $runDir "serial.log"
+Remove-Item -Force -ErrorAction SilentlyContinue $serialLog
+
 Write-Host "==> Starting $VMName" -ForegroundColor Cyan
 Start-VM -Name $VMName
 vmconnect.exe localhost $VMName
+
+# 5b. With -InjectNmi, a background job waits until the guest has resumed
+#     after its first VMCALL (it then sits in its wait loop) and injects one
+#     NMI. read-serial.ps1 below writes the log the job watches.
+$nmiJob = $null
+if ($InjectNmi) {
+    Write-Host "==> NMI injection armed: waiting for 'resuming the guest' on serial" -ForegroundColor Cyan
+    $nmiJob = Start-Job -ArgumentList $VMName, $serialLog -ScriptBlock {
+        param($vmName, $logPath)
+        $deadline = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $deadline) {
+            if ((Test-Path $logPath) -and (Select-String -Path $logPath -SimpleMatch 'resuming the guest' -Quiet)) {
+                Debug-VM -Name $vmName -InjectNonMaskableInterrupt -Force -ErrorAction Stop
+                return "NMI injected into $vmName at $(Get-Date -Format 'HH:mm:ss.fff')."
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        return "No 'resuming the guest' line within 120 s; no NMI injected."
+    }
+}
 
 # 6. Stream COM1. Connect immediately: Hyper-V drops serial output written
 #    while no client is attached, and the firmware reaches our code in seconds.
 if (-not $NoSerial) {
     & (Join-Path $PSScriptRoot "read-serial.ps1") -PipeName $PipeName
+}
+
+if ($nmiJob) {
+    Receive-Job -Job $nmiJob -Wait -AutoRemoveJob | ForEach-Object {
+        Write-Host "==> $_" -ForegroundColor Cyan
+    }
 }
