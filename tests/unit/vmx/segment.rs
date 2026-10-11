@@ -91,3 +91,12 @@ fn read_descriptor_ignores_rpl() {
     assert_eq!(unsafe { read_descriptor(&gdt, 0x10) }, Some(FLAT_DATA));
     assert_eq!(unsafe { read_descriptor(&gdt, 0x13) }, Some(FLAT_DATA));
 }
+
+#[test]
+fn descriptor_table_operand_is_limit_then_base() {
+    let table = DescriptorTable { base: 0x1122_3344_5566_7788, limit: 0xABCD };
+    assert_eq!(
+        descriptor_table_operand(&table),
+        [0xCD, 0xAB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
+    );
+}

@@ -3,6 +3,9 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+use core::time::Duration;
+
+use uefi::boot::{self, EventType, TimerTrigger, Tpl};
 use uefi::prelude::*;
 
 /// Prints a tagged line to COM1, and to the firmware console while still in
@@ -42,13 +45,60 @@ fn main() -> Status {
         Err(error) => log!("Serial output disabled: {error:?}; console only."),
     }
 
-    // On success, bring-up ends in VMLAUNCH and never comes back: the
-    // guest's VM exits go to the exit handler, which reports each exit over
-    // serial, resumes the guest after its first VMCALL, and halts after the
-    // last planned exit. So the only way back here is an error. `Ok` holds
-    // `Infallible`, which has no values, so this pattern always matches.
-    let Err(error) = bring_up::run();
-    bring_up::report_error(error);
+    // Bring-up returns once the guest has stopped, or at the first failure.
+    // Either way it has left VMX operation if it entered it, unless VMXOFF
+    // failed: then the CPU is still in VMX root operation with CR4.VMXE set,
+    // teardown printed that, and firmware takes over in that state.
+    let status = match bring_up::run() {
+        Ok(run) => {
+            log!("Guest finished after {} VM exits; VMX operation left.", run.exits);
+            Status::SUCCESS
+        }
+        Err(error) => {
+            bring_up::report_error(error);
+            Status::ABORTED
+        }
+    };
 
-    loop { }
+    check_firmware_timer();
+    log!("Returning to firmware with {status:?}.");
+    status
+}
+
+/// How long [`check_firmware_timer`] waits.
+const TIMER_CHECK: Duration = Duration::from_secs(1);
+
+/// Waits on a one-shot UEFI timer event. Only the firmware's timer
+/// interrupt signals it, so getting past the wait shows that interrupts
+/// reach the firmware's handlers through the restored IDT. If they do not,
+/// the wait never ends, and the "Waiting" line is the last one on serial.
+///
+/// WaitForEvent may turn interrupts on by itself (through RestoreTPL), so
+/// this does not show that teardown restored IF; teardown prints IF itself.
+fn check_firmware_timer() {
+    log!("Waiting {} s on a firmware timer event...", TIMER_CHECK.as_secs());
+
+    // SAFETY: no notification function, so no callback can run with a bad
+    // context pointer.
+    let event = match unsafe { boot::create_event(EventType::TIMER, Tpl::APPLICATION, None, None) } {
+        Ok(event) => event,
+        Err(error) => {
+            log!("Firmware timer event not created: {:?}.", error.status());
+            return;
+        }
+    };
+
+    let mut events = [event];
+    if let Err(error) = boot::set_timer(&events[0], TimerTrigger::Relative(TIMER_CHECK)) {
+        log!("Firmware timer not armed: {:?}.", error.status());
+    } else if let Err(error) = boot::wait_for_event(&mut events) {
+        log!("Waiting on the firmware timer failed: {:?}.", error.status());
+    } else {
+        log!("Firmware timer fired: interrupts reach the firmware again.");
+    }
+
+    let [event] = events;
+    if let Err(error) = boot::close_event(event) {
+        log!("Firmware timer event not closed: {:?}.", error.status());
+    }
 }

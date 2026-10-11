@@ -27,7 +27,7 @@ use core::{arch::asm, ptr::read_volatile};
 use super::msr;
 
 /// Contents of GDTR or IDTR: where a descriptor table starts and how big it is.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescriptorTable {
     /// Address of the first descriptor.
     pub base: u64,
@@ -78,6 +78,50 @@ pub unsafe fn read_idtr() -> DescriptorTable {
             buffer[6], buffer[7], buffer[8], buffer[9]]
         ),
         limit: u16::from_le_bytes([buffer[0], buffer[1]])
+    }
+}
+
+/// The 10-byte memory operand LGDT and LIDT read: the limit, then the base,
+/// both little-endian. SGDT and SIDT write the same layout.
+fn descriptor_table_operand(table: &DescriptorTable) -> [u8; 10] {
+    let mut operand = [0u8; 10];
+    operand[..2].copy_from_slice(&table.limit.to_le_bytes());
+    operand[2..].copy_from_slice(&table.base.to_le_bytes());
+    operand
+}
+
+/// Loads GDTR. Segment registers keep their cached descriptors until they
+/// are reloaded, so nothing visible changes until then.
+///
+/// # Safety
+///
+/// `table` must describe a live GDT with valid descriptors for the
+/// selectors in CS, SS, DS, ES, FS and GS, in case they are reloaded.
+pub unsafe fn load_gdtr(table: &DescriptorTable) {
+    let operand = descriptor_table_operand(table);
+    unsafe {
+        asm!(
+            "lgdt [{0}]",
+            in(reg) operand.as_ptr(),
+            options(readonly, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Loads IDTR.
+///
+/// # Safety
+///
+/// `table` must describe a live IDT whose gates handle every interrupt and
+/// exception that may arrive.
+pub unsafe fn load_idtr(table: &DescriptorTable) {
+    let operand = descriptor_table_operand(table);
+    unsafe {
+        asm!(
+            "lidt [{0}]",
+            in(reg) operand.as_ptr(),
+            options(readonly, nostack, preserves_flags)
+        );
     }
 }
 

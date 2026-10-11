@@ -255,7 +255,7 @@ A normal boot, in `run\serial.log`:
 ...
 ```
 
-After `VMLAUNCH`, the exit handler adds lines like these (confirmed on Hyper-V):
+After `VMLAUNCH`, the exit handler and then bring-up add lines like these (confirmed on Hyper-V):
 
 ```text
 [Aleph0 Virtualization Hypervisor] Launching the guest with VMLAUNCH; its VM exits are reported on serial only.
@@ -269,7 +269,12 @@ After `VMLAUNCH`, the exit handler adds lines like these (confirmed on Hyper-V):
 [Aleph0 Virtualization Hypervisor] VM exit #2: guest rip=0x000000007eb11005 instruction length=3
 [Aleph0 Virtualization Hypervisor] VM exit #2: guest rax=0x000000000000a1e1 rbx=0x000000007f337018 rcx=0x0000000000000000 rdx=0x0000000000000000
 [Aleph0 Virtualization Hypervisor] VM exit #2: expected VMCALL (rax=0xa1e1); all 2 planned exits handled.
-[Aleph0 Virtualization Hypervisor] VM exit #2: halting; returning to firmware is ROADMAP section 4b.
+[Aleph0 Virtualization Hypervisor] VM exit #2: stopping the guest; returning to bring-up.
+[Aleph0 Virtualization Hypervisor] Teardown: CR4.VMXE=0 firmware GDTR/IDTR restored=true IF=1.
+[Aleph0 Virtualization Hypervisor] Guest finished after 2 VM exits; VMX operation left.
+[Aleph0 Virtualization Hypervisor] Waiting 1 s on a firmware timer event...
+[Aleph0 Virtualization Hypervisor] Firmware timer fired: interrupts reach the firmware again.
+[Aleph0 Virtualization Hypervisor] Returning to firmware with SUCCESS.
 ```
 
 If the reason line ends in `[VM entry failed; guest did not run]`, the CPU

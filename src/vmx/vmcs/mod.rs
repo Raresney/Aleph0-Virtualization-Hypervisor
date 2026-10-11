@@ -41,6 +41,9 @@ use super::page::{allocate_zeroed_page, PAGE_SIZE};
 use super::vmxon::vmcs_revision_id;
 
 pub mod fields;
+mod launch;
+
+pub use launch::{encode_finished, encode_resume_failed, encode_unexpected, launch, GuestStop};
 
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
@@ -255,41 +258,6 @@ pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> 
     }
 
     Ok(check_rflags(rflags)?)
-}
-
-/// Enters the guest described by the current VMCS for the first time.
-///
-/// **Returns only on failure.** When VMLAUNCH succeeds, the CPU loads the
-/// guest state and runs the guest. The next host code to execute is
-/// HOST_RIP, on the VM-exit stack, after the guest's first VM exit, and
-/// nothing after the `vmlaunch` below runs.
-///
-/// When this returns, the guest was not entered:
-/// - [`VmcsError::VmFailInvalid`]: there is no valid current VMCS.
-/// - [`VmcsError::VmFailValid`]: the reason is in [`vm_instruction_error`]:
-///   7 = invalid control fields, 8 = invalid host-state fields, 4 = the VMCS
-///   was already launched.
-///
-/// Invalid *guest* state is reported differently: the CPU performs a VM exit
-/// with bit 31 of the exit reason set (basic reason 33), which the VM-exit
-/// handler prints.
-///
-/// # Safety
-///
-/// VMX root operation, with a current VMCS whose controls, host state and
-/// guest state are fully written. HOST_RSP and HOST_RIP must point at a live
-/// exit stack and handler, and the guest's pages must stay allocated.
-pub unsafe fn launch() -> VmcsError {
-    let rflags: u64;
-    unsafe {
-        asm!(
-            "vmlaunch",
-            "pushfq",
-            "pop {rflags}",
-            rflags = lateout(reg) rflags,
-        );
-    }
-    launch_failure(rflags)
 }
 
 /// Decodes the RFLAGS left behind when VMLAUNCH falls through. That only
@@ -510,6 +478,27 @@ fn choose_control(capability: u64, desired: u32) -> Result<u32, VmcsError> {
 pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
     // VM_INSTRUCTION_ERROR is a 32-bit field; VMREAD zero-extends it.
     Ok(unsafe { vmread(VM_INSTRUCTION_ERROR)? } as u32)
+}
+
+/// The VM-instruction error number behind `error`: `Some` only for a
+/// VmFailValid whose number is readable.
+///
+/// Call it right after the failure. The number lives in the current VMCS,
+/// so it is gone once the VMCS is cleared or VMX operation is left, which
+/// teardown does before bring-up prints its errors.
+///
+/// # Safety
+///
+/// A VmFailValid can only come from a VMX instruction executed in VMX
+/// operation with a current VMCS, so the VMREAD here cannot raise #UD. That
+/// holds only until the VMCS is cleared or VMXOFF runs: call this before
+/// either.
+pub unsafe fn instruction_error_for(error: VmcsError) -> Option<u32> {
+    if error == VmcsError::VmFailValid {
+        unsafe { vm_instruction_error() }.ok()
+    } else {
+        None
+    }
 }
 
 /// Human-readable name for a [`vm_instruction_error`] code.

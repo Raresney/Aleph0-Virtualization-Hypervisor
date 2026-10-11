@@ -75,3 +75,17 @@ fn resume_falling_through_with_clear_flags_is_still_a_failure() {
     // A successful VMRESUME never reaches the next instruction either.
     assert_eq!(resume_failure(RESERVED), VmcsError::ResumeReturned);
 }
+
+#[test]
+fn only_vm_fail_valid_has_an_instruction_error_to_read() {
+    // Every other error returns before the VMREAD, which would fault outside
+    // VMX operation (as it would here, on the host).
+    for error in [
+        VmcsError::VmFailInvalid,
+        VmcsError::LaunchReturned,
+        VmcsError::ResumeReturned,
+        VmcsError::AllocationFailed,
+    ] {
+        assert_eq!(unsafe { instruction_error_for(error) }, None);
+    }
+}

@@ -1,6 +1,6 @@
 # Aleph0 hypervisor roadmap
 
-Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tracks it from the first VM entry to running an operating system as its guest, with EPT memory isolation, multiple vCPUs, and Aleph0 resident after `ExitBootServices`. Each milestone ends in a result that is verified on Hyper-V before the next piece is built. The immediate goal is a clean stop: leave VMX operation and return to firmware after the guest's planned exits.
+Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tracks it from the first VM entry to running an operating system as its guest, with EPT memory isolation, multiple vCPUs, and Aleph0 resident after `ExitBootServices`. Each milestone ends in a result that is verified on Hyper-V before the next piece is built. The immediate goal is to finish section 4 (how NMIs and interrupts that arrive while the guest runs are handled) and then add EPT (section 5).
 
 ## Current state
 
@@ -13,7 +13,7 @@ Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tr
 - [x] Establish a usable host task register. The tested Hyper-V boot reported a nonzero `TR`; activation checks GDTR, TR, and the decoded TSS base against the prepared values.
 - [x] Discover VMX control MSRs, select legal control values, and write/read back the four VMCS control fields.
 - [x] Write/read back host selectors, CRs, segment/table bases, SYSENTER state, and `HOST_RSP`/`HOST_RIP`. The Hyper-V run reported host PAT and EFER load controls both false, so those conditional fields were skipped.
-- [x] Allocate a dedicated four-page VM-exit stack and compile an inactive entry stub that saves general-purpose registers and calls a non-returning Rust handler. Since section 4 the handler returns to resume the guest, and the stub restores the registers and executes VMRESUME.
+- [x] Allocate a dedicated four-page VM-exit stack and compile an inactive entry stub that saves general-purpose registers and calls a non-returning Rust handler. Since section 4 the handler returns 0 to resume the guest, and the stub restores the registers and executes VMRESUME; to stop the guest it returns a stop value, and the stub jumps back into `vmcs::launch`.
 - [x] Add a firmware-independent COM1 serial logger and stream it from the Hyper-V VM to the host console and `run\serial.log` (see section 0).
 - [x] Replace the `uefi` panic handler with one that needs no firmware, and gate console output by an output phase (see section 0b).
 
@@ -21,9 +21,11 @@ Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tr
 
 - [x] Resume the guest with `VMRESUME` after its first exit and recognise its second `VMCALL` exit (see section 4).
 
-After the second exit the handler halts: there is no way back to firmware yet. There is no EPT or OS boot yet.
+- [x] Stop the guest after its last planned exit, leave VMX operation (`VMCLEAR`, `VMXOFF`, CR0/CR4 restored), restore the firmware's GDTR, IDTR and interrupt flag, and return from the EFI application to firmware (see section 4).
 
-**Next:** section 4, the clean stop: after the last planned exit, `VMCLEAR` the VMCS, run `VMXOFF`, clear `CR4.VMXE`, and return from `bring_up::run` to firmware instead of halting. `VMRESUME` and a second exit are confirmed on Hyper-V.
+There is no EPT or OS boot yet.
+
+**Next:** section 4, the remaining item: decide how NMIs and interrupts that arrive while the guest runs are handled (NMI exiting is off today). Then section 5, EPT. The clean stop and the return to firmware are confirmed on Hyper-V.
 
 ## 0. Debug output that works without firmware
 
@@ -109,11 +111,11 @@ At the virtual-device milestone (section 5):
 ## 4. Make guest execution repeatable
 
 - [x] Advance guest RIP by the VM-exit instruction length when appropriate, then `VMRESUME` and handle a second known exit. The handler writes GUEST_RIP = RIP + `VM_EXIT_INSTRUCTION_LEN` and returns; the entry stub restores the guest registers and executes `VMRESUME`. The guest runs `inc eax` after each `VMCALL`. On Hyper-V, exit #2 showed the same RIP as exit #1 and guest `rax=0x000000000000a1e1`, so the guest resumed past the first `VMCALL`.
-- [x] Handle unexpected exits and failed resume paths explicitly. `exit_action` (host-tested) resumes only the expected `VMCALL` exits; anything else prints `NOT an expected guest VMCALL exit` and halts. A failed `VMRESUME` falls through to `vmresume_failed`, which decodes the flags and `VM_INSTRUCTION_ERROR`. Bring-up now stops instead of launching if the host descriptor tables changed.
-- [ ] Add clean VMCS/VMX shutdown and restore host state before returning control to firmware. A VM exit sets the host GDTR and IDTR limits to 0xFFFF and the TR limit to 0x67, so the return to firmware must reload the firmware's descriptor tables, not only leave VMX operation.
+- [x] Handle unexpected exits and failed resume paths explicitly. `exit_action` (host-tested) resumes only the expected `VMCALL` exits; anything else prints `NOT an expected guest VMCALL exit` and stops the guest. A failed `VMRESUME` falls through to `vmresume_failed`, which decodes the flags and `VM_INSTRUCTION_ERROR`. Bring-up now stops instead of launching if the host descriptor tables changed.
+- [x] Add clean VMCS/VMX shutdown and restore host state before returning control to firmware. A VM exit sets the host GDTR and IDTR limits to 0xFFFF and the TR limit to 0x67, so the return to firmware must reload the firmware's descriptor tables, not only leave VMX operation. `vmx_launch` (`src/vmx/vmcs/launch.rs`) saves the caller's frame before VMLAUNCH; to stop, the exit handler returns a stop value and the exit stub jumps back into that frame, so `vmcs::launch` returns a `GuestStop`. `bring_up::teardown` then loads the firmware's GDTR and IDTR, runs `VMCLEAR` and `VMXOFF`, restores CR0/CR4 and the interrupt flag, and `main` returns to firmware after a UEFI timer event fires. Every failure after VMXON takes the same path. TR stays on Aleph0's TSS, whose pages are never freed. On Hyper-V, serial showed `Teardown: CR4.VMXE=0 firmware GDTR/IDTR restored=true IF=1.`, the timer fired, and the application returned `SUCCESS`.
 - [ ] Plan for interrupts, exceptions, and firmware calls while in VMX root operation; avoid assuming a UEFI print call is safe inside a low-level exit stub. Exceptions: the exception bitmap is all ones, so a guest fault exits with reason 0 and its vector is printed, instead of running the firmware's handler inside the guest. Interrupts: the guest runs with RFLAGS.IF=0 and no interrupt exiting yet. NMIs bypass the exception bitmap (NMI exiting is off), so an NMI while the guest runs would go to the firmware's NMI handler inside the guest.
 
-**Checkpoint:** A short guest sequence produces predictable multiple exits and terminates cleanly.
+**Checkpoint:** A short guest sequence produces predictable multiple exits and terminates cleanly. Reached on Hyper-V: two VMCALL exits, then teardown and a return to firmware with `SUCCESS`.
 
 ## 5. Add isolation and devices incrementally
 
