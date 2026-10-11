@@ -261,14 +261,14 @@ After `VMLAUNCH`, the exit handler and then bring-up add lines like these (confi
 [Aleph0 Virtualization Hypervisor] Launching the guest with VMLAUNCH; its VM exits are reported on serial only.
 [Aleph0 Virtualization Hypervisor] VM exit #1: reason=18 (VMCALL)
 [Aleph0 Virtualization Hypervisor] VM exit #1: qualification=0x0000000000000000
-[Aleph0 Virtualization Hypervisor] VM exit #1: guest rip=0x000000007eb11005 instruction length=3
-[Aleph0 Virtualization Hypervisor] VM exit #1: guest rax=0x000000000000a1e0 rbx=0x000000007f337018 rcx=0x0000000000000000 rdx=0x0000000000000000
-[Aleph0 Virtualization Hypervisor] VM exit #1: expected VMCALL (rax=0xa1e0); resuming the guest at rip=0x000000007eb11008.
+[Aleph0 Virtualization Hypervisor] VM exit #1: guest rip=0x000000007eb0c007 instruction length=3
+[Aleph0 Virtualization Hypervisor] VM exit #1: guest rax=0x000000000000a1e0 rbx=0x0000000000000000 rcx=0x0000000004722378 rdx=0x0000000000000000
+[Aleph0 Virtualization Hypervisor] VM exit #1: expected VMCALL (rax=0xa1e0); resuming the guest at rip=0x000000007eb0c00a.
 [Aleph0 Virtualization Hypervisor] VM exit #2: reason=18 (VMCALL)
 [Aleph0 Virtualization Hypervisor] VM exit #2: qualification=0x0000000000000000
-[Aleph0 Virtualization Hypervisor] VM exit #2: guest rip=0x000000007eb11005 instruction length=3
-[Aleph0 Virtualization Hypervisor] VM exit #2: guest rax=0x000000000000a1e1 rbx=0x000000007f337018 rcx=0x0000000000000000 rdx=0x0000000000000000
-[Aleph0 Virtualization Hypervisor] VM exit #2: expected VMCALL (rax=0xa1e1); all 2 planned exits handled.
+[Aleph0 Virtualization Hypervisor] VM exit #2: guest rip=0x000000007eb0c01b instruction length=3
+[Aleph0 Virtualization Hypervisor] VM exit #2: guest rax=0x000000000000a1e1 rbx=0x0000000000000000 rcx=0x0000000000000000 rdx=0x0000000000000000
+[Aleph0 Virtualization Hypervisor] VM exit #2: expected VMCALL (rax=0xa1e1); all 2 planned VMCALLs handled; no NMI arrived.
 [Aleph0 Virtualization Hypervisor] VM exit #2: stopping the guest; returning to bring-up.
 [Aleph0 Virtualization Hypervisor] Teardown: CR4.VMXE=0 firmware GDTR/IDTR restored=true IF=1.
 [Aleph0 Virtualization Hypervisor] Guest finished after 2 VM exits; VMX operation left.
@@ -276,6 +276,8 @@ After `VMLAUNCH`, the exit handler and then bring-up add lines like these (confi
 [Aleph0 Virtualization Hypervisor] Firmware timer fired: interrupts reach the firmware again.
 [Aleph0 Virtualization Hypervisor] Returning to firmware with SUCCESS.
 ```
+
+With `.\scripts\run-hyperv.ps1 -InjectNmi`, two exits appear between those two VMCALLs: the NMI exit, and the VMCALL of the guest's NMI handler (see [NMI.md](NMI.md)).
 
 If the reason line ends in `[VM entry failed; guest did not run]`, the CPU
 rejected the guest state before running a single guest instruction. Reason 33

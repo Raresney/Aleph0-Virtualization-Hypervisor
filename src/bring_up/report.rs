@@ -57,12 +57,13 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
 }
 
 /// Prints how the current page tables, which the guest will share, map the
-/// guest pages. Only called once both permission checks have passed.
+/// guest pages. Only called once all permission checks have passed.
 pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     let stack_base = guest.stack_top() - vmx::page::PAGE_SIZE as u64;
     for (name, virtual_address, mapping) in [
         ("code", guest.code_base(), mappings.code),
         ("stack", stack_base, mappings.stack),
+        ("IDT", guest.idt().base, mappings.idt),
     ] {
         log!(
             "Guest {name} page: virt={virtual_address:#018x} phys={:#018x} identity={} size={:?} writable={} user={} xd={}",

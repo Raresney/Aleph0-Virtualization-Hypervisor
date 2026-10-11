@@ -24,6 +24,17 @@
 pub const PIN_BASED_VM_EXEC_CONTROL: u32 = 0x4000;
 /// Primary processor-based VM-execution controls.
 pub const PRIMARY_VM_EXEC_CONTROL: u32 = 0x4002;
+/// Pin-based control bit 3: an NMI that arrives while the guest runs causes
+/// a VM exit (reason 0, interruption type NMI) instead of being delivered
+/// through the guest's IDT.
+pub const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
+/// Pin-based control bit 5, "virtual NMIs": the CPU tracks the guest's NMI
+/// blocking, so an injected NMI blocks further ones until the guest's IRET.
+/// Requires NMI exiting.
+pub const PIN_BASED_VIRTUAL_NMIS: u32 = 1 << 5;
+/// Primary processor-based control bit 22: a VM exit (reason 8) as soon as
+/// the guest can take an NMI. Requires virtual NMIs.
+pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
 /// Exception bitmap: bit N set makes guest exception vector N cause a VM exit
 /// (reason 0) instead of being delivered through the guest's IDT.
 pub const EXCEPTION_BITMAP: u32 = 0x4004;
@@ -78,6 +89,9 @@ pub const VM_EXIT_REASON: u32 = 0x4402;
 /// bits 7:0 vector, bits 10:8 event type, bit 11 error code valid, bit 31 the
 /// field is valid.
 pub const VM_EXIT_INTERRUPTION_INFO: u32 = 0x4404;
+/// IDT-vectoring information (32-bit): bit 31 is set when the VM exit
+/// interrupted the delivery of an event through the guest's IDT.
+pub const IDT_VECTORING_INFO: u32 = 0x4408;
 /// Length in bytes of the instruction that caused the exit (32-bit), for
 /// exits caused by an instruction (VMCALL, CPUID, ...). Used to advance RIP.
 pub const VM_EXIT_INSTRUCTION_LEN: u32 = 0x440C;

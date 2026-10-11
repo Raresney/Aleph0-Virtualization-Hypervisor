@@ -63,10 +63,12 @@ pub struct DesiredControls {
 }
 
 impl DesiredControls {
-    /// Minimal requests for a 64-bit guest on this 64-bit host.
+    /// Minimal requests for a 64-bit guest on this 64-bit host, plus NMI
+    /// exiting with virtual NMIs, so Aleph0 sees the guest's NMIs and can
+    /// reinject them.
     pub const fn minimal_64_bit_guest() -> Self {
         Self {
-            pin: 0,
+            pin: PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS,
             primary: 0,
             exit: VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
             entry: VM_ENTRY_IA32E_MODE_GUEST,
@@ -76,11 +78,10 @@ impl DesiredControls {
 
 /// Exception bitmap value: every exception vector (0-31) causes a VM exit.
 ///
-/// The guest shares the firmware's IDT. Without an exit, a guest fault would
-/// run the firmware's exception handler inside the guest, which typically
-/// spins forever without ever exiting, so the host would see nothing. With
-/// all bits set, the fault arrives as exit reason 0 and the handler prints
-/// the vector.
+/// The guest has its own IDT with only vector 2 (NMI) present. Without an
+/// exit, a guest fault would hit a missing gate (#GP, then #DF, then a triple
+/// fault), so the host would see nothing useful. With all bits set, every
+/// exception arrives as exit reason 0 and the handler prints the vector.
 const EXCEPTION_BITMAP_ALL: u32 = u32::MAX;
 
 /// Why a VMCS operation failed.
@@ -109,6 +110,9 @@ pub enum VmcsError {
     /// VMRESUME fell through to the next instruction with CF and ZF both
     /// clear. Like [`VmcsError::LaunchReturned`], the guest was not entered.
     ResumeReturned,
+    /// The CPU does not allow NMI-window exiting, which the exit handler
+    /// needs to inject an NMI that arrived while the guest blocked NMIs.
+    NmiWindowExitingUnsupported,
 }
 
 impl From<VmxFail> for VmcsError {
@@ -287,7 +291,9 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 /// write them to the current VMCS, and verify each field by reading it back.
 /// Always request 64-bit host mode on VM exit, regardless of `desired.exit`.
 /// Also zeroes the counts and fields VM entry checks, and makes every guest
-/// exception exit ([`EXCEPTION_BITMAP_ALL`]).
+/// exception exit ([`EXCEPTION_BITMAP_ALL`]). It also checks that the CPU
+/// allows NMI-window exiting (`VmcsError::NmiWindowExitingUnsupported`
+/// otherwise), which the exit handler switches on at run time.
 ///
 /// # Safety
 ///
@@ -295,6 +301,10 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: DesiredControls) -> Result<(), VmcsError> {
     let pin = choose_control(capabilities.pinbased, desired.pin)?;
     let primary = choose_control(capabilities.primary, desired.primary)?;
+    // NMI-window exiting is only switched on while an NMI waits for
+    // injection (`set_nmi_window_exiting`), but the CPU must allow it.
+    choose_control(capabilities.primary, CPU_BASED_NMI_WINDOW_EXITING)
+        .map_err(|_| VmcsError::NmiWindowExitingUnsupported)?;
     let exit = choose_control(capabilities.exit, desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE)?;
     let entry = choose_control(capabilities.entry, desired.entry)?;
 
@@ -463,6 +473,25 @@ fn choose_control(capability: u64, desired: u32) -> Result<u32, VmcsError> {
 
     // Add mandatory bits without changing any other requested bits.
     Ok(desired | required)
+}
+
+/// `primary` with NMI-window exiting turned on or off, other bits unchanged.
+fn with_nmi_window_exiting(primary: u64, on: bool) -> u64 {
+    let bit = u64::from(CPU_BASED_NMI_WINDOW_EXITING);
+    if on { primary | bit } else { primary & !bit }
+}
+
+/// Turns NMI-window exiting on or off in the current VMCS. The exit handler
+/// turns it on while an NMI waits until the guest can take it, and off once
+/// the NMI is injected.
+///
+/// # Safety
+///
+/// VMX operation with a current VMCS. `configure_controls` has checked that
+/// the CPU allows the bit.
+pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
+    let primary = unsafe { vmread(PRIMARY_VM_EXEC_CONTROL)? };
+    unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
 }
 
 /// The numeric reason the last VMX instruction failed.

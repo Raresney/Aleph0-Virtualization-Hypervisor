@@ -14,7 +14,8 @@
 //! | CR0, CR3, CR4                | the host's (same page tables, same modes) |
 //! | CS, SS, DS, ES, FS, GS, TR   | the host's selectors, decoded from the GDT |
 //! | LDTR                         | unusable (UEFI does not use an LDT)       |
-//! | GDTR, IDTR                   | the host's tables                         |
+//! | GDTR                         | the host's table                          |
+//! | IDTR                         | the guest's own IDT (`GuestMemory::idt`)  |
 //! | SYSENTER MSRs                | the host's                                |
 //! | DR7, IA32_DEBUGCTL           | `0x400` (reset value), `0`                |
 //! | PAT, EFER                    | the host's, only if the entry controls load them |
@@ -26,8 +27,8 @@
 //! the guest gets the host's EFER.NXE either way, which the shared page
 //! tables need (see [`super::paging`]).
 //!
-//! The guest shares the host's GDT, IDT, TSS and page tables. That is fine
-//! for a guest that only runs `mov; vmcall`, but it is not isolation.
+//! The guest shares the host's GDT, TSS and page tables, and has an IDT of
+//! its own for NMIs. That is fine for a test guest, but it is not isolation.
 //!
 //! [`GuestState::write`] reads every field back after writing it. As with
 //! the host fields, that proves storage only: the CPU checks the state when
@@ -136,15 +137,15 @@ pub struct GuestState {
 }
 
 impl GuestState {
-    /// Captures the host's current state, with the guest's own `rip` and
-    /// `rsp`, and checks CS and TR.
+    /// Captures the host's current state, with the guest's own `rip`, `rsp`
+    /// and `idtr`, and checks CS and TR.
     ///
     /// # Safety
     ///
     /// VMX operation must be active with the controls already written to the
     /// current VMCS (they decide whether PAT and EFER are needed). The host
     /// GDT must be live and stable.
-    pub unsafe fn from_current(rip: u64, rsp: u64) -> Result<Self, GuestStateError> {
+    pub unsafe fn from_current(rip: u64, rsp: u64, idtr: DescriptorTable) -> Result<Self, GuestStateError> {
         let host = unsafe { segment::read_all() };
         let gdt = &host.gdtr;
         let entry_controls = unsafe { vmcs::vmread(fields::VM_ENTRY_CONTROLS) }
@@ -167,7 +168,7 @@ impl GuestState {
                 ldtr: GuestSegment::unusable(0, 0),
                 tr: segment_from_gdt(gdt, host.tr, Some(host.tr_base))?,
                 gdtr: host.gdtr,
-                idtr: host.idtr,
+                idtr,
                 sysenter_cs: u64::from(msr::rdmsr(msr::IA32_SYSENTER_CS) as u32),
                 sysenter_esp: msr::rdmsr(msr::IA32_SYSENTER_ESP),
                 sysenter_eip: msr::rdmsr(msr::IA32_SYSENTER_EIP),
