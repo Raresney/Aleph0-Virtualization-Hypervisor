@@ -1,5 +1,12 @@
-//! How the guest stopped, packed into the one 64-bit value the assembly
-//! stubs can pass back to Rust.
+//! Entering the guest with VMLAUNCH, and coming back when it stops.
+//!
+//! A successful VMLAUNCH never falls through: the CPU runs the guest, and
+//! every VM exit starts the VM-exit stub in `vmx::vmexit` on its own stack.
+//! To let bring-up go on after the guest stops, [`launch`] first saves the
+//! caller's registers and stack pointer, like C's `setjmp`. When the guest
+//! should stop, the exit stub jumps to `vmx_return_to_launcher`, which
+//! restores them and returns, like `longjmp`. To the Rust caller, `launch`
+//! is an ordinary function that returns a [`GuestStop`].
 //!
 //! Every way back from the guest carries a *stop value*. Bits 63:62 say
 //! which kind it is, and the rest is the payload:
@@ -16,8 +23,74 @@
 //! RFLAGS bit 1 always reads as 1, so the exit handler can return 0 to mean
 //! "resume the guest".
 
-use super::{launch_failure, resume_failure, VmcsError};
+use core::sync::atomic::AtomicU64;
+
+use super::{instruction_error_for, launch_failure, resume_failure, VmcsError};
 use crate::vmx::vmexit::ExitReason;
+
+/// RSP inside `vmx_launch`, saved after it pushed the caller's registers;
+/// `vmx_return_to_launcher` reloads it to get back into that frame.
+///
+/// Only the stub below reads and writes it, once per launch, on the one CPU
+/// that runs the guest. The atomic just gives it a fixed, writable home
+/// without `static mut`, and `no_mangle` keeps the name the asm uses.
+#[unsafe(no_mangle)]
+static VMX_LAUNCH_RSP: AtomicU64 = AtomicU64::new(0);
+
+// `vmx_launch` is called with the Microsoft x64 ABI (`efiapi`). A callee
+// must preserve RBX, RBP, RDI, RSI, R12-R15 and RSP, so the stub pushes the
+// eight registers and saves RSP. The ABI also makes XMM6-XMM15
+// callee-saved, but the x86_64-unknown-uefi target is soft-float with SSE
+// disabled, so neither the caller nor the exit handler uses them (see the
+// VM-exit stub in `vmx::vmexit`).
+//
+// While the guest runs, this frame on the firmware stack stays untouched:
+// the exit handler runs on the VM-exit stack, and the guest on its own page.
+//
+// No call happens here, so stack alignment does not matter. On the way
+// back, RFLAGS are what VMLAUNCH left (failure), or host RFLAGS as loaded
+// by the VM exit, 0x2 (stop), so IF stays 0 until teardown.
+core::arch::global_asm!(
+    r#"
+    .globl vmx_launch
+vmx_launch:
+    push rbx
+    push rbp
+    push rdi
+    push rsi
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rip + VMX_LAUNCH_RSP], rsp
+    vmlaunch
+
+    // Reached only if VMLAUNCH failed. Its RFLAGS are the stop value
+    // (kind 0); fall through to return them.
+    pushfq
+    pop rax
+
+    // RAX holds the stop value. The VM-exit stub also jumps here when the
+    // guest stops: back into vmx_launch's frame, then return to its caller.
+    .globl vmx_return_to_launcher
+vmx_return_to_launcher:
+    mov rsp, [rip + VMX_LAUNCH_RSP]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rsi
+    pop rdi
+    pop rbp
+    pop rbx
+    ret
+"#
+);
+
+unsafe extern "efiapi" {
+    /// The stub above. Returns a stop value.
+    fn vmx_launch() -> u64;
+}
 
 /// Why the guest stopped, or why it never ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +152,41 @@ fn decode(value: u64) -> GuestStop {
             error: resume_failure(payload),
             instruction_error: None,
         },
+    }
+}
+
+/// Enters the guest described by the current VMCS, and returns once the
+/// guest has stopped or VMLAUNCH has failed.
+///
+/// The guest runs between VMLAUNCH and the stop: the exit handler resumes
+/// it after each planned VMCALL, and stops it after the last one or at any
+/// exit or VMRESUME failure it does not handle. The module docs explain how
+/// execution gets back here.
+///
+/// For a VmFailValid of VMLAUNCH or VMRESUME, the VM-instruction error is
+/// read here, while the VMCS is still current; teardown clears it.
+///
+/// Invalid *guest* state is not a launch failure: the CPU reports it as a
+/// VM exit with bit 31 of the exit reason set (basic reason 33), which
+/// arrives as [`GuestStop::Unexpected`].
+///
+/// # Safety
+///
+/// VMX root operation, with a current VMCS whose controls, host state and
+/// guest state are fully written. HOST_RSP and HOST_RIP must point at a live
+/// exit stack and handler, and the guest's pages must stay allocated.
+pub unsafe fn launch() -> GuestStop {
+    let value = unsafe { vmx_launch() };
+    match decode(value) {
+        GuestStop::LaunchFailed { error, .. } => GuestStop::LaunchFailed {
+            error,
+            instruction_error: unsafe { instruction_error_for(error) },
+        },
+        GuestStop::ResumeFailed { error, .. } => GuestStop::ResumeFailed {
+            error,
+            instruction_error: unsafe { instruction_error_for(error) },
+        },
+        stop => stop,
     }
 }
 

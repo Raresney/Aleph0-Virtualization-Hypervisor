@@ -5,7 +5,7 @@ use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host_tables::{GdtError, TssError};
 use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmexit::VmExitStackError;
+use crate::vmx::vmexit::{ExitReason, VmExitStackError};
 use crate::vmx::vmxon::VmxOnError;
 
 /// Why bring-up stopped. Each step returns one of these, so the sequence
@@ -31,6 +31,11 @@ pub enum BringUpError {
     /// launch. The VMCS host fields were written from the activated tables,
     /// so a VM exit would load stale ones.
     HostTablesChanged,
+    /// The guest stopped at exit `number`, which the exit handler does not
+    /// resume. Its lines on serial say why.
+    UnexpectedExit { number: u64, reason: ExitReason },
+    /// VMRESUME failed after an exit the handler resumed.
+    ResumeFailed { error: VmcsError, instruction_error: Option<u32> },
 }
 
 impl From<TssError> for BringUpError {
@@ -119,6 +124,15 @@ pub fn report_error(error: BringUpError) {
         BringUpError::HostTablesChanged => log!(
             "Host descriptor tables changed after VMX/UEFI calls; the guest was not launched."
         ),
+        BringUpError::UnexpectedExit { number, reason } => log!(
+            "Guest stopped at VM exit #{number}: reason={} ({}){}; not an exit Aleph0 handles.",
+            reason.basic,
+            vmx::vmexit::exit_reason_name(reason.basic),
+            if reason.entry_failure { " [VM entry failed]" } else { "" },
+        ),
+        BringUpError::ResumeFailed { error, instruction_error } => {
+            report_vmcs_error("resume", error, instruction_error)
+        }
     }
 }
 

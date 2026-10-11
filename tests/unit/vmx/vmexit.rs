@@ -99,3 +99,24 @@ fn exception_vector_is_bits_7_to_0_of_valid_info() {
 fn exception_vector_needs_the_valid_bit() {
     assert_eq!(exception_vector(0x0000_0B0E), None);
 }
+
+#[test]
+fn resume_tells_the_stub_to_resume() {
+    assert_eq!(stub_return(ExitAction::Resume, 1, 18), RESUME_GUEST);
+    assert_eq!(RESUME_GUEST, 0);
+}
+
+#[test]
+fn finished_stops_with_the_exit_count() {
+    assert_eq!(stub_return(ExitAction::Finished, 2, 18), vmcs::encode_finished(2));
+}
+
+#[test]
+fn unexpected_stops_with_the_exit_and_its_reason() {
+    assert_eq!(stub_return(ExitAction::Unexpected, 1, 10), vmcs::encode_unexpected(1, 10));
+}
+
+#[test]
+fn unreadable_reason_has_its_own_name() {
+    assert_eq!(exit_reason_name(UNREADABLE_REASON), "VM_EXIT_REASON unreadable");
+}

@@ -11,8 +11,9 @@
 //!    host state, guest state ([`bring_up_vmx`]).
 //! 4. Check that none of this disturbed the host's descriptor tables, and
 //!    stop if it did.
-//! 5. Launch the guest with VMLAUNCH. On success this never returns: the
-//!    guest's first VM exit goes to the exit handler in `vmx::vmexit`.
+//! 5. Launch the guest with VMLAUNCH. `vmx::vmcs::launch` returns once the
+//!    guest has stopped: after its last planned exit, or at an exit or
+//!    failure the exit handler in `vmx::vmexit` does not handle.
 //!
 //! Each step returns either what the CPU will keep using or a
 //! [`BringUpError`]; `?` stops at the first failure and [`report_error`]
@@ -22,8 +23,6 @@
 mod error;
 mod report;
 
-use core::convert::Infallible;
-
 pub use error::{report_error, BringUpError};
 
 use crate::vmx;
@@ -32,11 +31,18 @@ use crate::vmx::guest::GuestMemory;
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::segment::DescriptorTable;
-use crate::vmx::vmcs::{DesiredControls, VmcsRegion};
+use crate::vmx::vmcs::{DesiredControls, GuestStop, VmcsRegion};
 use crate::vmx::vmexit::{VmExitStack, VM_EXIT_STACK_SIZE};
 use crate::vmx::vmxon::VmxOnRegion;
 
 use error::{guest_state_error, vmcs_step};
+
+/// How the guest run ended when everything went to plan.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestRun {
+    /// VM exits handled, all of them the planned VMCALLs.
+    pub exits: u64,
+}
 
 /// The host GDT and TSS, plus the descriptor-table state recorded right
 /// after they were activated.
@@ -66,15 +72,14 @@ const _: () = assert!(
 /// Activates the host tables, enters VMX operation, prepares the VMCS, and
 /// launches the guest.
 ///
-/// **Returns only on failure.** `Infallible` has no values, so `Ok` can
-/// never be returned. On success VMLAUNCH enters the guest, and the next
-/// host code to run is the VM-exit handler.
+/// Returns once the guest has stopped, or at the first failure. The CPU is
+/// still in VMX operation afterwards.
 ///
 /// Every region allocated here (TSS, GDT, VM-exit stack, guest pages, VMXON
 /// region, VMCS) must stay allocated while the CPU may use it. None of these
 /// types implement `Drop`, so their pages are never returned to UEFI, not
 /// even when this function returns early with an error.
-pub fn run() -> Result<Infallible, BringUpError> {
+pub fn run() -> Result<GuestRun, BringUpError> {
     let host_tables = activate_host_tables()?;
 
     // Independent of VMX, so this runs and prints even under QEMU/TCG.
@@ -100,8 +105,23 @@ pub fn run() -> Result<Infallible, BringUpError> {
     check_host_tables_preserved(&host_tables)?;
 
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
-    let error = unsafe { vmx::vmcs::launch() };
-    Err(vmcs_step("launch")(error))
+    guest_result(unsafe { vmx::vmcs::launch() })
+}
+
+/// Turns the way the guest stopped into bring-up's result.
+fn guest_result(stop: GuestStop) -> Result<GuestRun, BringUpError> {
+    match stop {
+        GuestStop::Finished { exits } => Ok(GuestRun { exits }),
+        GuestStop::Unexpected { number, reason } => {
+            Err(BringUpError::UnexpectedExit { number, reason })
+        }
+        GuestStop::LaunchFailed { error, instruction_error } => {
+            Err(BringUpError::Vmcs { operation: "launch", error, instruction_error })
+        }
+        GuestStop::ResumeFailed { error, instruction_error } => {
+            Err(BringUpError::ResumeFailed { error, instruction_error })
+        }
+    }
 }
 
 /// Builds a GDT that adds a TSS descriptor to a copy of the firmware's GDT,

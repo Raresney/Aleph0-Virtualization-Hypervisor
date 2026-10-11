@@ -43,6 +43,8 @@ use super::vmxon::vmcs_revision_id;
 pub mod fields;
 mod launch;
 
+pub use launch::{encode_finished, encode_resume_failed, encode_unexpected, launch, GuestStop};
+
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
 use fields::*;
@@ -256,41 +258,6 @@ pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> 
     }
 
     Ok(check_rflags(rflags)?)
-}
-
-/// Enters the guest described by the current VMCS for the first time.
-///
-/// **Returns only on failure.** When VMLAUNCH succeeds, the CPU loads the
-/// guest state and runs the guest. The next host code to execute is
-/// HOST_RIP, on the VM-exit stack, after the guest's first VM exit, and
-/// nothing after the `vmlaunch` below runs.
-///
-/// When this returns, the guest was not entered:
-/// - [`VmcsError::VmFailInvalid`]: there is no valid current VMCS.
-/// - [`VmcsError::VmFailValid`]: the reason is in [`vm_instruction_error`]:
-///   7 = invalid control fields, 8 = invalid host-state fields, 4 = the VMCS
-///   was already launched.
-///
-/// Invalid *guest* state is reported differently: the CPU performs a VM exit
-/// with bit 31 of the exit reason set (basic reason 33), which the VM-exit
-/// handler prints.
-///
-/// # Safety
-///
-/// VMX root operation, with a current VMCS whose controls, host state and
-/// guest state are fully written. HOST_RSP and HOST_RIP must point at a live
-/// exit stack and handler, and the guest's pages must stay allocated.
-pub unsafe fn launch() -> VmcsError {
-    let rflags: u64;
-    unsafe {
-        asm!(
-            "vmlaunch",
-            "pushfq",
-            "pop {rflags}",
-            rflags = lateout(reg) rflags,
-        );
-    }
-    launch_failure(rflags)
 }
 
 /// Decodes the RFLAGS left behind when VMLAUNCH falls through. That only
