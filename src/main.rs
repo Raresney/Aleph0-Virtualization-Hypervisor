@@ -43,10 +43,9 @@ fn main() -> Status {
     }
 
     // Bring-up returns once the guest has stopped, or at the first failure.
-    // If the guest ran, the exit handler switched the output phase, so the
-    // line below goes to serial only. The CPU is still in VMX operation.
+    // Either way it has left VMX operation if it entered it.
     match bring_up::run() {
-        Ok(run) => log!("Guest finished after {} VM exits.", run.exits),
+        Ok(run) => log!("Guest finished after {} VM exits; VMX operation left.", run.exits),
         Err(error) => bring_up::report_error(error),
     }
 

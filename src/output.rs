@@ -92,14 +92,17 @@ pub fn halt_forever() -> ! {
 /// the phase can live in an [`AtomicU8`].
 #[repr(u8)]
 pub enum Phase {
-    /// Ordinary UEFI code before `ExitBootServices`: `main` and bring-up.
-    /// The only phase in which the firmware console may be used.
+    /// Ordinary UEFI code before `ExitBootServices`: `main` and bring-up,
+    /// and again once teardown has left VMX operation. The only phase in
+    /// which the firmware console may be used.
     BootServices = 0,
     /// After `ExitBootServices`: the firmware console is gone and the OS
     /// owns the machine.
     #[expect(dead_code, reason = "set after ExitBootServices, ROADMAP section 5")]
     Runtime = 1,
-    /// Inside the VM-exit handler: interrupts off, firmware state unknown.
+    /// From the first VM exit until teardown switches back: the VM-exit
+    /// handler, then bring-up until it has left VMX operation. Interrupts
+    /// off, firmware state unknown.
     VmExit = 2,
 }
 

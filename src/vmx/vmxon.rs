@@ -17,7 +17,8 @@
 //!    CF=1 → VmFailInvalid (bad region, alignment or revision id),
 //!    ZF=1 → VmFailValid (already in VMX operation, error number 15).
 //!
-//! [`enter_vmx_root_operation`] runs the sequence end to end.
+//! [`enter_vmx_root_operation`] runs the sequence end to end, and
+//! [`VmxOperation::leave`] undoes it: VMXOFF, then CR0/CR4 as they were.
 //!
 //! Memory type: `LOADER_DATA` is fine while Boot Services are alive. If the
 //! hypervisor is meant to survive `ExitBootServices`, this must become
@@ -58,6 +59,42 @@ impl From<VmxFail> for VmxOnError {
             VmxFail::Invalid => Self::VmFailInvalid,
             VmxFail::Valid => Self::VmFailValid,
         }
+    }
+}
+
+/// VMX root operation, entered by [`enter_vmx_root_operation`]: the VMXON
+/// region the CPU uses meanwhile, and CR0/CR4 from before VMXON, which
+/// [`VmxOperation::leave`] restores.
+///
+/// No `Drop`: the region must stay allocated while the CPU is in VMX
+/// operation, and leaving needs a VMCLEAR first, which only the owner of
+/// the VMCS can do.
+pub struct VmxOperation {
+    _region: VmxOnRegion,
+    original_cr0: u64,
+    original_cr4: u64,
+}
+
+impl VmxOperation {
+    /// Executes VMXOFF, then restores CR0 and CR4 to their values before
+    /// VMXON, which clears CR4.VMXE.
+    ///
+    /// If VMXOFF fails, the CPU is still in VMX operation, so CR0 and CR4
+    /// stay as they are: clearing CR4.VMXE in VMX operation raises #GP, and
+    /// CR0 must keep the bits VMX operation fixes.
+    ///
+    /// # Safety
+    ///
+    /// Every VMCS used on this CPU must already be cleared with VMCLEAR, so
+    /// its data is written back to memory. No VMX instruction may run after
+    /// this succeeds.
+    pub unsafe fn leave(self) -> Result<(), VmxFail> {
+        unsafe {
+            vmxoff()?;
+            cr::write_cr0(self.original_cr0);
+            cr::write_cr4(self.original_cr4);
+        }
+        Ok(())
     }
 }
 
@@ -124,12 +161,27 @@ pub unsafe fn vmxon(region: &VmxOnRegion) -> Result<(), VmxOnError> {
     Ok(check_rflags(rflags)?)
 }
 
-/// The region must stay allocated for as long as the CPU is in VMX
-/// operation; dropping it while VMX is on is undefined behaviour.
+/// Executes VMXOFF, leaving VMX operation.
+unsafe fn vmxoff() -> Result<(), VmxFail> {
+    let rflags: u64;
+    unsafe {
+        asm!(
+            "vmxoff",
+            "pushfq",
+            "pop {0}",
+            lateout(reg) rflags
+        );
+    }
+
+    check_rflags(rflags)
+}
+
+/// The returned [`VmxOperation`] keeps the region allocated for as long as
+/// the CPU is in VMX operation, and remembers CR0/CR4 for leaving it.
 ///
 /// If VMXON fails, CR0 and CR4 are restored, so CR4.VMXE is not left set
 /// outside VMX operation.
-pub unsafe fn enter_vmx_root_operation() -> Result<VmxOnRegion, VmxOnError> {
+pub unsafe fn enter_vmx_root_operation() -> Result<VmxOperation, VmxOnError> {
     unsafe {
         let region_size = (msr::rdmsr(msr::IA32_VMX_BASIC) >> 32) & 0x1fff;
         if region_size == 0 || region_size > PAGE_SIZE as u64 {
@@ -149,6 +201,6 @@ pub unsafe fn enter_vmx_root_operation() -> Result<VmxOnRegion, VmxOnError> {
             cr::write_cr4(original_cr4);
             return Err(error);
         }
-        Ok(vmxon_region)
+        Ok(VmxOperation { _region: vmxon_region, original_cr0, original_cr4 })
     }
 }

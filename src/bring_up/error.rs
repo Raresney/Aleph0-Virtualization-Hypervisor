@@ -8,6 +8,8 @@ use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmexit::{ExitReason, VmExitStackError};
 use crate::vmx::vmxon::VmxOnError;
 
+use super::teardown::TeardownError;
+
 /// Why bring-up stopped. Each step returns one of these, so the sequence
 /// reads top to bottom with `?` and [`report_error`] prints the outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,10 @@ pub enum BringUpError {
     UnexpectedExit { number: u64, reason: ExitReason },
     /// VMRESUME failed after an exit the handler resumed.
     ResumeFailed { error: VmcsError, instruction_error: Option<u32> },
+    /// Leaving VMX operation failed. Returned only when nothing failed
+    /// before teardown; otherwise that earlier error is returned and this
+    /// one was printed when it happened.
+    Teardown(TeardownError),
 }
 
 impl From<TssError> for BringUpError {
@@ -76,6 +82,12 @@ pub(super) fn guest_state_error(error: GuestStateError) -> BringUpError {
         _ => None,
     };
     BringUpError::GuestState { error, instruction_error }
+}
+
+impl From<TeardownError> for BringUpError {
+    fn from(error: TeardownError) -> Self {
+        Self::Teardown(error)
+    }
 }
 
 /// Tags a VMCS failure with the step it came from, for use with `map_err`.
@@ -133,6 +145,7 @@ pub fn report_error(error: BringUpError) {
         BringUpError::ResumeFailed { error, instruction_error } => {
             report_vmcs_error("resume", error, instruction_error)
         }
+        BringUpError::Teardown(error) => log!("Leaving VMX operation failed: {error:?}."),
     }
 }
 
