@@ -57,6 +57,12 @@ if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
     Write-Error "Hyper-V role not installed. Run: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All"
     exit 1
 }
+# The NMI job triggers on a serial line; without the serial stream nothing
+# writes serial.log, so the NMI would never be injected.
+if ($InjectNmi -and $NoSerial) {
+    Write-Error "-InjectNmi needs the serial stream; do not combine it with -NoSerial."
+    exit 1
+}
 
 # 1. Build
 Write-Host "==> cargo build $(if ($Release) { '--release' })" -ForegroundColor Cyan
@@ -145,18 +151,19 @@ try {
 $serialLog = Join-Path $runDir "serial.log"
 Remove-Item -Force -ErrorAction SilentlyContinue $serialLog
 
-Write-Host "==> Starting $VMName" -ForegroundColor Cyan
-Start-VM -Name $VMName
-vmconnect.exe localhost $VMName
-
-# 5b. With -InjectNmi, a background job waits until the guest has resumed
-#     after its first VMCALL (it then sits in its wait loop) and injects one
-#     NMI. read-serial.ps1 below writes the log the job watches.
+# With -InjectNmi, a background job waits until the guest has resumed after
+# its first VMCALL (it then sits in its wait loop) and injects one NMI.
+# read-serial.ps1 below writes the log the job watches. The job is started
+# before Start-VM so its start-up cost cannot delay anything after boot: the
+# injection is a race against the guest's wait loop.
 $nmiJob = $null
 if ($InjectNmi) {
     Write-Host "==> NMI injection armed: waiting for 'resuming the guest' on serial" -ForegroundColor Cyan
     $nmiJob = Start-Job -ArgumentList $VMName, $serialLog -ScriptBlock {
         param($vmName, $logPath)
+        # Load the module now so the first Debug-VM call is not slowed by
+        # module auto-loading.
+        Import-Module Hyper-V -ErrorAction Stop
         $deadline = (Get-Date).AddSeconds(120)
         while ((Get-Date) -lt $deadline) {
             if ((Test-Path $logPath) -and (Select-String -Path $logPath -SimpleMatch 'resuming the guest' -Quiet)) {
@@ -168,6 +175,10 @@ if ($InjectNmi) {
         return "No 'resuming the guest' line within 120 s; no NMI injected."
     }
 }
+
+Write-Host "==> Starting $VMName" -ForegroundColor Cyan
+Start-VM -Name $VMName
+vmconnect.exe localhost $VMName
 
 # 6. Stream COM1. Connect immediately: Hyper-V drops serial output written
 #    while no client is attached, and the firmware reaches our code in seconds.

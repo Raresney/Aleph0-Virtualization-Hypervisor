@@ -78,11 +78,10 @@ impl DesiredControls {
 
 /// Exception bitmap value: every exception vector (0-31) causes a VM exit.
 ///
-/// The guest shares the firmware's IDT. Without an exit, a guest fault would
-/// run the firmware's exception handler inside the guest, which typically
-/// spins forever without ever exiting, so the host would see nothing. With
-/// all bits set, the fault arrives as exit reason 0 and the handler prints
-/// the vector.
+/// The guest has its own IDT with only vector 2 (NMI) present. Without an
+/// exit, a guest fault would hit a missing gate (#GP, then #DF, then a triple
+/// fault), so the host would see nothing useful. With all bits set, every
+/// exception arrives as exit reason 0 and the handler prints the vector.
 const EXCEPTION_BITMAP_ALL: u32 = u32::MAX;
 
 /// Why a VMCS operation failed.
@@ -292,7 +291,9 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 /// write them to the current VMCS, and verify each field by reading it back.
 /// Always request 64-bit host mode on VM exit, regardless of `desired.exit`.
 /// Also zeroes the counts and fields VM entry checks, and makes every guest
-/// exception exit ([`EXCEPTION_BITMAP_ALL`]).
+/// exception exit ([`EXCEPTION_BITMAP_ALL`]). It also checks that the CPU
+/// allows NMI-window exiting (`VmcsError::NmiWindowExitingUnsupported`
+/// otherwise), which the exit handler switches on at run time.
 ///
 /// # Safety
 ///
@@ -481,8 +482,8 @@ fn with_nmi_window_exiting(primary: u64, on: bool) -> u64 {
 }
 
 /// Turns NMI-window exiting on or off in the current VMCS. The exit handler
-/// turns it on while an NMI waits for the guest to stop blocking NMIs, and
-/// off once the NMI is injected.
+/// turns it on while an NMI waits until the guest can take it, and off once
+/// the NMI is injected.
 ///
 /// # Safety
 ///

@@ -125,6 +125,8 @@ const NMI_VECTOR: usize = 2;
 const GATE_SIZE: usize = 16;
 /// GUEST_IDTR limit: three gates, vectors 0 to 2. Only vector 2 is present.
 const GUEST_IDT_LIMIT: u16 = (3 * GATE_SIZE - 1) as u16;
+// The NMI gate must lie inside the IDT limit, or the guest would #GP on an NMI.
+const _: () = assert!(NMI_VECTOR * GATE_SIZE + GATE_SIZE - 1 <= GUEST_IDT_LIMIT as usize);
 
 /// A 64-bit interrupt gate to `handler` through code segment `selector`:
 /// present, DPL 0, no IST.

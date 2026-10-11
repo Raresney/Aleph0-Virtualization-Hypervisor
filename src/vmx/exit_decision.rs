@@ -10,8 +10,9 @@
 //!
 //! ```text
 //! main VMCALL #1 ──▶ resume past it
-//! NMI exit       ──▶ guest not blocking NMIs: inject it at the next entry
-//!                    guest blocking NMIs:     turn on NMI-window exiting,
+//! NMI exit       ──▶ guest can take the NMI:  inject it at the next entry
+//!                    guest cannot yet (STI, MOV SS or NMI blocking):
+//!                                             turn on NMI-window exiting,
 //! NMI-window exit──▶                          inject when the window opens
 //! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
 //! main VMCALL #2 ──▶ finished
@@ -105,7 +106,8 @@ pub enum ExitEvent {
     GuestNmiHandler,
     /// An NMI the guest can take now: inject it.
     NmiInjected,
-    /// An NMI while the guest blocks NMIs: wait for the NMI window.
+    /// An NMI while the guest cannot take an NMI yet (STI, MOV SS or NMI
+    /// blocking): wait for the NMI window.
     NmiDeferred,
     /// The NMI window opened: inject the pending NMI.
     NmiWindowInjected,
@@ -179,8 +181,10 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
                 (ExitEvent::NmiDeferred, ExitState { nmi_pending: true, ..state })
             }
         }
-        // The window can open while STI or MOV SS blocking still holds on
-        // some CPUs; injecting then would fail the VM entry, so keep waiting.
+        // Per the SDM, NMI-window exits never occur under MOV SS blocking, but
+        // the processor may still report one under STI blocking. Injecting
+        // then would fail the VM entry, so keep waiting. (MOV SS stays in the
+        // mask; it is harmless.)
         EXIT_REASON_NMI_WINDOW if state.nmi_pending && exit.interruptibility & NMI_INJECTION_BLOCKED != 0 => {
             (ExitEvent::NmiDeferred, state)
         }

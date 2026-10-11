@@ -460,12 +460,15 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::NmiWindowInjected => crate::serial_println!(
             "{tag} VM exit #{number}: NMI window open; reinjecting the pending NMI at rip={rip:#018x}."
         ),
-        ExitEvent::LastMainVmcall if state.nmis_injected == 0 && state.nmis_handled == 0 => crate::serial_println!(
+        ExitEvent::LastMainVmcall if state.nmis_injected == 0 && state.nmis_handled == 0 && !state.nmi_pending => crate::serial_println!(
             "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; no NMI arrived."
         ),
         ExitEvent::LastMainVmcall => crate::serial_println!(
-            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; NMIs: {} reinjected, {} handled by the guest.",
-            state.nmis_injected, state.nmis_handled,
+            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; NMIs: {} reinjected, {} handled by the guest{}.",
+            state.nmis_injected,
+            state.nmis_handled,
+            // An NMI deferred but never injected before the last VMCALL.
+            if state.nmi_pending { ", 1 still pending (dropped)" } else { "" },
         ),
         ExitEvent::InterruptedDelivery => crate::serial_println!(
             "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
