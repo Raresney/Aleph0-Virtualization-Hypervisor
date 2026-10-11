@@ -20,8 +20,13 @@ pub enum BringUpError {
     VmxDisabledByFirmware,
     VmxOn(VmxOnError),
     /// A VMCS step failed; `operation` names the step for the report.
-    Vmcs { operation: &'static str, error: VmcsError },
-    GuestState(GuestStateError),
+    /// `instruction_error` is the VM-instruction error number of a
+    /// VmFailValid, read when the error was created: after teardown it can
+    /// no longer be read.
+    Vmcs { operation: &'static str, error: VmcsError, instruction_error: Option<u32> },
+    /// Building or writing the guest state failed. For a VMCS failure,
+    /// `instruction_error` is captured as for [`BringUpError::Vmcs`].
+    GuestState { error: GuestStateError, instruction_error: Option<u32> },
     /// GDTR, TR, the TSS base or IDTR changed between activation and the
     /// launch. The VMCS host fields were written from the activated tables,
     /// so a VM exit would load stale ones.
@@ -58,15 +63,25 @@ impl From<VmxOnError> for BringUpError {
     }
 }
 
-impl From<GuestStateError> for BringUpError {
-    fn from(error: GuestStateError) -> Self {
-        Self::GuestState(error)
-    }
+/// Converts a guest-state failure, for use with `map_err`. Reads the
+/// VM-instruction error number now, while the VMCS is still current.
+pub(super) fn guest_state_error(error: GuestStateError) -> BringUpError {
+    let instruction_error = match error {
+        GuestStateError::Vmcs { error, .. } => unsafe { vmx::vmcs::instruction_error_for(error) },
+        _ => None,
+    };
+    BringUpError::GuestState { error, instruction_error }
 }
 
 /// Tags a VMCS failure with the step it came from, for use with `map_err`.
+/// Reads the VM-instruction error number now, while the VMCS is still
+/// current.
 pub(super) fn vmcs_step(operation: &'static str) -> impl FnOnce(VmcsError) -> BringUpError {
-    move |error| BringUpError::Vmcs { operation, error }
+    move |error| BringUpError::Vmcs {
+        operation,
+        error,
+        instruction_error: unsafe { vmx::vmcs::instruction_error_for(error) },
+    }
 }
 
 /// Prints why bring-up stopped.
@@ -84,36 +99,40 @@ pub fn report_error(error: BringUpError) {
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
         BringUpError::VmxOn(error) => log!("VMXON failed: {error:?}"),
-        BringUpError::Vmcs { operation, error } => report_vmcs_error(operation, error),
-        BringUpError::GuestState(GuestStateError::Vmcs { field, error }) => {
-            log!("Guest-state field {field:#06x} failed:");
-            report_vmcs_error("guest-state write", error);
+        BringUpError::Vmcs { operation, error, instruction_error } => {
+            report_vmcs_error(operation, error, instruction_error)
         }
-        BringUpError::GuestState(GuestStateError::ReadbackMismatch { field, written, read }) => log!(
+        BringUpError::GuestState {
+            error: GuestStateError::Vmcs { field, error },
+            instruction_error,
+        } => {
+            log!("Guest-state field {field:#06x} failed:");
+            report_vmcs_error("guest-state write", error, instruction_error);
+        }
+        BringUpError::GuestState {
+            error: GuestStateError::ReadbackMismatch { field, written, read },
+            ..
+        } => log!(
             "Guest-state field {field:#06x} read back {read:#x}, but {written:#x} was written."
         ),
-        BringUpError::GuestState(error) => log!("Guest state invalid: {error:x?}"),
+        BringUpError::GuestState { error, .. } => log!("Guest state invalid: {error:x?}"),
         BringUpError::HostTablesChanged => log!(
             "Host descriptor tables changed after VMX/UEFI calls; the guest was not launched."
         ),
     }
 }
 
-/// Prints a VMCS failure, decoding the VM-instruction error when one exists.
-fn report_vmcs_error(operation: &str, error: VmcsError) {
-    if error != VmcsError::VmFailValid {
-        log!("VMCS {operation} failed: {error:?}");
-        return;
-    }
-
-    // VmFailValid implies a current VMCS, so the error number is readable.
-    match unsafe { vmx::vmcs::vm_instruction_error() } {
-        Ok(code) => {
+/// Prints a VMCS failure with the VM-instruction error number captured when
+/// it happened. Reads nothing from the VMCS: by now it may be cleared.
+fn report_vmcs_error(operation: &str, error: VmcsError, instruction_error: Option<u32>) {
+    match (error, instruction_error) {
+        (VmcsError::VmFailValid, Some(code)) => {
             let name = vmx::vmcs::vm_instruction_error_name(code);
             log!("VMCS {operation} failed: {name} ({code})");
         }
-        Err(e) => {
-            log!("VMCS {operation} failed: VmFailValid, error unreadable ({e:?})");
+        (VmcsError::VmFailValid, None) => {
+            log!("VMCS {operation} failed: VmFailValid, error number unreadable");
         }
+        _ => log!("VMCS {operation} failed: {error:?}"),
     }
 }

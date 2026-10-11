@@ -512,6 +512,20 @@ pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
     Ok(unsafe { vmread(VM_INSTRUCTION_ERROR)? } as u32)
 }
 
+/// The VM-instruction error number behind `error`: `Some` only for a
+/// VmFailValid whose number is readable.
+///
+/// Call it right after the failure. The number lives in the current VMCS,
+/// so it is gone once the VMCS is cleared or VMX operation is left, which
+/// teardown does before bring-up prints its errors.
+pub unsafe fn instruction_error_for(error: VmcsError) -> Option<u32> {
+    if error == VmcsError::VmFailValid {
+        unsafe { vm_instruction_error() }.ok()
+    } else {
+        None
+    }
+}
+
 /// Human-readable name for a [`vm_instruction_error`] code.
 ///
 /// Numbers from Intel SDM Vol. 3, "VM-Instruction Error Numbers"; only the

@@ -36,7 +36,7 @@ use crate::vmx::vmcs::{DesiredControls, VmcsRegion};
 use crate::vmx::vmexit::{VmExitStack, VM_EXIT_STACK_SIZE};
 use crate::vmx::vmxon::VmxOnRegion;
 
-use error::vmcs_step;
+use error::{guest_state_error, vmcs_step};
 
 /// The host GDT and TSS, plus the descriptor-table state recorded right
 /// after they were activated.
@@ -182,8 +182,9 @@ fn bring_up_vmx(
     log!("VMCS HOST_RSP/HOST_RIP written and read back; VM entry not attempted.");
 
     // After the controls: they decide whether guest PAT/EFER fields exist.
-    let guest_state = unsafe { GuestState::from_current(guest.code_base(), guest.stack_top()) }?;
-    unsafe { guest_state.write() }?;
+    let guest_state = unsafe { GuestState::from_current(guest.code_base(), guest.stack_top()) }
+        .map_err(guest_state_error)?;
+    unsafe { guest_state.write() }.map_err(guest_state_error)?;
     report::guest_state(&guest_state);
 
     Ok((vmxon, vmcs))
