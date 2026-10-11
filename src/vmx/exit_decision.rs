@@ -42,6 +42,11 @@ const NMI_VECTOR: u32 = 2;
 /// successful entry, so it injects once.
 pub const INJECT_NMI: u32 = INTERRUPTION_VALID | (INTERRUPTION_TYPE_NMI << 8) | NMI_VECTOR;
 
+/// Guest interruptibility bit 0: blocking by STI. The Intel SDM (Vol. 3C,
+/// checks on guest non-register state) says: "A processor may require bit 0
+/// (blocking by STI) to be 0 if the valid bit is 1 and the interruption type
+/// is NMI." So an NMI is injected only when this bit is clear too.
+const BLOCKING_BY_STI: u32 = 1 << 0;
 /// Guest interruptibility bit 1: blocking by MOV SS. VM entry refuses to
 /// inject an NMI while it is set.
 const BLOCKING_BY_MOV_SS: u32 = 1 << 1;
@@ -49,6 +54,10 @@ const BLOCKING_BY_MOV_SS: u32 = 1 << 1;
 /// an injected NMI the guest has not ended with IRET yet; VM entry refuses
 /// to inject another while it is set.
 const BLOCKING_BY_NMI: u32 = 1 << 3;
+/// Any of the blocking bits that may stop an NMI injection. The handler
+/// injects only when none is set, and otherwise waits for the NMI window
+/// instead of injecting blindly.
+const NMI_INJECTION_BLOCKED: u32 = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
 
 /// Whether `info`, a VM_EXIT_INTERRUPTION_INFO value, describes an NMI:
 /// valid, type 2, vector 2. Bit 12 (NMI unblocking due to IRET) is ignored.
@@ -164,11 +173,16 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     let injected = ExitState { nmi_pending: false, nmis_injected: state.nmis_injected + 1, ..state };
     match exit.reason.basic {
         EXIT_REASON_EXCEPTION_OR_NMI if is_nmi(exit.interruption_info) => {
-            if exit.interruptibility & (BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI) == 0 {
+            if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
                 (ExitEvent::NmiInjected, injected)
             } else {
                 (ExitEvent::NmiDeferred, ExitState { nmi_pending: true, ..state })
             }
+        }
+        // The window can open while STI or MOV SS blocking still holds on
+        // some CPUs; injecting then would fail the VM entry, so keep waiting.
+        EXIT_REASON_NMI_WINDOW if state.nmi_pending && exit.interruptibility & NMI_INJECTION_BLOCKED != 0 => {
+            (ExitEvent::NmiDeferred, state)
         }
         EXIT_REASON_NMI_WINDOW if state.nmi_pending => (ExitEvent::NmiWindowInjected, injected),
         EXIT_REASON_VMCALL if exit.guest_rax == u64::from(GUEST_NMI_MARKER) => {

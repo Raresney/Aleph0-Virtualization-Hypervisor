@@ -10,7 +10,6 @@ const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;
 /// VM_EXIT_INTERRUPTION_INFO of an NMI exit.
 const NMI_INFO: u32 = 0x8000_0202;
-const BLOCKING_BY_STI: u32 = 1 << 0;
 
 /// Before the first exit.
 const START: ExitState = ExitState { main_vmcalls: 0, nmi_pending: false, nmis_injected: 0, nmis_handled: 0 };
@@ -53,6 +52,10 @@ fn exceptions_and_invalid_info_are_not_nmis() {
     assert!(!is_nmi(0x8000_0B0E));
     // NMI bits without the valid bit.
     assert!(!is_nmi(0x0000_0202));
+    // Right vector, wrong type: hardware exception (type 3), vector 2.
+    assert!(!is_nmi(0x8000_0302));
+    // Right type, wrong vector: NMI type, vector 3.
+    assert!(!is_nmi(0x8000_0203));
 }
 
 #[test]
@@ -84,9 +87,10 @@ fn nmi_while_unblocked_is_injected() {
 }
 
 #[test]
-fn nmi_blocked_only_by_sti_is_injected() {
-    // Blocking by STI does not block NMI injection.
-    assert_eq!(decide(WAITING, nmi(BLOCKING_BY_STI)).0, ExitEvent::NmiInjected);
+fn nmi_while_blocked_by_sti_waits_for_the_window() {
+    // The SDM requires bit 0 to be 0 for an NMI injection, so STI blocking
+    // defers the NMI just like NMI blocking does.
+    assert_eq!(decide(WAITING, nmi(BLOCKING_BY_STI)).0, ExitEvent::NmiDeferred);
 }
 
 #[test]
@@ -109,6 +113,13 @@ fn window_exit_injects_the_pending_nmi() {
         decide(pending, exit(EXIT_REASON_NMI_WINDOW)),
         (ExitEvent::NmiWindowInjected, ExitState { nmis_injected: 1, ..WAITING }),
     );
+}
+
+#[test]
+fn window_exit_while_still_blocked_keeps_waiting() {
+    let pending = ExitState { nmi_pending: true, ..WAITING };
+    let still_blocked = ExitInfo { interruptibility: BLOCKING_BY_STI, ..exit(EXIT_REASON_NMI_WINDOW) };
+    assert_eq!(decide(pending, still_blocked), (ExitEvent::NmiDeferred, pending));
 }
 
 #[test]
@@ -137,6 +148,18 @@ fn full_nmi_run_finishes_with_both_counts() {
 }
 
 #[test]
+fn deferred_nmi_run_finishes_with_both_counts() {
+    let exits = [vmcall(MARKER), nmi(BLOCKING_BY_NMI), exit(EXIT_REASON_NMI_WINDOW), vmcall(NMI_MARKER), vmcall(MARKER + 1)];
+    let mut state = START;
+    let mut event = ExitEvent::Unexpected;
+    for exit in exits {
+        (event, state) = decide(state, exit);
+    }
+    assert_eq!(event, ExitEvent::LastMainVmcall);
+    assert_eq!(state, ExitState { main_vmcalls: 2, nmi_pending: false, nmis_injected: 1, nmis_handled: 1 });
+}
+
+#[test]
 fn interrupted_delivery_is_never_handled() {
     let interrupted = ExitInfo { idt_vectoring_valid: true, ..vmcall(MARKER) };
     assert_eq!(decide(START, interrupted), (ExitEvent::InterruptedDelivery, START));
@@ -144,7 +167,7 @@ fn interrupted_delivery_is_never_handled() {
 
 #[test]
 fn entry_failure_is_unexpected() {
-    let failed = ExitInfo { reason: ExitReason { basic: 18, entry_failure: true }, ..vmcall(MARKER) };
+    let failed = ExitInfo { reason: ExitReason { basic: EXIT_REASON_VMCALL, entry_failure: true }, ..vmcall(MARKER) };
     assert_eq!(decide(START, failed), (ExitEvent::Unexpected, START));
 }
 
