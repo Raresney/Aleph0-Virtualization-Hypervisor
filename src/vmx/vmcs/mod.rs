@@ -41,6 +41,7 @@ use super::page::{allocate_zeroed_page, PAGE_SIZE};
 use super::vmxon::vmcs_revision_id;
 
 pub mod fields;
+mod launch;
 
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
