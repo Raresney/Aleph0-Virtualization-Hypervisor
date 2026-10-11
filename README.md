@@ -84,7 +84,7 @@ diagnostics that run before VMXON.
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
-| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them) |
+| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware) |
 
 ## License
 
