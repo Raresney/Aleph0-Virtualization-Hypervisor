@@ -46,8 +46,9 @@ fn main() -> Status {
     }
 
     // Bring-up returns once the guest has stopped, or at the first failure.
-    // Either way it has left VMX operation if it entered it, so firmware
-    // can take over again.
+    // Either way it has left VMX operation if it entered it, unless VMXOFF
+    // failed: then the CPU is still in VMX root operation with CR4.VMXE set,
+    // teardown printed that, and firmware takes over in that state.
     let status = match bring_up::run() {
         Ok(run) => {
             log!("Guest finished after {} VM exits; VMX operation left.", run.exits);

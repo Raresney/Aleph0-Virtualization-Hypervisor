@@ -4,7 +4,9 @@
 //! The steps, in order:
 //!
 //! 1. Load a host GDT with a TSS ([`activate_host_tables`]); VM entry needs
-//!    a nonzero host TR. The firmware's GDTR is recorded first, for step 7.
+//!    a nonzero host TR. The firmware's GDTR is recorded first, and put back
+//!    on every return path once this step has succeeded: by `run` if a
+//!    failure comes before VMXON, by step 7 after it.
 //! 2. Allocate the VM-exit stack and the guest's code and stack pages, and
 //!    check how the page tables map the guest pages.
 //! 3. Detect VMX and read its capability MSRs ([`check_vmx_support`]).
@@ -16,13 +18,18 @@
 //!    guest has stopped: after its last planned exit, or at an exit or
 //!    failure the exit handler in `vmx::vmexit` does not handle.
 //! 7. Leave VMX operation and restore the firmware's state
-//!    ([`teardown::teardown`]). Runs whatever happened in steps 4 to 6, so
-//!    firmware never gets the CPU back in VMX operation.
+//!    ([`teardown::teardown`]). Runs whatever happened after VMXON
+//!    succeeded (creating the VMCS, steps 5 and 6), so firmware gets the CPU
+//!    back outside VMX operation unless VMXOFF itself fails. If VMXON or an
+//!    earlier step failed there is nothing to leave, and only the firmware's
+//!    GDTR needs loading again.
 //!
 //! Each step returns either what the CPU will keep using or a
 //! [`BringUpError`]; `?` stops at the first failure and [`report_error`]
-//! prints it. Lines that only print state live in [`report`], so this file
-//! reads as the sequence itself.
+//! prints it. Before VMXON that failure goes straight back to `main` (with
+//! the firmware's GDTR loaded again); after VMXON it still goes through
+//! teardown first. Lines that only print state live in [`report`], so this
+//! file reads as the sequence itself.
 
 mod error;
 mod report;
@@ -66,11 +73,11 @@ struct HostTables {
     firmware_gdtr: DescriptorTable,
 }
 
-// The CPU keeps using these pages for as long as it is in VMX operation,
-// including after `run` returns an error. Freeing them on drop would hand
-// memory the CPU still uses back to UEFI, so none of them may implement
-// `Drop`; this turns adding a `Drop` impl (or a field that needs dropping)
-// into a compile error.
+// The CPU uses these pages while `run` is in progress, and some of them after
+// it returns: the TSS through TR, and the VMXON region and VMCS if VMXOFF
+// failed. Freeing them on drop would hand memory the CPU still uses back to
+// UEFI, so none of them may implement `Drop`; this turns adding a `Drop` impl
+// (or a field that needs dropping) into a compile error.
 const _: () = assert!(
     !core::mem::needs_drop::<TssRegion>()
         && !core::mem::needs_drop::<GdtRegion>()
@@ -83,9 +90,11 @@ const _: () = assert!(
 /// Activates the host tables, enters VMX operation, prepares the VMCS,
 /// launches the guest, and leaves VMX operation again.
 ///
-/// Returns once the guest has stopped, or at the first failure. Either way,
-/// if VMXON succeeded, the CPU has left VMX operation and the firmware's
-/// GDTR, IDTR and interrupt flag are back.
+/// Returns once the guest has stopped, or at the first failure. Once the host
+/// tables are active, every return path puts the firmware's GDTR back. If
+/// VMXON succeeded, it also puts back the IDTR and interrupt flag and leaves
+/// VMX operation. The one exception is a failing VMXOFF: the CPU then stays
+/// in VMX root operation with CR4.VMXE set, and teardown prints that.
 ///
 /// Every region allocated here (TSS, GDT, VM-exit stack, guest pages, VMXON
 /// region, VMCS) stays allocated, even after this returns. None of these
@@ -97,6 +106,52 @@ pub fn run() -> Result<GuestRun, BringUpError> {
     // Independent of VMX, so this runs and prints even under QEMU/TCG.
     report::segment_state();
 
+    let entry = match enter_vmx(&host_tables) {
+        Ok(entry) => entry,
+        Err(error) => {
+            // Nothing to leave yet, but the CPU still runs on Aleph0's GDT,
+            // which firmware never knew about. IF is still 1 and the phase
+            // is still boot services, so this needs no ordering care.
+            // SAFETY: the firmware's own GDT, read before activation. Boot
+            // services are still running, so it is still live.
+            unsafe { vmx::segment::load_gdtr(&host_tables.firmware_gdtr) };
+            return Err(error);
+        }
+    };
+    let VmxEntry { vmexit_stack, guest, controls, firmware, vmx_operation } = entry;
+
+    // From here on every path goes through teardown before returning.
+    // Only legal now: the VMCS instructions raise #UD outside VMX operation.
+    let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
+    let result = match &vmcs {
+        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &host_tables),
+        Err(error) => Err(*error),
+    };
+    let left = unsafe { teardown::teardown(vmx_operation, vmcs.as_ref().ok(), &firmware) };
+
+    // A failure before teardown explains more than one during it; a
+    // teardown failure was printed when it happened.
+    match (result, left) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(run), Ok(())) => Ok(run),
+    }
+}
+
+/// What exists once VMXON has succeeded, for the rest of [`run`].
+struct VmxEntry {
+    vmexit_stack: VmExitStack,
+    guest: GuestMemory,
+    controls: VmcsControlMsrs,
+    firmware: FirmwareState,
+    vmx_operation: VmxOperation,
+}
+
+/// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack and the guest's
+/// pages, checks VMX support, and enters VMX root operation. A failure here
+/// leaves the CPU outside VMX operation, so `run` only has to put the
+/// firmware's GDTR back.
+fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmexit_stack = VmExitStack::allocate()?;
     log!("VM-exit stack allocated: top={:#018x} size={VM_EXIT_STACK_SIZE}.", vmexit_stack.top());
 
@@ -120,22 +175,7 @@ pub fn run() -> Result<GuestRun, BringUpError> {
     let vmx_operation = unsafe { vmx::vmxon::enter_vmx_root_operation() }?;
     log!("Entered VMX root operation.");
 
-    // From here on every path goes through teardown before returning.
-    // Only legal now: the VMCS instructions raise #UD outside VMX operation.
-    let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
-    let result = match &vmcs {
-        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &host_tables),
-        Err(error) => Err(*error),
-    };
-    let left = unsafe { teardown::teardown(vmx_operation, vmcs.as_ref().ok(), &firmware) };
-
-    // A failure before teardown explains more than one during it; a
-    // teardown failure was printed when it happened.
-    match (result, left) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
-        (Ok(run), Ok(())) => Ok(run),
-    }
+    Ok(VmxEntry { vmexit_stack, guest, controls, firmware, vmx_operation })
 }
 
 /// Builds a GDT that adds a TSS descriptor to a copy of the firmware's GDT,

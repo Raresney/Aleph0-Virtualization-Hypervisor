@@ -1,7 +1,9 @@
 //! Leaving VMX operation and handing the CPU back to firmware.
 //!
 //! Runs after the guest stopped, and after any failure once VMXON has
-//! succeeded, so firmware never gets the CPU back in VMX operation.
+//! succeeded, so firmware gets the CPU back outside VMX operation. The one
+//! exception is a failing VMXOFF: the CPU is then still in VMX root
+//! operation with CR4.VMXE set, and teardown prints that.
 //!
 //! The order matters:
 //!
@@ -28,6 +30,11 @@
 //! TSS and GDT pages are never freed, so the CPU's cached TSS descriptor
 //! stays valid. The selector may lie past the firmware GDT's limit; only an
 //! LTR or a task switch would look it up again.
+//!
+//! Three more things a VM exit changes are intentionally not restored: DR7 is
+//! set to 0x400, IA32_DEBUGCTL is cleared, and LDTR is made null. Firmware
+//! then runs with those values, which only matters while a hardware debugger
+//! is attached; UEFI uses no LDT.
 
 use core::arch::asm;
 

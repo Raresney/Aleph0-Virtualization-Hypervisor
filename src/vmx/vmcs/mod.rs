@@ -486,6 +486,13 @@ pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
 /// Call it right after the failure. The number lives in the current VMCS,
 /// so it is gone once the VMCS is cleared or VMX operation is left, which
 /// teardown does before bring-up prints its errors.
+///
+/// # Safety
+///
+/// A VmFailValid can only come from a VMX instruction executed in VMX
+/// operation with a current VMCS, so the VMREAD here cannot raise #UD. That
+/// holds only until the VMCS is cleared or VMXOFF runs: call this before
+/// either.
 pub unsafe fn instruction_error_for(error: VmcsError) -> Option<u32> {
     if error == VmcsError::VmFailValid {
         unsafe { vm_instruction_error() }.ok()

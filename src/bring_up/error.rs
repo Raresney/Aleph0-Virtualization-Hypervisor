@@ -33,8 +33,9 @@ pub enum BringUpError {
     /// launch. The VMCS host fields were written from the activated tables,
     /// so a VM exit would load stale ones.
     HostTablesChanged,
-    /// The guest stopped at exit `number`, which the exit handler does not
-    /// resume. Its lines on serial say why.
+    /// The guest stopped at exit `number`, which the exit handler did not
+    /// resume: it does not handle that exit, or it is an expected VMCALL the
+    /// handler could not step past. Its lines on serial say which.
     UnexpectedExit { number: u64, reason: ExitReason },
     /// VMRESUME failed after an exit the handler resumed.
     ResumeFailed { error: VmcsError, instruction_error: Option<u32> },
@@ -78,6 +79,8 @@ impl From<VmxOnError> for BringUpError {
 /// VM-instruction error number now, while the VMCS is still current.
 pub(super) fn guest_state_error(error: GuestStateError) -> BringUpError {
     let instruction_error = match error {
+        // SAFETY: a VmFailValid came from a VMX instruction in VMX operation,
+        // and the VMCS is not cleared until teardown, after this runs.
         GuestStateError::Vmcs { error, .. } => unsafe { vmx::vmcs::instruction_error_for(error) },
         _ => None,
     };
@@ -97,6 +100,9 @@ pub(super) fn vmcs_step(operation: &'static str) -> impl FnOnce(VmcsError) -> Br
     move |error| BringUpError::Vmcs {
         operation,
         error,
+        // SAFETY: a VmFailValid came from a VMX instruction in VMX
+        // operation, and the VMCS is not cleared until teardown, after this
+        // runs.
         instruction_error: unsafe { vmx::vmcs::instruction_error_for(error) },
     }
 }
@@ -137,7 +143,7 @@ pub fn report_error(error: BringUpError) {
             "Host descriptor tables changed after VMX/UEFI calls; the guest was not launched."
         ),
         BringUpError::UnexpectedExit { number, reason } => log!(
-            "Guest stopped at VM exit #{number}: reason={} ({}){}; not an exit Aleph0 handles.",
+            "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",
             reason.basic,
             vmx::vmexit::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },

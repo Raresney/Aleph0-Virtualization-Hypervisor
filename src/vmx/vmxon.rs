@@ -67,7 +67,7 @@ impl From<VmxFail> for VmxOnError {
 /// [`VmxOperation::leave`] restores.
 ///
 /// No `Drop`: the region must stay allocated while the CPU is in VMX
-/// operation, and leaving needs a VMCLEAR first, which only the owner of
+/// operation, and leaving should follow a VMCLEAR, which only the owner of
 /// the VMCS can do.
 pub struct VmxOperation {
     _region: VmxOnRegion,
@@ -85,9 +85,11 @@ impl VmxOperation {
     ///
     /// # Safety
     ///
-    /// Every VMCS used on this CPU must already be cleared with VMCLEAR, so
-    /// its data is written back to memory. No VMX instruction may run after
-    /// this succeeds.
+    /// Every VMCS used on this CPU should be cleared with VMCLEAR first, so
+    /// the CPU writes its data back to memory. If one was not (its VMCLEAR
+    /// failed), only that VMCS's memory is stale, which is harmless while its
+    /// region is never reused. No VMX instruction may run after this
+    /// succeeds.
     pub unsafe fn leave(self) -> Result<(), VmxFail> {
         unsafe {
             vmxoff()?;
