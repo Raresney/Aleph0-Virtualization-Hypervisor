@@ -160,6 +160,10 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
         "Guest memory allocated: code={:#018x} ({} bytes copied) stack top={:#018x}.",
         guest.code_base(), guest.code_len(), guest.stack_top(),
     );
+    log!(
+        "Guest IDT at {:#018x} (limit {:#06x}): vector 2 -> NMI handler at {:#018x}.",
+        guest.idt().base, guest.idt().limit, guest.nmi_handler(),
+    );
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
 
@@ -277,7 +281,7 @@ fn prepare_vmcs(
     log!("VMCS HOST_RSP/HOST_RIP written and read back; VM entry not attempted.");
 
     // After the controls: they decide whether guest PAT/EFER fields exist.
-    let guest_state = unsafe { GuestState::from_current(guest.code_base(), guest.stack_top()) }
+    let guest_state = unsafe { GuestState::from_current(guest.code_base(), guest.stack_top(), guest.idt()) }
         .map_err(guest_state_error)?;
     unsafe { guest_state.write() }.map_err(guest_state_error)?;
     report::guest_state(&guest_state);

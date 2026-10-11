@@ -7,21 +7,57 @@
 use super::*;
 
 #[test]
-fn guest_code_is_marker_then_vmcall_loop() {
+fn guest_code_waits_for_an_nmi_between_two_vmcalls() {
     assert_eq!(
         guest_code(),
         [
+            0x31, 0xDB,                   // xor ebx, ebx
             0xB8, 0xE0, 0xA1, 0x00, 0x00, // mov eax, GUEST_MARKER
+            0x0F, 0x01, 0xC1,             // vmcall (main VMCALL #1)
+            0xB9, 0x00, 0x00, 0x00, 0x20, // mov ecx, GUEST_WAIT_ITERATIONS
+            0x85, 0xDB,                   // wait: test ebx, ebx
+            0x75, 0x06,                   // jnz done (+6)
+            0xF3, 0x90,                   // pause
+            0xFF, 0xC9,                   // dec ecx
+            0x75, 0xF6,                   // jnz wait (-10)
+            0xFF, 0xC0,                   // done: inc eax
+            0x0F, 0x01, 0xC1,             // vmcall (main VMCALL #2)
+            0x0F, 0x0B,                   // ud2
+            0x50,                         // nmi handler: push rax
+            0xB8, 0x49, 0x4D, 0x4E, 0x00, // mov eax, GUEST_NMI_MARKER
             0x0F, 0x01, 0xC1,             // vmcall
-            0xFF, 0xC0,                   // inc eax
-            0xEB, 0xF9,                   // jmp rel8 -7: back to vmcall
+            0x58,                         // pop rax
+            0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1
+            0x48, 0xCF,                   // iretq
         ],
     );
 }
 
 #[test]
+fn nmi_handler_starts_after_the_main_code() {
+    // Byte 32 in the listing above: right after the ud2.
+    assert_eq!(nmi_handler_offset(), 32);
+}
+
+#[test]
 fn guest_code_fits_in_one_page() {
     assert!(guest_code().len() <= PAGE_SIZE);
+}
+
+#[test]
+fn interrupt_gate_splits_a_low_handler_address() {
+    assert_eq!(
+        interrupt_gate(0x7eb0_f020, 0x28),
+        [0x20, 0xF0, 0x28, 0x00, 0x00, 0x8E, 0xB0, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn interrupt_gate_keeps_the_high_handler_bits() {
+    assert_eq!(
+        interrupt_gate(0xFFFF_8000_1234_5678, 0x28),
+        [0x78, 0x56, 0x28, 0x00, 0x00, 0x8E, 0x34, 0x12, 0x00, 0x80, 0xFF, 0xFF, 0, 0, 0, 0],
+    );
 }
 
 /// A supervisor, writable, executable 4 KiB page.
@@ -72,4 +108,16 @@ fn user_stack_is_refused_only_under_smap() {
         check_permissions(&kernel_page(), &stack, cr::CR4_SMAP),
         Err(GuestMemoryError::StackBlockedBySmap),
     );
+}
+
+#[test]
+fn kernel_idt_passes_under_smap() {
+    assert_eq!(check_idt_permissions(&kernel_page(), SMEP_AND_SMAP), Ok(()));
+}
+
+#[test]
+fn user_idt_is_refused_only_under_smap() {
+    let idt = Mapping { user: true, ..kernel_page() };
+    assert_eq!(check_idt_permissions(&idt, 0), Ok(()));
+    assert_eq!(check_idt_permissions(&idt, cr::CR4_SMAP), Err(GuestMemoryError::IdtBlockedBySmap));
 }
