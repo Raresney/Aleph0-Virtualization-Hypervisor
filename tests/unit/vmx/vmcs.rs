@@ -89,3 +89,13 @@ fn only_vm_fail_valid_has_an_instruction_error_to_read() {
         assert_eq!(unsafe { instruction_error_for(error) }, None);
     }
 }
+
+#[test]
+fn nmi_window_on_sets_only_bit_22() {
+    assert_eq!(with_nmi_window_exiting(0x8401_E172, true), 0x8441_E172);
+}
+
+#[test]
+fn nmi_window_off_clears_only_bit_22() {
+    assert_eq!(with_nmi_window_exiting(0x8441_E172, false), 0x8401_E172);
+}
