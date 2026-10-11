@@ -8,20 +8,26 @@
 //! CPU, so the stub saves them before any Rust code can clobber them.
 //!
 //! `bring_up::run` enters the guest through `vmcs::launch`, so the guest's
-//! first VM exit lands here. The handler prints each exit over serial. On
-//! the guest's first VMCALL it advances guest RIP and returns 0, and the
-//! stub executes VMRESUME. On the second, as on any exit it does not
-//! handle, it returns a stop value instead, and the stub jumps back into
-//! `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`).
+//! first VM exit lands here. The handler prints each exit over serial, and
+//! `exit_decision::decide` says what it is: a VMCALL to resume past, an NMI
+//! to reinject, an NMI window to inject in, the last planned VMCALL, or
+//! something unexpected. To resume, the handler updates the VMCS and returns
+//! 0, and the stub executes VMRESUME. To stop, it returns a stop value, and
+//! the stub jumps back into `vmcs::launch`, which returns to bring-up (see
+//! `vmx/vmcs/launch.rs`).
 
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::guest::GUEST_MARKER;
+use super::exit_decision::{
+    self, decide, expected_main_rax, ExitAction, ExitEvent, ExitInfo, ExitState,
+    EXIT_REASON_EXCEPTION_OR_NMI, INJECT_NMI, PLANNED_MAIN_VMCALLS,
+};
 use super::page::{allocate_zeroed_pages, PAGE_SIZE};
 use super::vmcs::{self, encode_finished, encode_resume_failed, encode_unexpected, VmcsError};
 use super::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO,
+    VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO,
     VM_EXIT_REASON,
 };
 
@@ -189,6 +195,7 @@ pub fn exit_reason_name(basic: u16) -> &'static str {
         2 => "triple fault",
         3 => "INIT signal",
         7 => "interrupt window",
+        8 => "NMI window",
         9 => "task switch",
         10 => "CPUID",
         12 => "HLT",
@@ -207,61 +214,36 @@ pub fn exit_reason_name(basic: u16) -> &'static str {
     }
 }
 
-/// Basic exit reason of an exception (or NMI) exit.
-const EXIT_REASON_EXCEPTION_OR_NMI: u16 = 0;
-/// Basic exit reason of a VMCALL exit.
-const EXIT_REASON_VMCALL: u16 = 18;
 /// Reason the handler reports when VM_EXIT_REASON itself could not be read.
 /// Basic exit reasons stop far below 0xFFFF, so it never names a real exit.
 const UNREADABLE_REASON: u16 = 0xFFFF;
-
-/// How many VMCALL exits the guest is resumed through before the handler
-/// stops: the first exit is resumed, the second ends the run.
-const PLANNED_VMCALL_EXITS: u64 = 2;
 
 /// Exits handled so far, including the current one, so the first exit is
 /// number 1. Only the exit handler touches it, with interrupts off, on the
 /// one CPU that runs the guest; the atomic just avoids `static mut`.
 static EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// The guest's RAX at its `number`th VMCALL exit (1-based): the marker, plus
-/// one for each `inc eax` the resumed guest has run since. `number` is
-/// always at least 1.
-fn expected_guest_rax(number: u64) -> u64 {
-    u64::from(GUEST_MARKER) + number - 1
-}
+// The `ExitState` that `decide` carries from one exit to the next, one
+// atomic per field, for the same reason as `EXIT_COUNT`.
+static MAIN_VMCALLS: AtomicU32 = AtomicU32::new(0);
+static NMI_PENDING: AtomicBool = AtomicBool::new(false);
+static NMIS_INJECTED: AtomicU32 = AtomicU32::new(0);
+static NMIS_HANDLED: AtomicU32 = AtomicU32::new(0);
 
-/// Whether exit `number` is the VMCALL exit the guest is built to produce.
-///
-/// The reason alone is not enough. The marker in the guest's RAX shows that
-/// the guest's own instructions ran up to the VMCALL. Its increase on later
-/// exits shows that the guest resumed past the previous VMCALL instead of
-/// running it again.
-fn is_expected_vmcall_exit(number: u64, reason: ExitReason, guest_rax: u64) -> bool {
-    !reason.entry_failure
-        && reason.basic == EXIT_REASON_VMCALL
-        && guest_rax == expected_guest_rax(number)
-}
-
-/// What the handler does after printing an exit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitAction {
-    /// Advance guest RIP past the VMCALL and return to the guest.
-    Resume,
-    /// The last planned exit arrived as expected; stop.
-    Finished,
-    /// Not an exit this hypervisor handles; stop without resuming.
-    Unexpected,
-}
-
-fn exit_action(number: u64, reason: ExitReason, guest_rax: u64) -> ExitAction {
-    if !is_expected_vmcall_exit(number, reason, guest_rax) {
-        ExitAction::Unexpected
-    } else if number < PLANNED_VMCALL_EXITS {
-        ExitAction::Resume
-    } else {
-        ExitAction::Finished
+fn load_state() -> ExitState {
+    ExitState {
+        main_vmcalls: MAIN_VMCALLS.load(Ordering::Relaxed),
+        nmi_pending: NMI_PENDING.load(Ordering::Relaxed),
+        nmis_injected: NMIS_INJECTED.load(Ordering::Relaxed),
+        nmis_handled: NMIS_HANDLED.load(Ordering::Relaxed),
     }
+}
+
+fn store_state(state: ExitState) {
+    MAIN_VMCALLS.store(state.main_vmcalls, Ordering::Relaxed);
+    NMI_PENDING.store(state.nmi_pending, Ordering::Relaxed);
+    NMIS_INJECTED.store(state.nmis_injected, Ordering::Relaxed);
+    NMIS_HANDLED.store(state.nmis_handled, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -272,7 +254,7 @@ const RESUME_GUEST: u64 = 0;
 /// `number`: [`RESUME_GUEST`], or the stop value `vmcs::launch` returns.
 fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
     match action {
-        ExitAction::Resume => RESUME_GUEST,
+        ExitAction::Resume { .. } => RESUME_GUEST,
         ExitAction::Finished => encode_finished(number),
         ExitAction::Unexpected => encode_unexpected(number, raw_reason),
     }
@@ -299,10 +281,11 @@ fn report_unreadable(name: &str, error: VmcsError) {
     crate::serial_println!("{} VM exit: {name} unreadable ({error:?})", crate::TAG);
 }
 
-/// VM-exit handler: prints the exit over serial, then tells the entry stub
-/// what to do. It returns [`RESUME_GUEST`] after advancing guest RIP past
-/// an expected VMCALL (the stub then executes VMRESUME), or a stop value
-/// (the stub then returns it from `vmcs::launch` to bring-up).
+/// VM-exit handler: prints the exit over serial, decides what it is
+/// (`exit_decision::decide`), then tells the entry stub what to do. It
+/// returns [`RESUME_GUEST`] after preparing the VMCS for the guest to go on
+/// (the stub then executes VMRESUME), or a stop value (the stub then returns
+/// it from `vmcs::launch` to bring-up).
 ///
 /// Runs on the VM-exit stack with interrupts off. It may only use things
 /// that need no firmware: VMREAD/VMWRITE (the VMCS is still current) and the
@@ -350,69 +333,160 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
         frame.rax, frame.rbx, frame.rcx, frame.rdx,
     );
 
-    let action = match reason {
-        Some(reason) => exit_action(number, reason, frame.rax),
-        None => ExitAction::Unexpected,
+    let interruption_info = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO);
+    let interruptibility = read_or_report("GUEST_INTERRUPTIBILITY_STATE", GUEST_INTERRUPTIBILITY_STATE);
+    let idt_vectoring = read_or_report("IDT_VECTORING_INFO", IDT_VECTORING_INFO);
+    let exit = match (reason, interruption_info, interruptibility, idt_vectoring) {
+        (Some(reason), Some(info), Some(blocking), Some(vectoring)) => Some(ExitInfo {
+            reason,
+            interruption_info: info as u32,
+            guest_rax: frame.rax,
+            interruptibility: blocking as u32,
+            idt_vectoring_valid: vectoring & (1 << 31) != 0,
+        }),
+        // An unreadable field was printed; without it the exit cannot be
+        // judged.
+        _ => None,
     };
-    let action = match action {
-        ExitAction::Resume if advance_guest_rip(number, rip, length, frame.rax) => ExitAction::Resume,
-        // Expected, but the guest cannot be resumed past it; the reason
-        // was printed.
-        ExitAction::Resume => ExitAction::Unexpected,
-        ExitAction::Finished => {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: expected VMCALL (rax={:#x}); all {PLANNED_VMCALL_EXITS} planned exits handled.",
-                frame.rax,
-            );
-            ExitAction::Finished
+
+    let state = load_state();
+    let (event, next) = match exit {
+        Some(exit) => decide(state, exit),
+        None => (ExitEvent::Unexpected, state),
+    };
+    store_state(next);
+
+    let action = match event.action() {
+        ExitAction::Resume { advance_rip, inject_nmi, nmi_window } => {
+            match prepare_resume(number, rip, length, advance_rip, inject_nmi, nmi_window) {
+                Some(resume_rip) => {
+                    report_event(number, event, exit, next, Some(resume_rip));
+                    ExitAction::Resume { advance_rip, inject_nmi, nmi_window }
+                }
+                // Why the guest cannot go on was printed.
+                None => ExitAction::Unexpected,
+            }
         }
-        ExitAction::Unexpected => {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: NOT an expected guest VMCALL exit (expected rax={:#x}).",
-                expected_guest_rax(number),
-            );
-            ExitAction::Unexpected
+        stop => {
+            report_event(number, event, exit, next, None);
+            stop
         }
     };
 
-    if action != ExitAction::Resume {
+    if !matches!(action, ExitAction::Resume { .. }) {
         crate::serial_println!("{tag} VM exit #{number}: stopping the guest; returning to bring-up.");
     }
     stub_return(action, number, raw_reason.unwrap_or(u32::from(UNREADABLE_REASON)))
 }
 
-/// Writes GUEST_RIP = `rip` + `length`, past the VMCALL, and prints the
-/// outcome. Returns whether the guest can be resumed.
-fn advance_guest_rip(number: u64, rip: Option<u64>, length: Option<u64>, guest_rax: u64) -> bool {
+/// Prepares the VMCS for a `Resume` action: moves GUEST_RIP past the exiting
+/// instruction, queues an NMI for injection at the next VM entry, and turns
+/// NMI-window exiting on or off. Returns the RIP the guest resumes at, or
+/// `None` after printing why it cannot resume.
+fn prepare_resume(
+    number: u64,
+    rip: Option<u64>,
+    length: Option<u64>,
+    advance_rip: bool,
+    inject_nmi: bool,
+    nmi_window: Option<bool>,
+) -> Option<u64> {
     let tag = crate::TAG;
-    let (Some(rip), Some(length)) = (rip, length) else {
-        crate::serial_println!(
-            "{tag} VM exit #{number}: guest RIP or instruction length unreadable; not resuming."
-        );
-        return false;
+    let Some(rip) = rip else {
+        crate::serial_println!("{tag} VM exit #{number}: guest RIP unreadable; not resuming.");
+        return None;
     };
-    match unsafe { vmcs::vmwrite(GUEST_RIP, rip + length) } {
-        Ok(()) => {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: expected VMCALL (rax={guest_rax:#x}); resuming the guest at rip={:#018x}.",
-                rip + length,
-            );
-            true
-        }
-        Err(error) => {
+
+    let resume_rip = if advance_rip {
+        let Some(length) = length else {
+            crate::serial_println!("{tag} VM exit #{number}: instruction length unreadable; not resuming.");
+            return None;
+        };
+        if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, rip + length) } {
             crate::serial_println!(
                 "{tag} VM exit #{number}: could not advance guest RIP ({error:?}); not resuming."
             );
-            false
+            return None;
         }
+        rip + length
+    } else {
+        // An NMI exit: the guest goes on at the instruction it was about to
+        // run, and the injected NMI is delivered before it.
+        rip
+    };
+
+    if inject_nmi {
+        if let Err(error) = unsafe { vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, INJECT_NMI.into()) } {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: could not queue the NMI for injection ({error:?}); not resuming."
+            );
+            return None;
+        }
+    }
+    if let Some(on) = nmi_window {
+        if let Err(error) = unsafe { vmcs::set_nmi_window_exiting(on) } {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: could not turn NMI-window exiting {} ({error:?}); not resuming.",
+                if on { "on" } else { "off" },
+            );
+            return None;
+        }
+    }
+    Some(resume_rip)
+}
+
+/// Prints what exit `number` turned out to be and what Aleph0 does about
+/// it. `state` is the state after the exit; `resume_rip` is where the guest
+/// goes on, for events that resume it.
+fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: ExitState, resume_rip: Option<u64>) {
+    let tag = crate::TAG;
+    let rax = exit.map_or(0, |exit| exit.guest_rax);
+    let rip = resume_rip.unwrap_or(0);
+    match event {
+        ExitEvent::MainVmcall => crate::serial_println!(
+            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); resuming the guest at rip={rip:#018x}."
+        ),
+        ExitEvent::GuestNmiHandler => crate::serial_println!(
+            "{tag} VM exit #{number}: guest NMI handler ran (rax={rax:#x}); the reinjected NMI was delivered; resuming the guest at rip={rip:#018x}."
+        ),
+        ExitEvent::NmiInjected => crate::serial_println!(
+            "{tag} VM exit #{number}: NMI (interruption info={:#010x}); reinjecting it into the guest at rip={rip:#018x}.",
+            exit.map_or(0, |exit| exit.interruption_info),
+        ),
+        ExitEvent::NmiDeferred => crate::serial_println!(
+            "{tag} VM exit #{number}: NMI cannot be injected yet (interruptibility={:#x}); waiting for the NMI window.",
+            exit.map_or(0, |exit| exit.interruptibility),
+        ),
+        ExitEvent::NmiWindowInjected => crate::serial_println!(
+            "{tag} VM exit #{number}: NMI window open; reinjecting the pending NMI at rip={rip:#018x}."
+        ),
+        ExitEvent::LastMainVmcall if state.nmis_injected == 0 && state.nmis_handled == 0 => crate::serial_println!(
+            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; no NMI arrived."
+        ),
+        ExitEvent::LastMainVmcall => crate::serial_println!(
+            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; NMIs: {} reinjected, {} handled by the guest.",
+            state.nmis_injected, state.nmis_handled,
+        ),
+        ExitEvent::InterruptedDelivery => crate::serial_println!(
+            "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
+        ),
+        ExitEvent::Unexpected => crate::serial_println!(
+            "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
+            expected_main_rax(state),
+        ),
     }
 }
 
 /// Prints the vector of an exception exit. Exit qualification, printed by
 /// the caller, holds the faulting address for a page fault (#PF, vector 14).
+/// NMI exits share reason 0 but are not exceptions; the event line printed
+/// later reports them.
 fn report_exception(number: u64) {
     let tag = crate::TAG;
     if let Some(info) = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO) {
+        if exit_decision::is_nmi(info as u32) {
+            return;
+        }
         match exception_vector(info as u32) {
             Some(vector) => crate::serial_println!(
                 "{tag} VM exit #{number}: guest exception vector={vector} (interruption info={info:#010x})"
