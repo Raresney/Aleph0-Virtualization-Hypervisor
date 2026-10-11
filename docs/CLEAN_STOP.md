@@ -104,7 +104,7 @@ run ─▶ launch() ─▶ vmx_launch: push 8 regs, save RSP, VMLAUNCH
                                    │
           guest: mov eax,0xa1e0; vmcall ──▶ exit #1 ──▶ handler returns 0
                                    ◀── stub pops guest regs, VMRESUME
-          guest: inc eax; jmp; vmcall ───▶ exit #2 ──▶ handler returns 0x4000_0000_0000_0002
+     guest: (wait loop) inc eax; vmcall ──▶ exit #2 ──▶ handler returns 0x4000_0000_0000_0002
                                                         │ stub: test rax,rax; jnz
                                                         ▼
                                    vmx_return_to_launcher: RSP = VMX_LAUNCH_RSP,
@@ -151,8 +151,8 @@ stub instead of halting:
 | Exit | Handler action | Returns | Stub does |
 |---|---|---|---|
 | expected VMCALL, not the last one | writes GUEST_RIP = RIP + instruction length | `0` | pops guest registers, VMRESUME |
-| expected VMCALL, the last planned one | prints `all 2 planned exits handled` | `encode_finished(number)` | jumps to `vmx_return_to_launcher` |
-| anything else | prints `NOT an expected guest VMCALL exit` | `encode_unexpected(number, reason)` | jumps to `vmx_return_to_launcher` |
+| expected VMCALL, the last planned one | prints `all 2 planned VMCALLs handled` | `encode_finished(number)` | jumps to `vmx_return_to_launcher` |
+| anything else | prints `NOT an expected exit` | `encode_unexpected(number, reason)` | jumps to `vmx_return_to_launcher` |
 | expected VMCALL, but GUEST_RIP cannot be advanced | prints why | `encode_unexpected(number, 18)` | jumps to `vmx_return_to_launcher` |
 
 If VMRESUME itself falls through, the stub calls `vmresume_failed`, which
@@ -163,6 +163,8 @@ reason sent back is `0xFFFF`, which no real exit uses
 
 The stop path never restores the guest's registers: the exit stack is
 simply abandoned, and the next launch would start it from the top again.
+
+Since the NMI step, `exit_decision::decide` makes this decision, and the handler also resumes after NMI and NMI-window exits; see [NMI.md](NMI.md).
 
 ## 5. Teardown
 
@@ -256,7 +258,7 @@ Then `main` returns the status, and the firmware's boot manager takes over.
 
 ## 9. The Hyper-V run
 
-The tail of `run\serial.log`, with what each part shows:
+The tail of `run\serial.log` from the clean-stop step, before NMI exiting was added, with what each part shows. Its addresses and the exit #2 RIP match that older guest, not the current one:
 
 ```text
 VM exit #1: guest rip=0x000000007eb0f005 instruction length=3
@@ -285,9 +287,8 @@ with ABORTED.`
   been compiled. A run with the expected guest RAX changed on purpose would
   exercise `Unexpected` at exit #1, teardown from exit context, and
   `ABORTED`.
-- NMIs: NMI exiting is off, so an NMI while the guest runs goes to the
-  firmware's handler inside the guest. That is the remaining item of
-  ROADMAP section 4.
+- NMIs: since the NMI step, NMI exiting is on and NMIs are reinjected into
+  the guest's own IDT; see NMI.md.
 - After `ExitBootServices` Aleph0 must stay resident instead of returning
   (ROADMAP section 5). The stop path is then the way to shut the hypervisor
   down, not the normal end of a run.

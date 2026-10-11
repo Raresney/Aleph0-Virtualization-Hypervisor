@@ -11,8 +11,9 @@ the analysis the anti-cheat needs.
 
 It currently enters VMX root operation, fills in a complete VMCS, launches
 a minimal guest, and resumes it after its first VMCALL exit; both exits are
-reported over serial. After the second exit it leaves VMX operation and
-returns to firmware.
+reported over serial. An NMI that arrives while the guest runs is caught
+and reinjected into the guest's own IDT. After the last exit it leaves VMX
+operation and returns to firmware.
 See [ROADMAP.md](ROADMAP.md) for what has been verified and what comes next.
 
 ## Requirements
@@ -77,10 +78,10 @@ diagnostics that run before VMXON.
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
 | `src/vmx/host_tables.rs`, `segment.rs` | Host GDT/TSS setup and segmentation state |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
-| `src/vmx/guest.rs`, `paging.rs` | Guest code and stack pages; the page-table walk that checks them |
+| `src/vmx/guest.rs`, `paging.rs` | Guest code, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
-| `src/vmx/vmexit.rs` | VM-exit stack, entry stub (with the VMRESUME path) and exit handler |
+| `src/vmx/vmexit.rs`, `exit_decision.rs` | VM-exit stack, entry stub (with the VMRESUME path) and exit handler; the pure decision for each exit (VMCALLs, NMI reinjection) |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
