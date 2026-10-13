@@ -10,10 +10,12 @@ low-level `unsafe` Rust, and of AI-assisted reverse-engineering tooling for
 the analysis the anti-cheat needs.
 
 It currently enters VMX root operation, fills in a complete VMCS, launches
-a minimal guest, and resumes it after its first VMCALL exit; both exits are
-reported over serial. An NMI that arrives while the guest runs is caught
-and reinjected into the guest's own IDT. After the last exit it leaves VMX
-operation and returns to firmware.
+a minimal guest, and resumes it after its first VMCALL exit; every exit is
+reported over serial. Guest memory goes through EPT: an identity map of all
+memory with one guest page read-only, so the guest's write to it exits to
+Aleph0, which grants the write and retries it. An NMI that arrives while
+the guest runs is caught and reinjected into the guest's own IDT. After the
+last exit it leaves VMX operation and returns to firmware.
 See [ROADMAP.md](ROADMAP.md) for what has been verified and what comes next.
 
 ## Requirements
@@ -78,14 +80,15 @@ diagnostics that run before VMXON.
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
 | `src/vmx/host_tables.rs`, `segment.rs` | Host GDT/TSS setup and segmentation state |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
-| `src/vmx/guest.rs`, `paging.rs` | Guest code, stack and IDT pages; the page-table walk that checks them |
+| `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
+| `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
 | `src/vmx/vmexit.rs`, `exit_decision.rs` | VM-exit stack, entry stub (with the VMRESUME path) and exit handler; the pure decision for each exit (VMCALLs, NMI reinjection) |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
-| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them) |
+| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation) |
 
 ## License
 

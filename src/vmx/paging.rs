@@ -3,9 +3,10 @@
 //! Answers one question: for a given address, what do the page tables say
 //! about it? Is it mapped, can it be written, can code run from it?
 //!
-//! With EPT off and guest CR3 = host CR3, the guest translates addresses
-//! through exactly these tables, so what they say about a page is what the
-//! guest gets.
+//! With guest CR3 = host CR3, the guest translates linear addresses through
+//! exactly these tables, so what they say about a page is what the guest's
+//! first translation stage gives. EPT (`vmx::ept`) then translates the
+//! result a second time and may refuse the access on its own.
 //!
 //! In 64-bit mode the CPU translates every address through 4 levels of
 //! tables, splitting the address into pieces:
