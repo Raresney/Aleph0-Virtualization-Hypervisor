@@ -35,6 +35,12 @@ pub const PIN_BASED_VIRTUAL_NMIS: u32 = 1 << 5;
 /// Primary processor-based control bit 22: a VM exit (reason 8) as soon as
 /// the guest can take an NMI. Requires virtual NMIs.
 pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
+/// Primary processor-based control bit 31: the CPU also uses the secondary
+/// controls ([`SECONDARY_VM_EXEC_CONTROL`]). Without it they all count as 0.
+pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
+/// Secondary control bit 1: guest-physical addresses are translated through
+/// the EPT tables named by [`EPT_POINTER`].
+pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 /// Exception bitmap: bit N set makes guest exception vector N cause a VM exit
 /// (reason 0) instead of being delivered through the guest's IDT.
 pub const EXCEPTION_BITMAP: u32 = 0x4004;
@@ -63,6 +69,16 @@ pub const VM_ENTRY_MSR_LOAD_COUNT: u32 = 0x4014;
 /// VM-entry interruption-information field: bit 31 set injects an event on
 /// entry, so 0 means no injection.
 pub const VM_ENTRY_INTERRUPTION_INFO: u32 = 0x4016;
+/// Secondary processor-based VM-execution controls. The CPU reads this field
+/// only while primary bit 31 ([`CPU_BASED_ACTIVATE_SECONDARY_CONTROLS`]) is
+/// set.
+pub const SECONDARY_VM_EXEC_CONTROL: u32 = 0x401E;
+
+// ── Control fields (64-bit) ──────────────────────────────────────────────
+
+/// EPT pointer (EPTP): the physical address of the EPT PML4 table, with the
+/// memory type and page-walk length in its low bits (see `vmx::ept::eptp`).
+pub const EPT_POINTER: u32 = 0x201A;
 
 // ── Bits inside the control fields ───────────────────────────────────────
 
@@ -96,8 +112,13 @@ pub const IDT_VECTORING_INFO: u32 = 0x4408;
 /// exits caused by an instruction (VMCALL, CPUID, ...). Used to advance RIP.
 pub const VM_EXIT_INSTRUCTION_LEN: u32 = 0x440C;
 /// Extra exit detail whose meaning depends on the exit reason (natural
-/// width), e.g. the faulting address for an EPT violation.
+/// width), e.g. the kind of access for an EPT violation.
 pub const EXIT_QUALIFICATION: u32 = 0x6400;
+/// Guest-physical address of an EPT violation or misconfiguration (64-bit).
+pub const GUEST_PHYSICAL_ADDRESS: u32 = 0x2400;
+/// Guest-linear address of an EPT violation (natural width), valid when
+/// exit qualification bit 7 is set.
+pub const GUEST_LINEAR_ADDRESS: u32 = 0x640A;
 
 // ── Guest-state fields ───────────────────────────────────────────────────
 
