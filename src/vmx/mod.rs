@@ -25,6 +25,7 @@ pub mod instruction;
 pub mod msr;
 pub mod page;
 pub mod paging;
+pub mod region;
 pub mod segment;
 pub mod vmcs;
 pub mod vmexit;

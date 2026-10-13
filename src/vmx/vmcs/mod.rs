@@ -12,8 +12,8 @@
 //!
 //! Lifecycle:
 //!
-//! 1. [`VmcsRegion::allocate`] + [`VmcsRegion::write_revision_id`] — same as
-//!    the VMXON region.
+//! 1. [`VmxRegion::allocate`] — a page with the revision identifier, same
+//!    as the VMXON region.
 //! 2. [`VmcsRegion::vmclear`] — initialise it and flush any cached data the
 //!    CPU holds for that physical address. Required once before first use,
 //!    even on a freshly zeroed page.
@@ -32,13 +32,11 @@
 //! that once a current VMCS exists, VMfailValid also stores a numeric reason
 //! readable via [`vm_instruction_error`].
 
-use crate::vmx::instruction::{VmxFail, check_rflags};
+use crate::vmx::instruction::{VmxFail, check_rflags, vmx_asm};
 use crate::vmx::msr::{self, VmcsControlMsrs};
+use crate::vmx::region::VmxRegion;
 use crate::vmx::{cr, segment};
 use core::arch::asm;
-
-use super::page::{PAGE_SIZE, allocate_zeroed_page};
-use super::vmxon::vmcs_revision_id;
 
 pub mod fields;
 mod launch;
@@ -48,10 +46,6 @@ pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpe
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
 use fields::*;
-
-/// VMCS region size. Architecturally at most 4 KiB; one page is the norm.
-pub const VMCS_REGION_SIZE: usize = 4096;
-const _: () = assert!(VMCS_REGION_SIZE == PAGE_SIZE);
 
 /// Requested control bits; CPU-required bits are added by `configure_controls`.
 #[derive(Debug, Clone, Copy)]
@@ -138,56 +132,24 @@ impl From<VmxFail> for VmcsError {
     }
 }
 
-/// A 4 KiB, 4 KiB-aligned VMCS region.
+/// A VMCS: a [`VmxRegion`] used as a VMCS, through VMCLEAR and VMPTRLD.
 pub struct VmcsRegion {
-    /// Physical address of the region. Equal to the virtual address under UEFI.
-    phys_addr: u64,
+    region: VmxRegion,
 }
 
 impl VmcsRegion {
-    /// Allocates and zeroes one page through UEFI Boot Services.
-    pub fn allocate() -> Result<Self, VmcsError> {
-        let ptr = allocate_zeroed_page(VmcsError::AllocationFailed)?;
-
-        Ok(Self {
-            phys_addr: ptr.as_ptr() as u64,
-        })
-    }
-
-    /// Address of the field holding the physical address, for the memory
-    /// operand that VMCLEAR and VMPTRLD take.
-    pub fn phys_addr_ref(&self) -> &u64 {
-        &self.phys_addr
-    }
-
-    /// Writes the VMCS revision identifier into the first four bytes.
-    ///
-    /// # Safety
-    ///
-    /// The region must not be in use as a VMCS when it is modified.
-    pub unsafe fn write_revision_id(&mut self, revision_id: u32) {
-        unsafe {
-            (self.phys_addr as *mut u32).write_volatile(revision_id);
-        }
-    }
-
     /// Initialises the VMCS and flushes CPU-cached data for its address.
     ///
     /// Must run once before the region is first used, and again whenever a
     /// VMCS stops being current on this processor.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must be in VMX root operation.
     pub unsafe fn vmclear(&self) -> Result<(), VmcsError> {
-        let rflags: u64;
-        unsafe {
-            asm!(
-                "vmclear [{0}]",
-                "pushfq",
-                "pop {1}",
-                in(reg) self.phys_addr_ref(),
-                lateout(reg) rflags
-            );
-        }
-
-        Ok(check_rflags(rflags)?)
+        // SAFETY: VMCLEAR reads only the 8-byte operand and works on a region
+        // this value owns; the caller guarantees VMX root operation.
+        Ok(unsafe { vmx_asm!("vmclear [{0}]", in(reg) self.region.phys_addr_ref()) }?)
     }
 
     /// Allocates a VMCS, initialises it, and makes it the current VMCS.
@@ -199,31 +161,30 @@ impl VmcsRegion {
     ///
     /// The CPU must be in VMX root operation.
     pub unsafe fn create_current() -> Result<Self, VmcsError> {
+        // SAFETY: VMX root operation (the caller's obligation) implies VMX
+        // support. The revision identifier is written before VMPTRLD, not
+        // just before use: VMPTRLD rejects a region whose identifier does
+        // not match the CPU (error 11).
         unsafe {
-            let mut region = Self::allocate()?;
-            // Before VMPTRLD, not just before use: VMPTRLD rejects a region
-            // whose revision identifier does not match the CPU (error 11).
-            region.write_revision_id(vmcs_revision_id());
-            region.vmclear()?;
-            region.vmptrld()?;
-            Ok(region)
+            let vmcs = Self {
+                region: VmxRegion::allocate(VmcsError::AllocationFailed)?,
+            };
+            vmcs.vmclear()?;
+            vmcs.vmptrld()?;
+            Ok(vmcs)
         }
     }
 
     /// Makes this VMCS the current one for this logical processor.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must be in VMX root operation, and the region must have been
+    /// cleared with [`VmcsRegion::vmclear`].
     pub unsafe fn vmptrld(&self) -> Result<(), VmcsError> {
-        let rflags: u64;
-        unsafe {
-            asm!(
-                "vmptrld [{0}]",
-                "pushfq",
-                "pop {1}",
-                in(reg) self.phys_addr_ref(),
-                lateout(reg) rflags
-            );
-        }
-
-        Ok(check_rflags(rflags)?)
+        // SAFETY: VMPTRLD reads only the 8-byte operand; the caller
+        // guarantees VMX root operation and a cleared region.
+        Ok(unsafe { vmx_asm!("vmptrld [{0}]", in(reg) self.region.phys_addr_ref()) }?)
     }
 }
 

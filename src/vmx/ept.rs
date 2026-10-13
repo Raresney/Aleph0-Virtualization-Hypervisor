@@ -37,13 +37,12 @@
 //! and [`grant_write`] makes it writable when that exit arrives. The
 //! longer walkthrough is in `docs/EPT.md`.
 
-use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
 
-use super::instruction::{VmxFail, check_rflags};
+use super::instruction::{VmxFail, vmx_asm};
 use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 
 /// Entry bit 0: reads allowed.
@@ -427,20 +426,21 @@ struct InveptDescriptor {
 
 /// Runs INVEPT. Like the other VMX instructions it reports failure through
 /// RFLAGS.
+///
+/// # Safety
+///
+/// The CPU must be in VMX root operation.
 unsafe fn invalidate(kind: InveptType, eptp: u64) -> Result<(), VmxFail> {
     let descriptor = InveptDescriptor { eptp, reserved: 0 };
-    let rflags: u64;
+    // SAFETY: INVEPT reads only the 16-byte descriptor, which lives on this
+    // stack frame; the caller guarantees VMX root operation.
     unsafe {
-        asm!(
+        vmx_asm!(
             "invept {kind}, [{descriptor}]",
-            "pushfq",
-            "pop {rflags}",
             kind = in(reg) kind as u64,
-            descriptor = in(reg) &descriptor,
-            rflags = lateout(reg) rflags,
-        );
+            descriptor = in(reg) &descriptor
+        )
     }
-    check_rflags(rflags)
 }
 
 #[cfg(test)]
