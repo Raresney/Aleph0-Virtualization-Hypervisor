@@ -78,6 +78,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ///
 /// `-> !` ("never") tells the compiler this function does not return, which
 /// is what lets the panic handler end with a call to it.
+///
+/// Not compiled for host tests, whose `std` panic handler replaces Aleph0's.
+#[cfg(not(test))]
 pub fn halt_forever() -> ! {
     loop {
         // `nomem`/`nostack`: no memory or stack access. `preserves_flags` is

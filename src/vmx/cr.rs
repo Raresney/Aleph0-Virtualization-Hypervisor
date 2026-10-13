@@ -62,17 +62,6 @@ pub unsafe fn read_cr3() -> u64 {
     value
 }
 
-/// Writes CR3.
-pub unsafe fn write_cr3(value: u64) {
-    unsafe {
-        asm!(
-            "mov cr3, {}",
-            in(reg) value,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
 /// Reads CR4.
 pub unsafe fn read_cr4() -> u64 {
     let value: u64;

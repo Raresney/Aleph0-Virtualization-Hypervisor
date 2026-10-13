@@ -102,11 +102,11 @@ pub(super) unsafe fn teardown(
         segment::load_idtr(&firmware.idtr);
     }
 
-    if let Some(vmcs) = vmcs {
-        if let Err(error) = unsafe { vmcs.vmclear() } {
-            log!("Teardown: VMCLEAR failed: {error:?}.");
-            result = Err(TeardownError::Vmclear(error));
-        }
+    if let Some(vmcs) = vmcs
+        && let Err(error) = unsafe { vmcs.vmclear() }
+    {
+        log!("Teardown: VMCLEAR failed: {error:?}.");
+        result = Err(TeardownError::Vmclear(error));
     }
 
     if let Err(fail) = unsafe { vmx_operation.leave() } {

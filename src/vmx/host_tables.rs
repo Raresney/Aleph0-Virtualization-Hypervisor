@@ -213,7 +213,7 @@ impl GdtRegion {
     /// descriptor busy, so the pre-load verifier will reject a second call.
     /// If post-load verification fails, the CPU still uses the new tables.
     pub unsafe fn activate(&self, tss_region: &TssRegion) -> Result<(), GdtError> {
-        if !self.verify_tss_descriptor(&tss_region) {
+        if !self.verify_tss_descriptor(tss_region) {
             return Err(GdtError::TssVerificationFailed);
         }
         let gdtr = self.prepared_gdtr().ok_or(GdtError::GdtrPreparationFailed)?;
@@ -233,7 +233,7 @@ impl GdtRegion {
 
         let idtr = unsafe { read_idtr() };
         let idt_length = idtr.limit as usize + 1;
-        if idtr.base == 0 || idt_length % 16 != 0 {
+        if idtr.base == 0 || !idt_length.is_multiple_of(16) {
             return Err(GdtError::InvalidIdt);
         }
         let idt = idtr.base as *const u8;

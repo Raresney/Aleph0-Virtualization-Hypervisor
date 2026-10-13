@@ -484,22 +484,20 @@ fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: Ex
         rip
     };
 
-    if inject_nmi {
-        if let Err(error) = unsafe { vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, INJECT_NMI.into()) } {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: could not queue the NMI for injection ({error:?}); not resuming."
-            );
-            return None;
-        }
+    if inject_nmi && let Err(error) = unsafe { vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, INJECT_NMI.into()) } {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: could not queue the NMI for injection ({error:?}); not resuming."
+        );
+        return None;
     }
-    if let Some(on) = nmi_window {
-        if let Err(error) = unsafe { vmcs::set_nmi_window_exiting(on) } {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: could not turn NMI-window exiting {} ({error:?}); not resuming.",
-                if on { "on" } else { "off" },
-            );
-            return None;
-        }
+    if let Some(on) = nmi_window
+        && let Err(error) = unsafe { vmcs::set_nmi_window_exiting(on) }
+    {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: could not turn NMI-window exiting {} ({error:?}); not resuming.",
+            if on { "on" } else { "off" },
+        );
+        return None;
     }
     let invept = if grant_write {
         match unsafe { ept::grant_write() } {

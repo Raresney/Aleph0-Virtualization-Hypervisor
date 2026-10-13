@@ -178,17 +178,3 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 
     ((high as u64) << 32) | low as u64
 }
-
-/// Writes an MSR. `value` is split into EDX (high 32) : EAX (low 32).
-pub unsafe fn wrmsr(msr: u32, value: u64) {
-    let (low, high): (u32, u32) = (value as u32, (value >> 32) as u32);
-    unsafe {
-        asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") low,
-            in("edx") high,
-            options(nostack, preserves_flags),
-        );
-    }
-}

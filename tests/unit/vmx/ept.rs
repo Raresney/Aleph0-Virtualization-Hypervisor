@@ -61,7 +61,7 @@ fn read_only_page_entry_has_only_r() {
 
 #[test]
 fn eptp_low_bits_are_write_back_and_4_levels() {
-    assert_eq!(eptp(0x7e00_0000), 0x7e00_001E);
+    assert_eq!(eptp(0x7e00_0000), 0x7e00_001e);
 }
 
 #[test]

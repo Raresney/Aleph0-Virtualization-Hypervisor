@@ -305,7 +305,7 @@ impl Ept {
     pub unsafe fn build(protected_page: u64, invept: InveptType) -> Result<Self, EptError> {
         let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| EptError::MemoryMapUnavailable)?;
         let end = identity_map_end(map.entries().map(|region| (region.phys_start, region.page_count)))?;
-        if protected_page >= end || protected_page % SIZE_4K != 0 {
+        if protected_page >= end || !protected_page.is_multiple_of(SIZE_4K) {
             return Err(EptError::ProtectedPageOutsideMap);
         }
 
