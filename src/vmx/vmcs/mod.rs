@@ -58,6 +58,9 @@ const _: () = assert!(VMCS_REGION_SIZE == PAGE_SIZE);
 pub struct DesiredControls {
     pub pin: u32,
     pub primary: u32,
+    /// Secondary processor-based controls. Nonzero also turns on primary
+    /// bit 31, without which the CPU ignores them.
+    pub secondary: u32,
     pub exit: u32,
     pub entry: u32,
 }
@@ -65,14 +68,25 @@ pub struct DesiredControls {
 impl DesiredControls {
     /// Minimal requests for a 64-bit guest on this 64-bit host, plus NMI
     /// exiting with virtual NMIs, so Aleph0 sees the guest's NMIs and can
-    /// reinject them.
+    /// reinject them, and EPT, so guest memory goes through Aleph0's tables.
     pub const fn minimal_64_bit_guest() -> Self {
         Self {
             pin: PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS,
             primary: 0,
+            secondary: SECONDARY_ENABLE_EPT,
             exit: VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
             entry: VM_ENTRY_IA32E_MODE_GUEST,
         }
+    }
+}
+
+/// The primary controls to request for `desired`: its own bits, plus
+/// "activate secondary controls" when it asks for any secondary control.
+fn primary_request(desired: DesiredControls) -> u32 {
+    if desired.secondary != 0 {
+        desired.primary | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+    } else {
+        desired.primary
     }
 }
 
@@ -289,6 +303,8 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 
 /// Derive legal pin, primary, exit, and entry controls from the CPU masks,
 /// write them to the current VMCS, and verify each field by reading it back.
+/// When `desired.secondary` is nonzero, the secondary controls are chosen,
+/// written and verified the same way, and primary bit 31 activates them.
 /// Always request 64-bit host mode on VM exit, regardless of `desired.exit`.
 /// Also zeroes the counts and fields VM entry checks, and makes every guest
 /// exception exit ([`EXCEPTION_BITMAP_ALL`]). It also checks that the CPU
@@ -300,7 +316,12 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 /// VMX operation must be active and a VMCS must be current on this CPU.
 pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: DesiredControls) -> Result<(), VmcsError> {
     let pin = choose_control(capabilities.pinbased, desired.pin)?;
-    let primary = choose_control(capabilities.primary, desired.primary)?;
+    let primary = choose_control(capabilities.primary, primary_request(desired))?;
+    let secondary = if desired.secondary != 0 {
+        Some(choose_control(capabilities.secondary, desired.secondary)?)
+    } else {
+        None
+    };
     // NMI-window exiting is only switched on while an NMI waits for
     // injection (`set_nmi_window_exiting`), but the CPU must allow it.
     choose_control(capabilities.primary, CPU_BASED_NMI_WINDOW_EXITING)
@@ -326,6 +347,12 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
         }
         if vmread(VM_ENTRY_CONTROLS)? != entry as u64 {
             return Err(VmcsError::ControlReadbackMismatch);
+        }
+        if let Some(secondary) = secondary {
+            vmwrite(SECONDARY_VM_EXEC_CONTROL, secondary.into())?;
+            if vmread(SECONDARY_VM_EXEC_CONTROL)? != secondary as u64 {
+                return Err(VmcsError::ControlReadbackMismatch);
+            }
         }
 
         // VM entry checks these fields, and VMCLEAR does not guarantee that
@@ -492,6 +519,23 @@ fn with_nmi_window_exiting(primary: u64, on: bool) -> u64 {
 pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
     let primary = unsafe { vmread(PRIMARY_VM_EXEC_CONTROL)? };
     unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
+}
+
+/// Writes the EPT pointer (see `vmx::ept::eptp`) and reads it back. VM entry
+/// checks it only when the "enable EPT" secondary control is set.
+///
+/// # Safety
+///
+/// VMX operation with a current VMCS. The tables `eptp` names must stay
+/// allocated for as long as the VMCS may be used.
+pub unsafe fn set_ept_pointer(eptp: u64) -> Result<(), VmcsError> {
+    unsafe {
+        vmwrite(EPT_POINTER, eptp)?;
+        if vmread(EPT_POINTER)? != eptp {
+            return Err(VmcsError::ControlReadbackMismatch);
+        }
+    }
+    Ok(())
 }
 
 /// The numeric reason the last VMX instruction failed.
