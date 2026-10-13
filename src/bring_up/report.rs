@@ -64,6 +64,7 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
         ("code", guest.code_base(), mappings.code),
         ("stack", stack_base, mappings.stack),
         ("IDT", guest.idt().base, mappings.idt),
+        ("data", guest.data_page(), mappings.data),
     ] {
         log!(
             "Guest {name} page: virt={virtual_address:#018x} phys={:#018x} identity={} size={:?} writable={} user={} xd={}",
@@ -77,7 +78,7 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     let nxe = unsafe { vmx::msr::rdmsr(vmx::msr::IA32_EFER) } & vmx::msr::EFER_NXE != 0;
     let cr4 = unsafe { vmx::cr::read_cr4() };
     log!(
-        "Guest code page executable and stack page writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
+        "Guest code page executable, stack and data pages writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
         cr4 & vmx::cr::CR4_SMEP != 0, cr4 & vmx::cr::CR4_SMAP != 0,
     );
 }
