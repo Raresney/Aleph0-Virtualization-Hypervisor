@@ -34,10 +34,11 @@
 //! Aleph0 builds an identity map (GPA = HPA) of all memory, so the guest
 //! runs exactly as without EPT. One 4 KiB page, the guest's data page, is
 //! mapped read-only: a guest write to it is the intentional EPT violation,
-//! and [`grant_write`] makes it writable when that exit arrives. The
+//! and [`ProtectedPage::grant_write`] makes it writable when that exit
+//! arrives. The
 //! longer walkthrough is in `docs/EPT.md`.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
@@ -131,6 +132,9 @@ pub enum EptError {
     ProtectedPageOutsideMap,
     /// UEFI could not provide the table pages.
     AllocationFailed,
+    /// An EPT was already built and its protected page published; the exit
+    /// handler knows one protected page only.
+    AlreadyBuilt,
 }
 
 /// Checks that this CPU supports the EPT Aleph0 builds, and picks the INVEPT
@@ -272,23 +276,22 @@ struct Tables<'a> {
     pt_address: u64,
 }
 
-/// Fills `tables` with an identity map of `[0, end)`: 2 MiB pages, RWX,
-/// write-back, except the 2 MiB region holding `protected_page`. That
+/// Fills `tables` with an identity map of the first `gibs` GiB: 2 MiB pages,
+/// RWX, write-back, except the 2 MiB region holding `protected_page`. That
 /// region goes through the PT in 4 KiB pages, and `protected_page` itself
 /// is read-only. Returns the PT index of `protected_page`.
 ///
-/// `end` is a multiple of 1 GiB, `pds` holds `end / 1 GiB` tables, and
-/// `protected_page` is 4 KiB-aligned and below `end`; [`Ept::build`]
-/// checks all three.
-fn fill_identity_map(tables: Tables<'_>, end: u64, protected_page: u64) -> usize {
-    let gibs = (end / SIZE_1G) as usize;
+/// `pds` holds `gibs` tables, and `protected_page` is 4 KiB-aligned and
+/// inside the map; [`Ept::build`] checks both.
+fn fill_identity_map(tables: Tables<'_>, gibs: usize, protected_page: u64) -> usize {
+    debug_assert!(tables.pds.len() == gibs * ENTRIES);
     tables.pml4[0] = EptEntry::table(tables.pdpt_address);
     for gib in 0..gibs {
         tables.pdpt[gib] = EptEntry::table(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
     }
 
     // PD entry number `i` across all PDs maps GPA i * 2 MiB.
-    for (i, entry) in tables.pds.iter_mut().enumerate().take(gibs * ENTRIES) {
+    for (i, entry) in tables.pds.iter_mut().enumerate() {
         *entry = EptEntry::large_page(i as u64 * SIZE_2M);
     }
     // The PDs are back to back, one per PDPT entry, so the PD entry for an
@@ -315,8 +318,9 @@ pub struct Ept {
 
 impl Ept {
     /// Builds the identity map from the UEFI memory map, with
-    /// `protected_page` read-only, and publishes what [`grant_write`] needs
-    /// later in the exit handler.
+    /// `protected_page` read-only, and publishes the [`ProtectedPage`] the
+    /// exit handler needs later. Refuses a second build with
+    /// [`EptError::AlreadyBuilt`]: the handler knows one page only.
     ///
     /// # Safety
     ///
@@ -351,7 +355,7 @@ impl Ept {
                 pds_address: pds,
                 pt_address: pt,
             },
-            end,
+            gibs,
             protected_page,
         );
 
@@ -360,10 +364,12 @@ impl Ept {
             end,
             table_pages: gibs + 3,
         };
-        PROTECTED_PAGE.store(protected_page, Ordering::Relaxed);
-        PROTECTED_ENTRY.store(pt + (protected * size_of::<EptEntry>()) as u64, Ordering::Relaxed);
-        PUBLISHED_EPTP.store(ept.eptp.raw(), Ordering::Relaxed);
-        INVEPT_TYPE.store(invept as u64, Ordering::Relaxed);
+        publish(ProtectedPage {
+            gpa: protected_page,
+            entry: (pt as *mut EptEntry).wrapping_add(protected),
+            eptp: ept.eptp,
+            invept,
+        })?;
         Ok(ept)
     }
 
@@ -383,59 +389,88 @@ impl Ept {
     }
 }
 
+/// The page [`Ept::build`] maps read-only, with what making it writable
+/// needs: its PT entry, the EPTP, and the INVEPT type to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectedPage {
+    /// Guest-physical address of the page.
+    pub gpa: u64,
+    /// Its entry in the PT [`Ept::build`] filled.
+    entry: *mut EptEntry,
+    eptp: Eptp,
+    invept: InveptType,
+}
+
+impl ProtectedPage {
+    /// Makes the page writable and drops cached translations with INVEPT.
+    /// Returns the INVEPT type used, for the report.
+    ///
+    /// The CPU already drops the translation that caused an EPT violation,
+    /// so the retried write would see the new entry even without INVEPT.
+    /// INVEPT is still the architectural way to publish an EPT change, and
+    /// changes not caused by a violation need it.
+    ///
+    /// # Safety
+    ///
+    /// VMX root operation, and [`Ept::build`]'s tables still in place. Called
+    /// from the exit handler, while the guest is not running.
+    pub unsafe fn grant_write(&self) -> Result<InveptType, VmxFail> {
+        // SAFETY: `entry` points into the PT `Ept::build` filled, which is
+        // never freed, and the guest is not running to race with the write.
+        // The caller guarantees VMX root operation for INVEPT.
+        unsafe {
+            self.entry
+                .write_volatile(self.entry.read_volatile().with_access(EPT_READ | EPT_WRITE));
+            invalidate(self.invept, self.eptp)?;
+        }
+        Ok(self.invept)
+    }
+}
+
 // What `Ept::build` publishes for the exit handler, which cannot take
 // arguments from bring-up. Written once before VMLAUNCH; read only in exit
-// context, on the one CPU that runs the guest.
-/// GPA of the read-only page, 0 before `build`.
-static PROTECTED_PAGE: AtomicU64 = AtomicU64::new(0);
-/// Address of its PT entry, 0 before `build`.
-static PROTECTED_ENTRY: AtomicU64 = AtomicU64::new(0);
+// context, on the one CPU that runs the guest. Atomics rather than a
+// `static mut` or a lock: this `no_std` build has neither an allocator for
+// `Once`-style cells nor a `Mutex`.
+static PROTECTED_GPA: AtomicU64 = AtomicU64::new(0);
+static PROTECTED_ENTRY: AtomicPtr<EptEntry> = AtomicPtr::new(core::ptr::null_mut());
 static PUBLISHED_EPTP: AtomicU64 = AtomicU64::new(0);
-/// An [`InveptType`] as its operand value.
-static INVEPT_TYPE: AtomicU64 = AtomicU64::new(0);
+/// The [`InveptType`] as its operand value, and the "published" flag: 0
+/// until [`publish`] has stored everything else. Written last (Release),
+/// read first (Acquire), so a reader that sees a type sees the rest.
+static INVEPT_TYPE: AtomicU8 = AtomicU8::new(0);
 
-/// GPA of the page [`Ept::build`] made read-only, or 0 before it ran.
-pub fn protected_page() -> u64 {
-    PROTECTED_PAGE.load(Ordering::Relaxed)
+/// The INVEPT type stored as `value`, or `None` for anything [`publish`]
+/// never stores: 0 (nothing published) or an unknown type.
+fn decode_invept(value: u8) -> Option<InveptType> {
+    match value {
+        1 => Some(InveptType::SingleContext),
+        2 => Some(InveptType::AllContext),
+        _ => None,
+    }
 }
 
-/// Why [`grant_write`] failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantError {
-    /// [`Ept::build`] never ran, so there is no page to unprotect.
-    NothingProtected,
-    /// INVEPT failed: CF (invalid) or ZF (valid, see the VM-instruction
-    /// error).
-    Invept(VmxFail),
+/// Publishes `page` for [`protected_page`]. Refuses a second publication.
+fn publish(page: ProtectedPage) -> Result<(), EptError> {
+    if decode_invept(INVEPT_TYPE.load(Ordering::Acquire)).is_some() {
+        return Err(EptError::AlreadyBuilt);
+    }
+    PROTECTED_GPA.store(page.gpa, Ordering::Relaxed);
+    PROTECTED_ENTRY.store(page.entry, Ordering::Relaxed);
+    PUBLISHED_EPTP.store(page.eptp.raw(), Ordering::Relaxed);
+    INVEPT_TYPE.store(page.invept as u8, Ordering::Release);
+    Ok(())
 }
 
-/// Makes the protected page writable and drops cached translations with
-/// INVEPT. Returns the INVEPT type used, for the report.
-///
-/// The CPU already drops the translation that caused an EPT violation, so
-/// the retried write would see the new entry even without INVEPT. INVEPT is
-/// still the architectural way to publish an EPT change, and changes not
-/// caused by a violation need it.
-///
-/// # Safety
-///
-/// VMX root operation, and [`Ept::build`]'s tables still in place. Called
-/// from the exit handler, while the guest is not running.
-pub unsafe fn grant_write() -> Result<InveptType, GrantError> {
-    let entry = PROTECTED_ENTRY.load(Ordering::Relaxed);
-    if entry == 0 {
-        return Err(GrantError::NothingProtected);
-    }
-    let invept = match INVEPT_TYPE.load(Ordering::Relaxed) {
-        1 => InveptType::SingleContext,
-        _ => InveptType::AllContext,
-    };
-    unsafe {
-        let entry = entry as *mut EptEntry;
-        entry.write_volatile(entry.read_volatile().with_access(EPT_READ | EPT_WRITE));
-        invalidate(invept, Eptp(PUBLISHED_EPTP.load(Ordering::Relaxed))).map_err(GrantError::Invept)?;
-    }
-    Ok(invept)
+/// The page [`Ept::build`] made read-only, or `None` before it ran.
+pub fn protected_page() -> Option<ProtectedPage> {
+    let invept = decode_invept(INVEPT_TYPE.load(Ordering::Acquire))?;
+    Some(ProtectedPage {
+        gpa: PROTECTED_GPA.load(Ordering::Relaxed),
+        entry: PROTECTED_ENTRY.load(Ordering::Relaxed),
+        eptp: Eptp(PUBLISHED_EPTP.load(Ordering::Relaxed)),
+        invept,
+    })
 }
 
 /// The 128-bit INVEPT descriptor: the EPTP, then 64 reserved bits that must

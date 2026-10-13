@@ -220,6 +220,22 @@ pub enum GuestMemoryError {
     /// The data page is a user page and CR4.SMAP is set, so the ring-0
     /// guest's accesses to it would fault before reaching EPT.
     DataBlockedBySmap,
+    /// The page tables map a guest page somewhere other than itself. Guest
+    /// RIP, RSP and IDTR are these virtual addresses, and the EPT identity
+    /// map and its protected GPA assume virtual = guest-physical = physical.
+    NotIdentityMapped { virtual_address: u64, physical: u64 },
+}
+
+/// Checks that `mapping`, the page-table walk of `virtual_address`, maps it
+/// to the same physical address.
+fn check_identity(virtual_address: u64, mapping: &Mapping) -> Result<(), GuestMemoryError> {
+    if mapping.physical != virtual_address {
+        return Err(GuestMemoryError::NotIdentityMapped {
+            virtual_address,
+            physical: mapping.physical,
+        });
+    }
+    Ok(())
 }
 
 /// Checks that a ring-0 guest running with `cr4` can execute from `code`
@@ -354,8 +370,9 @@ impl GuestMemory {
     }
 
     /// Walks the current page tables for the four pages and checks that
-    /// the code page is executable, the stack and data pages writable, and
-    /// the IDT page readable by the CPU on the ring-0 guest's behalf.
+    /// each is identity-mapped ([`check_identity`]), the code page
+    /// executable, the stack and data pages writable, and the IDT page
+    /// readable by the CPU on the ring-0 guest's behalf.
     ///
     /// The guest will use these same tables (guest CR3 = host CR3); EPT
     /// translates their result a second time.
@@ -372,11 +389,19 @@ impl GuestMemory {
     ///
     /// Boot services must still be active; see [`paging::walk_current`].
     pub unsafe fn check_mappings(&self) -> Result<GuestMappings, GuestMemoryError> {
+        let stack_base = self.stack.as_ptr() as u64;
         let code = unsafe { paging::walk_current(self.code_base()) }.map_err(GuestMemoryError::CodeNotMapped)?;
-        let stack =
-            unsafe { paging::walk_current(self.stack.as_ptr() as u64) }.map_err(GuestMemoryError::StackNotMapped)?;
+        let stack = unsafe { paging::walk_current(stack_base) }.map_err(GuestMemoryError::StackNotMapped)?;
         let idt = unsafe { paging::walk_current(self.idt().base) }.map_err(GuestMemoryError::IdtNotMapped)?;
         let data = unsafe { paging::walk_current(self.data_page()) }.map_err(GuestMemoryError::DataNotMapped)?;
+        for (virtual_address, mapping) in [
+            (self.code_base(), &code),
+            (stack_base, &stack),
+            (self.idt().base, &idt),
+            (self.data_page(), &data),
+        ] {
+            check_identity(virtual_address, mapping)?;
+        }
 
         let cr4 = read_cr4();
         check_permissions(&code, &stack, cr4)?;

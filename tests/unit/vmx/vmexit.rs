@@ -43,12 +43,7 @@ fn exception_vector_needs_the_valid_bit() {
     assert_eq!(InterruptionInfo(0x0000_0B0E).vector(), None);
 }
 
-const RESUME: ExitAction = ExitAction::Resume {
-    advance_rip: true,
-    inject_nmi: false,
-    nmi_window: None,
-    grant_write: false,
-};
+const RESUME: ExitAction = ExitAction::Resume(ResumePlan::PAST_INSTRUCTION);
 
 #[test]
 fn resume_tells_the_stub_to_resume() {

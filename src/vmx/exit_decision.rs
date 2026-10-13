@@ -12,7 +12,8 @@
 //! ```text
 //! EPT violation  ──▶ a write to the protected data page: make it writable,
 //!                    resume at the same RIP so the write is retried
-//! main VMCALL #1 ──▶ resume past it (only after the EPT violation)
+//! main VMCALL #1 ──▶ resume past it (only after the EPT violation, and only
+//!                    if ECX/EDX hold the data page's seed and new value)
 //! NMI exit       ──▶ guest can take the NMI:  inject it at the next entry
 //!                    guest cannot yet (STI, MOV SS or NMI blocking):
 //!                                             turn on NMI-window exiting,
@@ -21,7 +22,7 @@
 //! main VMCALL #2 ──▶ finished
 //! ```
 
-use super::guest::{GUEST_MARKER, GUEST_NMI_MARKER};
+use super::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 use super::vmexit::ExitReason;
 
 /// Basic exit reason of an exception or NMI exit.
@@ -182,6 +183,10 @@ pub struct ExitInfo {
     /// VM_EXIT_INTERRUPTION_INFO.
     pub interruption_info: InterruptionInfo,
     pub guest_rax: u64,
+    /// The guest's RCX and RDX: at main VMCALL #1, what it read from its
+    /// data page before and after its write.
+    pub guest_rcx: u64,
+    pub guest_rdx: u64,
     /// GUEST_INTERRUPTIBILITY_STATE.
     pub interruptibility: u32,
     /// IDT_VECTORING_INFO bit 31: the exit interrupted an event's delivery
@@ -235,27 +240,70 @@ pub enum ExitEvent {
     /// A main VMCALL arrived before any EPT violation: the write to the data
     /// page went through, so EPT did not protect it.
     EptWriteMissing,
+    /// Main VMCALL #1 after the granted write, but ECX/EDX do not hold what
+    /// the guest should have read from its data page: the seed before its
+    /// write, its own value after it.
+    DataPageMismatch,
     /// Anything else.
     Unexpected,
+}
+
+/// How the handler prepares the VMCS (and EPT) before resuming the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePlan {
+    /// Move GUEST_RIP past the exiting instruction (a VMCALL).
+    pub advance_rip: bool,
+    /// Write [`InterruptionInfo::NMI`] to VM_ENTRY_INTERRUPTION_INFO.
+    pub inject_nmi: bool,
+    /// Turn NMI-window exiting on (`Some(true)`) or off (`Some(false)`), or
+    /// leave it (`None`).
+    pub nmi_window: Option<bool>,
+    /// Make the protected page writable in EPT
+    /// (`ept::ProtectedPage::grant_write`).
+    pub grant_write: bool,
+}
+
+impl ResumePlan {
+    /// Go on after the exiting instruction (a VMCALL).
+    pub const PAST_INSTRUCTION: Self = Self {
+        advance_rip: true,
+        inject_nmi: false,
+        nmi_window: None,
+        grant_write: false,
+    };
+    /// Inject an NMI, delivered before the instruction the guest was about
+    /// to run. Injecting always turns NMI-window exiting off: it may have
+    /// been on for an earlier NMI the new one replaces, and turning it off
+    /// when it was already off is harmless.
+    pub const INJECT_NMI: Self = Self {
+        advance_rip: false,
+        inject_nmi: true,
+        nmi_window: Some(false),
+        grant_write: false,
+    };
+    /// Go on where the guest was, with NMI-window exiting on, so the next
+    /// exit comes as soon as the guest can take an NMI.
+    pub const WAIT_FOR_NMI_WINDOW: Self = Self {
+        advance_rip: false,
+        inject_nmi: false,
+        nmi_window: Some(true),
+        grant_write: false,
+    };
+    /// Make the protected page writable; RIP stays on the faulting write, so
+    /// it runs again.
+    pub const RETRY_AFTER_GRANT: Self = Self {
+        advance_rip: false,
+        inject_nmi: false,
+        nmi_window: None,
+        grant_write: true,
+    };
 }
 
 /// What the handler does after an exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitAction {
-    /// Return to the guest.
-    ///
-    /// `advance_rip`: move GUEST_RIP past the exiting instruction (a
-    /// VMCALL). `inject_nmi`: write [`InterruptionInfo::NMI`] to
-    /// VM_ENTRY_INTERRUPTION_INFO. `nmi_window`: turn NMI-window exiting on
-    /// (`Some(true)`) or off (`Some(false)`), or leave it (`None`).
-    /// `grant_write`: make the protected page writable in EPT
-    /// (`ept::grant_write`).
-    Resume {
-        advance_rip: bool,
-        inject_nmi: bool,
-        nmi_window: Option<bool>,
-        grant_write: bool,
-    },
+    /// Return to the guest, after preparing it as the plan says.
+    Resume(ResumePlan),
     /// The last planned exit arrived as expected; stop.
     Finished,
     /// Not an exit this hypervisor handles; stop without resuming.
@@ -264,32 +312,25 @@ pub enum ExitAction {
 
 impl ExitEvent {
     /// The action for this event.
-    ///
-    /// Injecting always turns NMI-window exiting off: it may have been on
-    /// for an earlier NMI the new one replaces, and turning it off when it
-    /// was already off is harmless.
     pub fn action(self) -> ExitAction {
-        let resume = |advance_rip, inject_nmi, nmi_window| ExitAction::Resume {
-            advance_rip,
-            inject_nmi,
-            nmi_window,
-            grant_write: false,
-        };
         match self {
-            Self::MainVmcall | Self::GuestNmiHandler => resume(true, false, None),
-            Self::NmiInjected | Self::NmiWindowInjected => resume(false, true, Some(false)),
-            Self::NmiDeferred => resume(false, false, Some(true)),
-            // RIP stays on the faulting write, so it runs again.
-            Self::EptWriteGranted => ExitAction::Resume {
-                advance_rip: false,
-                inject_nmi: false,
-                nmi_window: None,
-                grant_write: true,
-            },
+            Self::MainVmcall | Self::GuestNmiHandler => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
+            Self::NmiInjected | Self::NmiWindowInjected => ExitAction::Resume(ResumePlan::INJECT_NMI),
+            Self::NmiDeferred => ExitAction::Resume(ResumePlan::WAIT_FOR_NMI_WINDOW),
+            Self::EptWriteGranted => ExitAction::Resume(ResumePlan::RETRY_AFTER_GRANT),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::InterruptedDelivery | Self::EptWriteMissing | Self::Unexpected => ExitAction::Unexpected,
+            Self::InterruptedDelivery | Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => {
+                ExitAction::Unexpected
+            }
         }
     }
+}
+
+/// Whether, at main VMCALL #1, ECX holds the seed the guest read from its
+/// data page and EDX the value it wrote and read back. Compared as 32-bit
+/// values: the guest loads both with 32-bit moves.
+fn data_page_read_back(exit: &ExitInfo) -> bool {
+    exit.guest_rcx as u32 == GUEST_DATA_SEED && exit.guest_rdx as u32 == GUEST_EPT_VALUE
 }
 
 /// The guest's RAX at its next main VMCALL: the marker, plus one for each
@@ -305,7 +346,7 @@ pub fn expected_main_rax(state: ExitState) -> u64 {
 /// NMIs never queue: a new NMI while one is pending replaces it, as on real
 /// hardware, where at most one NMI waits. Exactly one EPT violation is
 /// handled, a write to the protected page, and it must come before the
-/// first main VMCALL.
+/// first main VMCALL, which must show the data page read back as planned.
 pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
@@ -364,6 +405,11 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         ),
         EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) && state.ept_writes_granted == 0 => {
             (ExitEvent::EptWriteMissing, state)
+        }
+        EXIT_REASON_VMCALL
+            if exit.guest_rax == expected_main_rax(state) && state.main_vmcalls == 0 && !data_page_read_back(&exit) =>
+        {
+            (ExitEvent::DataPageMismatch, state)
         }
         EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) => {
             let state = ExitState {

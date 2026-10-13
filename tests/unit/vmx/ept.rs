@@ -126,7 +126,7 @@ fn filled(protected_page: u64) -> (Vec<EptEntry>, Vec<EptEntry>, Vec<EptEntry>, 
             pds_address: 0x2000,
             pt_address: 0x4000,
         },
-        2 * SIZE_1G,
+        2,
         protected_page,
     );
     (pml4, pdpt, pds, pt, protected)
@@ -160,4 +160,13 @@ fn identity_map_makes_only_the_protected_page_read_only() {
     assert_eq!(pt[0x11C], EptEntry::page(0x7eb1_c000, EPT_RWX));
     assert_eq!(pt[0], EptEntry::page(0x7ea0_0000, EPT_RWX));
     assert_eq!(pt[511], EptEntry::page(0x7ebf_f000, EPT_RWX));
+}
+
+#[test]
+fn only_published_invept_types_decode() {
+    assert_eq!(decode_invept(0), None, "nothing published");
+    assert_eq!(decode_invept(1), Some(InveptType::SingleContext));
+    assert_eq!(decode_invept(2), Some(InveptType::AllContext));
+    assert_eq!(decode_invept(3), None);
+    assert_eq!(decode_invept(0xFF), None);
 }

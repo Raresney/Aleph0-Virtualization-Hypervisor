@@ -144,6 +144,12 @@ pub fn report_error(error: BringUpError) {
         }
         BringUpError::Gdt(error) => log!("Host GDT/TSS setup failed: {error:?}; GDTR/TR unchanged."),
         BringUpError::VmExitStack(error) => log!("VM-exit stack allocation failed: {error:?}"),
+        BringUpError::GuestMemory(GuestMemoryError::NotIdentityMapped {
+            virtual_address,
+            physical,
+        }) => log!(
+            "Guest memory setup failed: page {virtual_address:#018x} is mapped at {physical:#018x}, not identity-mapped."
+        ),
         BringUpError::GuestMemory(error) => log!("Guest memory setup failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),

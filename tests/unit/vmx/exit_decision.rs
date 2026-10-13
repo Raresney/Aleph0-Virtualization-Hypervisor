@@ -48,6 +48,9 @@ fn exit(basic: u16) -> ExitInfo {
         },
         interruption_info: InterruptionInfo(0),
         guest_rax: 0,
+        // What the guest holds at main VMCALL #1 when its data page behaved.
+        guest_rcx: GUEST_DATA_SEED.into(),
+        guest_rdx: GUEST_EPT_VALUE.into(),
         interruptibility: 0,
         idt_vectoring_valid: false,
         exit_qualification: EptQualification(0),
@@ -223,6 +226,45 @@ fn main_vmcall_before_the_violation_means_ept_did_not_protect() {
 #[test]
 fn first_main_vmcall_resumes() {
     assert_eq!(decide(WRITTEN, vmcall(MARKER)), (ExitEvent::MainVmcall, WAITING));
+}
+
+#[test]
+fn first_main_vmcall_with_a_wrong_seed_is_a_data_page_mismatch() {
+    let wrong_seed = ExitInfo {
+        guest_rcx: 0xDA7B,
+        ..vmcall(MARKER)
+    };
+    assert_eq!(decide(WRITTEN, wrong_seed), (ExitEvent::DataPageMismatch, WRITTEN));
+}
+
+#[test]
+fn first_main_vmcall_with_a_wrong_value_is_a_data_page_mismatch() {
+    // The write never landed: the guest read the seed back.
+    let unwritten = ExitInfo {
+        guest_rdx: GUEST_DATA_SEED.into(),
+        ..vmcall(MARKER)
+    };
+    assert_eq!(decide(WRITTEN, unwritten), (ExitEvent::DataPageMismatch, WRITTEN));
+}
+
+#[test]
+fn data_page_values_compare_as_32_bits() {
+    let high_bits = ExitInfo {
+        guest_rcx: (1 << 32) | u64::from(GUEST_DATA_SEED),
+        guest_rdx: (1 << 32) | u64::from(GUEST_EPT_VALUE),
+        ..vmcall(MARKER)
+    };
+    assert_eq!(decide(WRITTEN, high_bits), (ExitEvent::MainVmcall, WAITING));
+}
+
+#[test]
+fn second_main_vmcall_does_not_check_the_data_page() {
+    // RCX is the wait loop's counter by then.
+    let counting = ExitInfo {
+        guest_rcx: 0x1FFF_0000,
+        ..vmcall(MARKER + 1)
+    };
+    assert_eq!(decide(WAITING, counting).0, ExitEvent::LastMainVmcall);
 }
 
 #[test]
@@ -446,11 +488,13 @@ fn exception_exit_is_unexpected() {
 
 #[test]
 fn each_event_maps_to_its_action() {
-    let resume = |advance_rip, inject_nmi, nmi_window, grant_write| ExitAction::Resume {
-        advance_rip,
-        inject_nmi,
-        nmi_window,
-        grant_write,
+    let resume = |advance_rip, inject_nmi, nmi_window, grant_write| {
+        ExitAction::Resume(ResumePlan {
+            advance_rip,
+            inject_nmi,
+            nmi_window,
+            grant_write,
+        })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
     assert_eq!(ExitEvent::GuestNmiHandler.action(), resume(true, false, None, false));
@@ -465,5 +509,6 @@ fn each_event_maps_to_its_action() {
     assert_eq!(ExitEvent::LastMainVmcall.action(), ExitAction::Finished);
     assert_eq!(ExitEvent::InterruptedDelivery.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::EptWriteMissing.action(), ExitAction::Unexpected);
+    assert_eq!(ExitEvent::DataPageMismatch.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::Unexpected.action(), ExitAction::Unexpected);
 }

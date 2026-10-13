@@ -87,6 +87,22 @@ fn kernel_page() -> Mapping {
 const SMEP_AND_SMAP: u64 = cr::CR4_SMEP | cr::CR4_SMAP;
 
 #[test]
+fn identity_mapped_page_passes() {
+    assert_eq!(check_identity(0x7eb1_9000, &kernel_page()), Ok(()));
+}
+
+#[test]
+fn page_mapped_elsewhere_is_refused() {
+    assert_eq!(
+        check_identity(0xffff_8000_7eb1_9000, &kernel_page()),
+        Err(GuestMemoryError::NotIdentityMapped {
+            virtual_address: 0xffff_8000_7eb1_9000,
+            physical: 0x7eb1_9000,
+        }),
+    );
+}
+
+#[test]
 fn kernel_pages_pass_even_with_smep_and_smap() {
     assert_eq!(check_permissions(&kernel_page(), &kernel_page(), SMEP_AND_SMAP), Ok(()));
 }
