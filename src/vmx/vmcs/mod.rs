@@ -362,12 +362,6 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
 /// VMX operation must be active, a VMCS must be current on this CPU, and the
 /// host GDT and TSS must already be active and remain valid on VM exit.
 pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
-    // a. Read segment::read_all() and cr::read_cr0/cr3/cr4 after GDT/TSS activation.
-    // b. Check the host selectors' VM-entry constraints before writing them.
-    // c. Pair each HOST_* selector, CR, and base encoding with its live value;
-    //    use vmwrite and vmread to verify every pair, as configure_controls does.
-    // d. Load host PAT/EFER only when selected VM-exit controls require them.
-    // e. Configure HOST_RSP/HOST_RIP separately with configure_host_entry; do not launch.
     let segments = unsafe { segment::read_all() };
     let cr0 = cr::read_cr0();
     let cr3 = cr::read_cr3();
@@ -376,6 +370,8 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     let sysenter_esp = unsafe { msr::rdmsr(msr::IA32_SYSENTER_ESP) };
     let sysenter_eip = unsafe { msr::rdmsr(msr::IA32_SYSENTER_EIP) };
 
+    // VM entry requires every host selector to have RPL and TI clear, and
+    // CS and TR to be non-null.
     {
         let selectors = [
             segments.es,
@@ -387,7 +383,10 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
             segments.tr,
         ];
 
-        if selectors.iter().any(|selector| selector & 0b111 != 0) {
+        if selectors
+            .iter()
+            .any(|selector| selector & segment::SELECTOR_RPL_TI != 0)
+        {
             return Err(VmcsError::HostStateValidation);
         }
     }
@@ -397,6 +396,8 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     }
     let exit_controls = unsafe { vmread(VM_EXIT_CONTROLS)? };
 
+    // Host PAT and EFER are written only when the exit controls load them.
+    // HOST_RSP and HOST_RIP come later, from `configure_host_entry`.
     unsafe {
         write_verified(HOST_ES_SELECTOR, segments.es as u64)?;
         write_verified(HOST_CS_SELECTOR, segments.cs as u64)?;

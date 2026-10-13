@@ -23,7 +23,57 @@
 //! ```
 
 use super::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
-use super::vmexit::ExitReason;
+
+/// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitReason {
+    /// Bits 15:0: which event caused the exit (Intel SDM Vol. 3D, Appendix C).
+    pub basic: u16,
+    /// Bit 31: VM entry itself failed. The guest never ran; `basic` says
+    /// why (33 = invalid guest state, 34 = MSR loading, 41 = machine check).
+    pub entry_failure: bool,
+}
+
+impl ExitReason {
+    pub fn from_raw(raw: u32) -> Self {
+        Self {
+            basic: raw as u16,
+            entry_failure: raw & (1 << 31) != 0,
+        }
+    }
+}
+
+/// Human-readable name for a basic exit reason. Only the reasons this
+/// hypervisor is likely to meet early on are spelled out.
+pub fn exit_reason_name(basic: u16) -> &'static str {
+    match basic {
+        0 => "exception or NMI",
+        1 => "external interrupt",
+        2 => "triple fault",
+        3 => "INIT signal",
+        7 => "interrupt window",
+        8 => "NMI window",
+        9 => "task switch",
+        10 => "CPUID",
+        12 => "HLT",
+        18 => "VMCALL",
+        28 => "control-register access",
+        30 => "I/O instruction",
+        31 => "RDMSR",
+        32 => "WRMSR",
+        33 => "VM-entry failure: invalid guest state",
+        34 => "VM-entry failure: MSR loading",
+        41 => "VM-entry failure: machine-check event",
+        48 => "EPT violation",
+        49 => "EPT misconfiguration",
+        UNREADABLE_REASON => "VM_EXIT_REASON unreadable",
+        _ => "unnamed exit reason",
+    }
+}
+
+/// Reason the handler reports when VM_EXIT_REASON itself could not be read.
+/// Basic exit reasons stop far below 0xFFFF, so it never names a real exit.
+pub const UNREADABLE_REASON: u16 = 0xFFFF;
 
 /// Basic exit reason of an exception or NMI exit.
 pub const EXIT_REASON_EXCEPTION_OR_NMI: u16 = 0;

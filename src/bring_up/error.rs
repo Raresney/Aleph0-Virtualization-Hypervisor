@@ -2,11 +2,12 @@
 
 use crate::vmx;
 use crate::vmx::ept::EptError;
+use crate::vmx::exit_decision::ExitReason;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host_tables::{GdtError, TssError};
 use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmexit::{ExitReason, VmExitStackError};
+use crate::vmx::vmexit::VmExitStackError;
 use crate::vmx::vmxon::VmxOnError;
 
 use super::teardown::TeardownError;
@@ -186,7 +187,7 @@ pub fn report_error(error: BringUpError) {
         BringUpError::UnexpectedExit { number, reason } => log!(
             "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",
             reason.basic,
-            vmx::vmexit::exit_reason_name(reason.basic),
+            vmx::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
         ),
         BringUpError::ResumeFailed {

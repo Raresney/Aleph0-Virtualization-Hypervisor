@@ -1,8 +1,13 @@
-//! Host descriptor tables for a future VMX guest launch.
+//! The host's own GDT and TSS, which every VM exit loads.
 //!
-//! TODO:
-//! - Provide RSP0/IST stacks if the host IDT or privilege transitions will
-//!   use them; the TSS currently has zeroed stack fields.
+//! VM entry rejects a host TR selector of 0, and firmware may leave TR unset
+//! (Hyper-V's does). So Aleph0 copies the firmware's GDT into a page of its
+//! own, appends a 64-bit TSS descriptor, and loads both
+//! ([`GdtRegion::activate`]).
+//!
+//! The TSS stack fields (RSP0-2, IST1-7) stay 0: the host never changes
+//! privilege level, and `activate` refuses an IDT with a gate that would
+//! switch to an IST stack.
 
 use crate::vmx::segment::{
     self, DescriptorTable, SegmentDescriptor, descriptor_offset, read_cs, read_gdtr, read_idtr, read_ss, read_tr,

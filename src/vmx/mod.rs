@@ -1,13 +1,12 @@
 //! VMX (Intel VT-x) support detection.
 //!
-//! Checking whether the CPU can enter VMX operation requires three
-//! independent checks, each gated behind its own stub below:
+//! Checking whether the CPU can enter VMX operation takes two checks,
+//! which [`detect`] combines into the single entry point the rest of the
+//! hypervisor calls:
 //!
 //! 1. [`cpuid::is_vmx_supported`] — CPUID.1:ECX.VMX\[bit 5\] is set.
 //! 2. [`msr::feature_control_vmx_enabled`] — IA32_FEATURE_CONTROL MSR
 //!    (0x3A) has the lock bit set and the "VMX outside SMX" bit set.
-//! 3. [`detect`] — combines the two checks above into the single entry
-//!    point the rest of the hypervisor should call.
 //!
 //! The CPUID check must run before the MSR check: IA32_FEATURE_CONTROL is
 //! only guaranteed to exist on CPUs that support VMX or SMX, so reading it
