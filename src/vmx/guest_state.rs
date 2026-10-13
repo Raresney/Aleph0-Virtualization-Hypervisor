@@ -37,7 +37,7 @@
 
 use super::cr;
 use super::msr;
-use super::segment::{self, ACCESS_RIGHTS_UNUSABLE, DescriptorTable};
+use super::segment::{self, ACCESS_RIGHTS_UNUSABLE, DescriptorTable, SegmentDescriptor};
 use super::vmcs::{self, VmcsError, fields};
 
 /// RFLAGS bit 1 is reserved and must be 1; every other bit is 0.
@@ -67,7 +67,7 @@ pub struct GuestSegment {
     pub base: u64,
     /// In bytes, already scaled by the granularity bit.
     pub limit: u32,
-    /// VMCS format; see [`segment::descriptor_access_rights`].
+    /// VMCS format; see [`SegmentDescriptor::access_rights`].
     pub access_rights: u32,
 }
 
@@ -85,15 +85,15 @@ impl GuestSegment {
 
     /// A usable register loaded from its 8-byte descriptor, with `base`
     /// supplied by the caller (it lives in different places per register).
-    fn from_descriptor(selector: u16, descriptor: u64, base: u64) -> Self {
-        let mut access_rights = segment::descriptor_access_rights(descriptor);
+    fn from_descriptor(selector: u16, descriptor: SegmentDescriptor, base: u64) -> Self {
+        let mut access_rights = descriptor.access_rights();
         if access_rights & CODE_OR_DATA != 0 {
             access_rights |= TYPE_ACCESSED;
         }
         Self {
             selector,
             base,
-            limit: segment::descriptor_limit(descriptor),
+            limit: descriptor.limit(),
             access_rights,
         }
     }
@@ -315,12 +315,12 @@ unsafe fn segment_from_gdt(
     base: Option<u64>,
 ) -> Result<GuestSegment, GuestStateError> {
     // Selectors 0-3 all name the null descriptor (the low 2 bits are RPL).
-    if selector & !0b11 == 0 {
+    if selector & !segment::SELECTOR_RPL == 0 {
         return Ok(GuestSegment::unusable(selector, base.unwrap_or(0)));
     }
     let descriptor =
         unsafe { segment::read_descriptor(gdt, selector) }.ok_or(GuestStateError::BadSelector { selector })?;
-    let base = base.unwrap_or_else(|| segment::descriptor_base(descriptor));
+    let base = base.unwrap_or_else(|| descriptor.base());
     Ok(GuestSegment::from_descriptor(selector, descriptor, base))
 }
 

@@ -217,7 +217,7 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
 fn activate_host_tables() -> Result<HostTables, BringUpError> {
     // Before anything is loaded, so teardown can give firmware its own GDT
     // back.
-    let firmware_gdtr = unsafe { vmx::segment::read_gdtr() };
+    let firmware_gdtr = vmx::segment::read_gdtr();
 
     let tss = TssRegion::allocate()?;
     log!("Host TSS allocated at {:#018x}; TR not loaded yet.", tss.base());
@@ -246,7 +246,7 @@ fn activate_host_tables() -> Result<HostTables, BringUpError> {
         gdtr: prepared,
         tr: selector,
         tss_base: tss.base(),
-        idtr: unsafe { vmx::segment::read_idtr() },
+        idtr: vmx::segment::read_idtr(),
         firmware_gdtr,
         _tss: tss,
         _gdt: gdt,
@@ -363,11 +363,11 @@ fn guest_result(stop: GuestStop) -> Result<GuestRun, BringUpError> {
 /// changed, stops before the launch: the host fields in the VMCS describe
 /// the activated tables, and every VM exit would load them.
 fn check_host_tables_preserved(expected: &HostTables) -> Result<(), BringUpError> {
-    let gdtr = unsafe { vmx::segment::read_gdtr() };
-    let tr = unsafe { vmx::segment::read_tr() };
-    let idtr = unsafe { vmx::segment::read_idtr() };
-    let same_gdtr = gdtr.base == expected.gdtr.base && gdtr.limit == expected.gdtr.limit;
-    let same_idtr = idtr.base == expected.idtr.base && idtr.limit == expected.idtr.limit;
+    let gdtr = vmx::segment::read_gdtr();
+    let tr = vmx::segment::read_tr();
+    let idtr = vmx::segment::read_idtr();
+    let same_gdtr = gdtr == expected.gdtr;
+    let same_idtr = idtr == expected.idtr;
     let same_tss_base = same_gdtr
         && tr == expected.tr
         && unsafe { vmx::segment::segment_base_from_gdt(&gdtr, tr) } == expected.tss_base;

@@ -156,7 +156,7 @@ pub const GUEST_GDTR_LIMIT: u32 = 0x4810;
 pub const GUEST_IDTR_LIMIT: u32 = 0x4812;
 
 /// Guest segment access rights (32-bit), in the format of
-/// [`crate::vmx::segment::descriptor_access_rights`].
+/// [`crate::vmx::segment::SegmentDescriptor::access_rights`].
 pub const GUEST_ES_ACCESS_RIGHTS: u32 = 0x4814;
 pub const GUEST_CS_ACCESS_RIGHTS: u32 = 0x4816;
 pub const GUEST_SS_ACCESS_RIGHTS: u32 = 0x4818;

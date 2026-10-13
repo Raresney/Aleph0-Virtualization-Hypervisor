@@ -308,7 +308,7 @@ impl GuestMemory {
         // The data page is 4 KiB-aligned, so a u32 at its start is aligned.
         unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
-        let gate = interrupt_gate(memory.nmi_handler(), unsafe { segment::read_cs() });
+        let gate = interrupt_gate(memory.nmi_handler(), segment::read_cs());
         unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_VECTOR * GATE_SIZE), GATE_SIZE) };
         Ok(memory)
     }
@@ -377,7 +377,7 @@ impl GuestMemory {
         let idt = unsafe { paging::walk_current(self.idt().base) }.map_err(GuestMemoryError::IdtNotMapped)?;
         let data = unsafe { paging::walk_current(self.data_page()) }.map_err(GuestMemoryError::DataNotMapped)?;
 
-        let cr4 = unsafe { read_cr4() };
+        let cr4 = read_cr4();
         check_permissions(&code, &stack, cr4)?;
         check_idt_permissions(&idt, cr4)?;
         check_data_permissions(&data, cr4)?;

@@ -397,9 +397,9 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     // d. Load host PAT/EFER only when selected VM-exit controls require them.
     // e. Configure HOST_RSP/HOST_RIP separately with configure_host_entry; do not launch.
     let segments = unsafe { segment::read_all() };
-    let cr0 = unsafe { cr::read_cr0() };
-    let cr3 = unsafe { cr::read_cr3() };
-    let cr4 = unsafe { cr::read_cr4() };
+    let cr0 = cr::read_cr0();
+    let cr3 = cr::read_cr3();
+    let cr4 = cr::read_cr4();
     let sysenter_cs = u64::from(unsafe { msr::rdmsr(msr::IA32_SYSENTER_CS) } as u32);
     let sysenter_esp = unsafe { msr::rdmsr(msr::IA32_SYSENTER_ESP) };
     let sysenter_eip = unsafe { msr::rdmsr(msr::IA32_SYSENTER_EIP) };

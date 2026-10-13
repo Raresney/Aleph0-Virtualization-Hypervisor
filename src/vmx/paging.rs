@@ -299,10 +299,10 @@ pub fn walk(cr3: u64, virtual_address: u64, read_entry: impl Fn(u64) -> u64) -> 
 /// themselves must be identity-mapped. UEFI guarantees that while boot
 /// services are active; after `ExitBootServices` it no longer holds.
 pub unsafe fn walk_current(virtual_address: u64) -> Result<Mapping, WalkError> {
-    if unsafe { read_cr4() } & CR4_LA57 != 0 {
+    if read_cr4() & CR4_LA57 != 0 {
         return Err(WalkError::FiveLevelPaging);
     }
-    let cr3 = unsafe { read_cr3() };
+    let cr3 = read_cr3();
     walk(cr3, virtual_address, |physical| unsafe {
         (physical as *const u64).read_volatile()
     })

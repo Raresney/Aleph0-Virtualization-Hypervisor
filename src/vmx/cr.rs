@@ -21,79 +21,46 @@ pub const CR4_SMEP: u64 = 1 << 20;
 /// RFLAGS.AC = 0.
 pub const CR4_SMAP: u64 = 1 << 21;
 
-/// Reads CR0.
-pub unsafe fn read_cr0() -> u64 {
-    let value: u64;
+/// Defines a safe reader, and optionally an unsafe writer, for one control
+/// register. Reading a control register in ring 0 has no side effects;
+/// writing one changes how the CPU runs, so writers stay `unsafe`.
+macro_rules! control_register {
+    ($read:ident, $write:ident, $register:literal) => {
+        control_register!($read, $register);
 
-    unsafe {
-        asm!(
-            "mov {}, cr0",
-            out(reg) value,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    value
+        #[doc = concat!("Writes ", $register, ".")]
+        ///
+        /// # Safety
+        ///
+        /// The new value must keep the CPU in a state the running code can
+        /// continue in (paging, protection and VMX fixed bits included).
+        pub unsafe fn $write(value: u64) {
+            // SAFETY: the caller guarantees the value is valid to load.
+            unsafe { asm!(concat!("mov ", $register, ", {}"), in(reg) value, options(nostack, preserves_flags)) };
+        }
+    };
+    ($read:ident, $register:literal) => {
+        #[doc = concat!("Reads ", $register, ".")]
+        pub fn $read() -> u64 {
+            let value: u64;
+            // SAFETY: a read of a control register in ring 0: no memory
+            // access, no side effects.
+            unsafe { asm!(concat!("mov {}, ", $register), out(reg) value, options(nomem, nostack, preserves_flags)) };
+            value
+        }
+    };
 }
 
-/// Writes CR0.
-pub unsafe fn write_cr0(value: u64) {
-    unsafe {
-        asm!(
-            "mov cr0, {}",
-            in(reg) value,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
-/// Reads CR3.
-pub unsafe fn read_cr3() -> u64 {
-    let value: u64;
-
-    unsafe {
-        asm!(
-            "mov {}, cr3",
-            out(reg) value,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    value
-}
-
-/// Reads CR4.
-pub unsafe fn read_cr4() -> u64 {
-    let value: u64;
-
-    unsafe {
-        asm!(
-            "mov {}, cr4",
-            out(reg) value,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    value
-}
-
-/// Writes CR4.
-pub unsafe fn write_cr4(value: u64) {
-    unsafe {
-        asm!(
-            "mov cr4, {}",
-            in(reg) value,
-            options(nostack, preserves_flags),
-        );
-    }
-}
+control_register!(read_cr0, write_cr0, "cr0");
+control_register!(read_cr3, "cr3");
+control_register!(read_cr4, write_cr4, "cr4");
 
 /// Sets CR4.VMXE, leaving every other bit untouched.
+///
+/// # Safety
+///
+/// The CPU must support VMX (CPUID.1:ECX.VMX); otherwise the write faults.
 pub unsafe fn enable_vmxe() {
-    let mut cr4: u64;
-    unsafe {
-        cr4 = read_cr4();
-        cr4 |= CR4_VMXE;
-        write_cr4(cr4);
-    }
+    // SAFETY: only VMXE changes, which the caller has checked is supported.
+    unsafe { write_cr4(read_cr4() | CR4_VMXE) };
 }

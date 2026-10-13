@@ -126,9 +126,8 @@ pub(super) unsafe fn teardown(
 /// Prints whether teardown left the CPU as firmware expects. Reaches the
 /// console too: the phase is boot services again.
 fn report(firmware: &FirmwareState) {
-    let vmxe = unsafe { cr::read_cr4() } & CR4_VMXE != 0;
-    let tables_restored =
-        unsafe { segment::read_gdtr() } == firmware.gdtr && unsafe { segment::read_idtr() } == firmware.idtr;
+    let vmxe = cr::read_cr4() & CR4_VMXE != 0;
+    let tables_restored = segment::read_gdtr() == firmware.gdtr && segment::read_idtr() == firmware.idtr;
     log!(
         "Teardown: CR4.VMXE={} firmware GDTR/IDTR restored={tables_restored} IF={}.",
         u8::from(vmxe),
