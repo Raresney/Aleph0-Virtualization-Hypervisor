@@ -10,10 +10,10 @@ How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 - what the identity map does *not* hide, and what is not covered yet.
 
 Code:
-- `src/vmx/ept.rs`: support check, entry encodings, identity map, `grant_write`, INVEPT;
+- `src/vmx/ept.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
 - `src/vmx/guest.rs`: the data page and the guest code that writes it;
 - `src/vmx/exit_decision.rs`: which EPT violation is accepted;
-- `src/vmx/vmexit.rs`: the handler that reports and applies it;
+- `src/vmx/vmexit/`: the handler that reports and applies it;
 - `src/vmx/vmcs/mod.rs` and `fields.rs`: secondary controls, `EPT_POINTER`;
 - `src/bring_up/mod.rs`: where EPT is checked, built and enabled.
 
@@ -76,10 +76,10 @@ The encodings Aleph0 uses (`ept.rs`, all host-tested):
 
 | Function | Value | Example |
 |---|---|---|
-| `table_entry(addr)` | `addr \| 0b111` | `0x7e00_1007` |
-| `large_page_entry(addr)` | `addr \| RWX \| 6 << 3 \| 1 << 7` | `0x4020_00B7` |
-| `page_entry(addr, R)` | `addr \| R \| 6 << 3` | `0x7eb1_d031` (read-only) |
-| `eptp(pml4)` | `pml4 \| 6 \| 3 << 3` | low bits always `0x1E` |
+| `EptEntry::table(addr)` | `addr \| 0b111` | `0x7e00_1007` |
+| `EptEntry::large_page(addr)` | `addr \| RWX \| 6 << 3 \| 1 << 7` | `0x4020_00B7` |
+| `EptEntry::page(addr, R)` | `addr \| R \| 6 << 3` | `0x7eb1_d031` (read-only) |
+| `Eptp::new(pml4)` | `pml4 \| 6 \| 3 << 3` | low bits always `0x1E` |
 
 The **EPT pointer** (EPTP, VMCS field `0x201A`) tells the CPU where the
 PML4 is:
@@ -112,7 +112,7 @@ IA32_VMX_PROCBASED_CTLS (primary) allows bit 31
 | 6 | 4-level page walk | the EPTP Aleph0 writes |
 | 14 | WB for the EPT tables | the EPTP's memory type |
 | 16 | 2 MiB pages | the identity map uses them |
-| 20 | INVEPT | `grant_write` |
+| 20 | INVEPT | `ProtectedPage::grant_write` |
 | 25 or 26 | single- or all-context INVEPT | single-context is preferred |
 
 Hyper-V (nested) reported:
@@ -249,7 +249,7 @@ not protect the page, and the guest stops with a message saying so
 ### Grant and retry
 
 For the accepted violation, the handler:
-1. sets W = 1 in the data page's PT entry (`ept::grant_write`);
+1. sets W = 1 in the data page's PT entry (`ept::ProtectedPage::grant_write`);
 2. runs INVEPT (section 7);
 3. resumes **without advancing RIP**.
 
@@ -274,7 +274,7 @@ type 2 = all-context:    translations from every EPTP
 ```
 
 Like other VMX instructions it reports failure through CF/ZF;
-`grant_write` returns `GrantError::Invept` and the guest stops if it fails.
+`ProtectedPage::grant_write` returns the failure (`VmxFail`) and the guest stops if it fails.
 
 Strictly, this INVEPT is not needed: an EPT violation already drops the
 cached translations for the address that caused it, so the retried write
