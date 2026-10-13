@@ -112,10 +112,9 @@ pub enum GuestStateError {
     CsNot64Bit { access_rights: u32 },
     /// TR is unusable or not a busy 64-bit TSS.
     TrNotBusyTss { access_rights: u32 },
-    /// VMWRITE or VMREAD of `field` failed.
+    /// Writing `field` failed: VMWRITE or VMREAD failed, or it read back a
+    /// different value than was written ([`VmcsError::ReadbackMismatch`]).
     Vmcs { field: u32, error: VmcsError },
-    /// `field` read back a different value than was written.
-    ReadbackMismatch { field: u32, written: u64, read: u64 },
 }
 
 /// The complete guest state, captured from the host and ready to write.
@@ -343,17 +342,7 @@ fn check_segments(cs: &GuestSegment, tr: &GuestSegment) -> Result<(), GuestState
 
 /// Writes one field and verifies it by reading it back.
 unsafe fn write_field(field: u32, value: u64) -> Result<(), GuestStateError> {
-    let vmcs_error = |error| GuestStateError::Vmcs { field, error };
-    unsafe { vmcs::vmwrite(field, value) }.map_err(vmcs_error)?;
-    let read = unsafe { vmcs::vmread(field) }.map_err(vmcs_error)?;
-    if read != value {
-        return Err(GuestStateError::ReadbackMismatch {
-            field,
-            written: value,
-            read,
-        });
-    }
-    Ok(())
+    unsafe { vmcs::write_verified(field, value) }.map_err(|error| GuestStateError::Vmcs { field, error })
 }
 
 #[cfg(test)]

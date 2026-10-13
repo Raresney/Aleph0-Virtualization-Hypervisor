@@ -53,9 +53,9 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     log!(
         "VMX BASIC={:#018x}; true controls={}",
         controls.basic,
-        controls.basic & (1u64 << 55) != 0,
+        controls.basic & vmx::msr::VMX_BASIC_TRUE_CONTROLS != 0,
     );
-    for (name, value) in [
+    for (name, capability) in [
         ("pin", controls.pinbased),
         ("primary", controls.primary),
         ("exit", controls.exit),
@@ -63,14 +63,14 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     ] {
         log!(
             "VMX {name}: required={:#010x} allowed={:#010x}",
-            value as u32,
-            (value >> 32) as u32,
+            capability.required(),
+            capability.allowed(),
         );
     }
     log!(
         "VMX secondary: required={:#010x} allowed={:#010x}; EPT/VPID capabilities={:#018x}",
-        controls.secondary as u32,
-        (controls.secondary >> 32) as u32,
+        controls.secondary.required(),
+        controls.secondary.allowed(),
         controls.ept_vpid_cap,
     );
 }

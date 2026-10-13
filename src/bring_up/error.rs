@@ -159,16 +159,20 @@ pub fn report_error(error: BringUpError) {
             instruction_error,
         } => report_vmcs_error(operation, error, instruction_error),
         BringUpError::GuestState {
+            error:
+                GuestStateError::Vmcs {
+                    field,
+                    error: VmcsError::ReadbackMismatch { written, read, .. },
+                },
+            ..
+        } => log!("Guest-state field {field:#06x} read back {read:#x}, but {written:#x} was written."),
+        BringUpError::GuestState {
             error: GuestStateError::Vmcs { field, error },
             instruction_error,
         } => {
             log!("Guest-state field {field:#06x} failed:");
             report_vmcs_error("guest-state write", error, instruction_error);
         }
-        BringUpError::GuestState {
-            error: GuestStateError::ReadbackMismatch { field, written, read },
-            ..
-        } => log!("Guest-state field {field:#06x} read back {read:#x}, but {written:#x} was written."),
         BringUpError::GuestState { error, .. } => log!("Guest state invalid: {error:x?}"),
         BringUpError::HostTablesChanged => {
             log!("Host descriptor tables changed after VMX/UEFI calls; the guest was not launched.")
@@ -197,6 +201,9 @@ fn report_vmcs_error(operation: &str, error: VmcsError, instruction_error: Optio
         }
         (VmcsError::VmFailValid, None) => {
             log!("VMCS {operation} failed: VmFailValid, error number unreadable");
+        }
+        (VmcsError::ReadbackMismatch { field, written, read }, _) => {
+            log!("VMCS {operation} failed: field {field:#06x} read back {read:#x}, but {written:#x} was written.");
         }
         _ => log!("VMCS {operation} failed: {error:?}"),
     }

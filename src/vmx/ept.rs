@@ -43,7 +43,9 @@ use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
 
 use super::instruction::{VmxFail, vmx_asm};
+use super::msr::ControlCapability;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages};
+use super::vmcs::fields::SECONDARY_ENABLE_EPT;
 
 /// Entry bit 0: reads allowed.
 pub const EPT_READ: u64 = 1 << 0;
@@ -87,9 +89,6 @@ const CAP_INVEPT: u64 = 1 << 20;
 const CAP_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
 /// Bit 26: all-context INVEPT (every EPTP's translations).
 const CAP_INVEPT_ALL_CONTEXT: u64 = 1 << 26;
-/// Secondary control bit 1 (enable EPT), in the allowed (high) half of
-/// IA32_VMX_PROCBASED_CTLS2.
-const SECONDARY_ALLOWS_EPT: u64 = 1 << (32 + 1);
 
 /// Which cached EPT translations INVEPT drops. The value is the INVEPT type
 /// operand.
@@ -140,8 +139,8 @@ pub enum EptError {
 ///
 /// `secondary` is IA32_VMX_PROCBASED_CTLS2 and `ept_vpid_cap`
 /// IA32_VMX_EPT_VPID_CAP, both 0 when the CPU lacks them.
-pub fn check_support(secondary: u64, ept_vpid_cap: u64) -> Result<InveptType, EptError> {
-    if secondary & SECONDARY_ALLOWS_EPT == 0 {
+pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<InveptType, EptError> {
+    if !secondary.allows(SECONDARY_ENABLE_EPT) {
         return Err(EptError::EptUnsupported);
     }
     if ept_vpid_cap & CAP_WALK_LENGTH_4 == 0 {

@@ -6,6 +6,9 @@
 
 use super::*;
 
+/// A secondary capability MSR that allows EPT and nothing else.
+const EPT_ALLOWED: ControlCapability = ControlCapability((SECONDARY_ENABLE_EPT as u64) << 32);
+
 /// The EPT/VPID capabilities Aleph0 needs: 4-level walk, WB, 2 MiB pages,
 /// INVEPT with both types.
 const FULL_CAP: u64 =
@@ -13,21 +16,21 @@ const FULL_CAP: u64 =
 
 #[test]
 fn full_support_picks_single_context() {
-    assert_eq!(
-        check_support(SECONDARY_ALLOWS_EPT, FULL_CAP),
-        Ok(InveptType::SingleContext)
-    );
+    assert_eq!(check_support(EPT_ALLOWED, FULL_CAP), Ok(InveptType::SingleContext));
 }
 
 #[test]
 fn all_context_is_the_fallback() {
     let cap = FULL_CAP & !CAP_INVEPT_SINGLE_CONTEXT;
-    assert_eq!(check_support(SECONDARY_ALLOWS_EPT, cap), Ok(InveptType::AllContext));
+    assert_eq!(check_support(EPT_ALLOWED, cap), Ok(InveptType::AllContext));
 }
 
 #[test]
 fn each_missing_capability_has_its_error() {
-    assert_eq!(check_support(0, FULL_CAP), Err(EptError::EptUnsupported));
+    assert_eq!(
+        check_support(ControlCapability(0), FULL_CAP),
+        Err(EptError::EptUnsupported)
+    );
     for (missing, error) in [
         (CAP_WALK_LENGTH_4, EptError::PageWalkLength4Unsupported),
         (CAP_WRITE_BACK, EptError::WriteBackUnsupported),
@@ -38,7 +41,7 @@ fn each_missing_capability_has_its_error() {
             EptError::InveptUnsupported,
         ),
     ] {
-        assert_eq!(check_support(SECONDARY_ALLOWS_EPT, FULL_CAP & !missing), Err(error));
+        assert_eq!(check_support(EPT_ALLOWED, FULL_CAP & !missing), Err(error));
     }
 }
 

@@ -33,7 +33,7 @@
 //! readable via [`vm_instruction_error`].
 
 use crate::vmx::instruction::{VmxFail, check_rflags, vmx_asm};
-use crate::vmx::msr::{self, VmcsControlMsrs};
+use crate::vmx::msr::{self, UnsupportedControl, VmcsControlMsrs};
 use crate::vmx::region::VmxRegion;
 use crate::vmx::{cr, segment};
 use core::arch::asm;
@@ -102,14 +102,15 @@ pub enum VmcsError {
     /// ZF=1: the instruction failed and stored a reason in the current VMCS;
     /// read it with [`vm_instruction_error`].
     VmFailValid,
-    /// [`self_test`] read back something other than what it wrote. Both
-    /// instructions reported success, so this is not a VMX failure.
-    SelfTestMismatch,
+    /// [`write_verified`] read `read` back from `field` after writing
+    /// `written`. Both instructions reported success, so this is not a VMX
+    /// failure.
+    ReadbackMismatch { field: u32, written: u64, read: u64 },
     /// The requested control value is not supported by the processor.
     UnsupportedControlValue,
-    /// A control field read back differently from the value written to it.
-    ControlReadbackMismatch,
-    /// Host state validation failed.
+    /// A host-state value failed its check before being written: a selector
+    /// with RPL or TI set, a null CS or TR, or a null or misaligned
+    /// HOST_RSP/HOST_RIP.
     HostStateValidation,
     /// VMLAUNCH fell through to the next instruction with CF and ZF both
     /// clear. A successful VMLAUNCH never falls through, so the guest was
@@ -129,6 +130,12 @@ impl From<VmxFail> for VmcsError {
             VmxFail::Invalid => Self::VmFailInvalid,
             VmxFail::Valid => Self::VmFailValid,
         }
+    }
+}
+
+impl From<UnsupportedControl> for VmcsError {
+    fn from(_: UnsupportedControl) -> Self {
+        Self::UnsupportedControlValue
     }
 }
 
@@ -236,6 +243,28 @@ pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> 
     Ok(check_rflags(rflags)?)
 }
 
+/// Writes a field in the current VMCS and reads it back, so a value that did
+/// not land as written is caught here rather than as a VM-entry failure.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
+pub unsafe fn write_verified(field: u32, value: u64) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    let read = unsafe {
+        vmwrite(field, value)?;
+        vmread(field)?
+    };
+    if read != value {
+        return Err(VmcsError::ReadbackMismatch {
+            field,
+            written: value,
+            read,
+        });
+    }
+    Ok(())
+}
+
 /// Decodes the RFLAGS left behind when VMLAUNCH falls through. That only
 /// happens on failure, so clear flags become [`VmcsError::LaunchReturned`]
 /// instead of success.
@@ -273,44 +302,31 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 ///
 /// VMX operation must be active and a VMCS must be current on this CPU.
 pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: DesiredControls) -> Result<(), VmcsError> {
-    let pin = choose_control(capabilities.pinbased, desired.pin)?;
-    let primary = choose_control(capabilities.primary, primary_request(desired))?;
+    let pin = capabilities.pinbased.choose(desired.pin)?;
+    let primary = capabilities.primary.choose(primary_request(desired))?;
     let secondary = if desired.secondary != 0 {
-        Some(choose_control(capabilities.secondary, desired.secondary)?)
+        Some(capabilities.secondary.choose(desired.secondary)?)
     } else {
         None
     };
     // NMI-window exiting is only switched on while an NMI waits for
     // injection (`set_nmi_window_exiting`), but the CPU must allow it.
-    choose_control(capabilities.primary, CPU_BASED_NMI_WINDOW_EXITING)
-        .map_err(|_| VmcsError::NmiWindowExitingUnsupported)?;
-    let exit = choose_control(capabilities.exit, desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE)?;
-    let entry = choose_control(capabilities.entry, desired.entry)?;
+    if !capabilities.primary.allows(CPU_BASED_NMI_WINDOW_EXITING) {
+        return Err(VmcsError::NmiWindowExitingUnsupported);
+    }
+    let exit = capabilities
+        .exit
+        .choose(desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE)?;
+    let entry = capabilities.entry.choose(desired.entry)?;
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     unsafe {
-        vmwrite(PIN_BASED_VM_EXEC_CONTROL, pin.into())?;
-        vmwrite(PRIMARY_VM_EXEC_CONTROL, primary.into())?;
-        vmwrite(VM_EXIT_CONTROLS, exit.into())?;
-        vmwrite(VM_ENTRY_CONTROLS, entry.into())?;
-
-        // Verify by reading back
-        if vmread(PIN_BASED_VM_EXEC_CONTROL)? != pin as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-        if vmread(PRIMARY_VM_EXEC_CONTROL)? != primary as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-        if vmread(VM_EXIT_CONTROLS)? != exit as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-        if vmread(VM_ENTRY_CONTROLS)? != entry as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
+        write_verified(PIN_BASED_VM_EXEC_CONTROL, pin.into())?;
+        write_verified(PRIMARY_VM_EXEC_CONTROL, primary.into())?;
+        write_verified(VM_EXIT_CONTROLS, exit.into())?;
+        write_verified(VM_ENTRY_CONTROLS, entry.into())?;
         if let Some(secondary) = secondary {
-            vmwrite(SECONDARY_VM_EXEC_CONTROL, secondary.into())?;
-            if vmread(SECONDARY_VM_EXEC_CONTROL)? != secondary as u64 {
-                return Err(VmcsError::ControlReadbackMismatch);
-            }
+            write_verified(SECONDARY_VM_EXEC_CONTROL, secondary.into())?;
         }
 
         // VM entry checks these fields, and VMCLEAR does not guarantee that
@@ -327,16 +343,10 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
             PAGE_FAULT_ERROR_CODE_MASK,
             PAGE_FAULT_ERROR_CODE_MATCH,
         ] {
-            vmwrite(field, 0)?;
-            if vmread(field)? != 0 {
-                return Err(VmcsError::ControlReadbackMismatch);
-            }
+            write_verified(field, 0)?;
         }
 
-        vmwrite(EXCEPTION_BITMAP, EXCEPTION_BITMAP_ALL.into())?;
-        if vmread(EXCEPTION_BITMAP)? != u64::from(EXCEPTION_BITMAP_ALL) {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
+        write_verified(EXCEPTION_BITMAP, EXCEPTION_BITMAP_ALL.into())?;
     }
 
     Ok(())
@@ -387,33 +397,33 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     let exit_controls = unsafe { vmread(VM_EXIT_CONTROLS)? };
 
     unsafe {
-        write_host_state(HOST_ES_SELECTOR, segments.es as u64)?;
-        write_host_state(HOST_CS_SELECTOR, segments.cs as u64)?;
-        write_host_state(HOST_SS_SELECTOR, segments.ss as u64)?;
-        write_host_state(HOST_DS_SELECTOR, segments.ds as u64)?;
-        write_host_state(HOST_FS_SELECTOR, segments.fs as u64)?;
-        write_host_state(HOST_GS_SELECTOR, segments.gs as u64)?;
-        write_host_state(HOST_TR_SELECTOR, segments.tr as u64)?;
+        write_verified(HOST_ES_SELECTOR, segments.es as u64)?;
+        write_verified(HOST_CS_SELECTOR, segments.cs as u64)?;
+        write_verified(HOST_SS_SELECTOR, segments.ss as u64)?;
+        write_verified(HOST_DS_SELECTOR, segments.ds as u64)?;
+        write_verified(HOST_FS_SELECTOR, segments.fs as u64)?;
+        write_verified(HOST_GS_SELECTOR, segments.gs as u64)?;
+        write_verified(HOST_TR_SELECTOR, segments.tr as u64)?;
 
-        write_host_state(HOST_CR0, cr0)?;
-        write_host_state(HOST_CR3, cr3)?;
-        write_host_state(HOST_CR4, cr4)?;
+        write_verified(HOST_CR0, cr0)?;
+        write_verified(HOST_CR3, cr3)?;
+        write_verified(HOST_CR4, cr4)?;
 
-        write_host_state(HOST_FS_BASE, segments.fs_base)?;
-        write_host_state(HOST_GS_BASE, segments.gs_base)?;
-        write_host_state(HOST_TR_BASE, segments.tr_base)?;
-        write_host_state(HOST_GDTR_BASE, segments.gdtr.base)?;
-        write_host_state(HOST_IDTR_BASE, segments.idtr.base)?;
+        write_verified(HOST_FS_BASE, segments.fs_base)?;
+        write_verified(HOST_GS_BASE, segments.gs_base)?;
+        write_verified(HOST_TR_BASE, segments.tr_base)?;
+        write_verified(HOST_GDTR_BASE, segments.gdtr.base)?;
+        write_verified(HOST_IDTR_BASE, segments.idtr.base)?;
 
-        write_host_state(HOST_IA32_SYSENTER_CS, sysenter_cs)?;
-        write_host_state(HOST_IA32_SYSENTER_ESP, sysenter_esp)?;
-        write_host_state(HOST_IA32_SYSENTER_EIP, sysenter_eip)?;
+        write_verified(HOST_IA32_SYSENTER_CS, sysenter_cs)?;
+        write_verified(HOST_IA32_SYSENTER_ESP, sysenter_esp)?;
+        write_verified(HOST_IA32_SYSENTER_EIP, sysenter_eip)?;
 
         if exit_controls & VM_EXIT_LOAD_IA32_PAT != 0 {
-            write_host_state(HOST_IA32_PAT, msr::rdmsr(msr::IA32_PAT))?;
+            write_verified(HOST_IA32_PAT, msr::rdmsr(msr::IA32_PAT))?;
         }
         if exit_controls & VM_EXIT_LOAD_IA32_EFER != 0 {
-            write_host_state(HOST_IA32_EFER, msr::rdmsr(msr::IA32_EFER))?;
+            write_verified(HOST_IA32_EFER, msr::rdmsr(msr::IA32_EFER))?;
         }
     }
 
@@ -431,37 +441,12 @@ pub unsafe fn configure_host_entry(stack_top: u64, entry_address: u64) -> Result
         return Err(VmcsError::HostStateValidation);
     }
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     unsafe {
-        write_host_state(HOST_RSP, stack_top)?;
-        write_host_state(HOST_RIP, entry_address)?;
+        write_verified(HOST_RSP, stack_top)?;
+        write_verified(HOST_RIP, entry_address)?;
     }
     Ok(())
-}
-
-/// Write a host state field and verify it by reading it back.
-unsafe fn write_host_state(field_encoding: u32, value: u64) -> Result<(), VmcsError> {
-    unsafe {
-        vmwrite(field_encoding, value)?;
-        let read_back = vmread(field_encoding)?;
-        if read_back != value {
-            return Err(VmcsError::HostStateValidation);
-        }
-        Ok(())
-    }
-}
-
-/// Choose a 32-bit VMCS control value using one raw capability MSR.
-/// The low half forces bits to 1; the high half permits bits to be 1.
-/// Reject an inconsistent mask or a requested bit the CPU cannot enable.
-fn choose_control(capability: u64, desired: u32) -> Result<u32, VmcsError> {
-    let required = capability as u32;
-    let allowed = (capability >> 32) as u32;
-    if required & !allowed != 0 || desired & !allowed != 0 {
-        return Err(VmcsError::UnsupportedControlValue);
-    }
-
-    // Add mandatory bits without changing any other requested bits.
-    Ok(desired | required)
 }
 
 /// `primary` with NMI-window exiting turned on or off, other bits unchanged.
@@ -491,13 +476,8 @@ pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
 /// VMX operation with a current VMCS. The tables `eptp` names must stay
 /// allocated for as long as the VMCS may be used.
 pub unsafe fn set_ept_pointer(eptp: u64) -> Result<(), VmcsError> {
-    unsafe {
-        vmwrite(EPT_POINTER, eptp)?;
-        if vmread(EPT_POINTER)? != eptp {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-    }
-    Ok(())
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    unsafe { write_verified(EPT_POINTER, eptp) }
 }
 
 /// The numeric reason the last VMX instruction failed.
@@ -569,14 +549,8 @@ pub unsafe fn self_test() -> Result<(), VmcsError> {
     // VM entry starts checking it.
     const PATTERN: u64 = 0x0000_7FFF_DEAD_BEEF;
 
-    unsafe {
-        vmwrite(GUEST_RIP, PATTERN)?;
-        if vmread(GUEST_RIP)? != PATTERN {
-            return Err(VmcsError::SelfTestMismatch);
-        }
-    }
-
-    Ok(())
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    unsafe { write_verified(GUEST_RIP, PATTERN) }
 }
 
 #[cfg(test)]

@@ -41,6 +41,10 @@ pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 /// Secondary control bit 1: guest-physical addresses are translated through
 /// the EPT tables named by [`EPT_POINTER`].
 pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+/// Secondary control bit 5: the guest's TLB entries are tagged with a
+/// virtual-processor identifier. Aleph0 does not enable it; the EPT/VPID
+/// capability MSR exists if either this or EPT is allowed.
+pub const SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 /// Exception bitmap: bit N set makes guest exception vector N cause a VM exit
 /// (reason 0) instead of being delivered through the guest's IDT.
 pub const EXCEPTION_BITMAP: u32 = 0x4004;

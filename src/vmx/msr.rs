@@ -1,6 +1,8 @@
 //! Model-specific registers (MSRs): their addresses, the bits this
-//! hypervisor reads in them, and RDMSR/WRMSR.
+//! hypervisor reads in them, and RDMSR.
 use core::arch::asm;
+
+use super::vmcs::fields::{CPU_BASED_ACTIVATE_SECONDARY_CONTROLS, SECONDARY_ENABLE_EPT, SECONDARY_ENABLE_VPID};
 
 /// MSR address of IA32_FEATURE_CONTROL.
 pub const IA32_FEATURE_CONTROL: u32 = 0x3A;
@@ -48,9 +50,11 @@ pub unsafe fn feature_control_vmx_enabled() -> bool {
 }
 
 /// IA32_VMX_BASIC. Bits 0..=30: VMCS revision identifier (bit 31 is always 0).
-/// Bit 55: when set, the `IA32_VMX_TRUE_*_CTLS` MSRs exist and should be
-/// preferred over the non-TRUE variants when configuring the VMCS later.
+/// Bit 55: see [`VMX_BASIC_TRUE_CONTROLS`].
 pub const IA32_VMX_BASIC: u32 = 0x480;
+/// IA32_VMX_BASIC bit 55: the `IA32_VMX_TRUE_*_CTLS` MSRs exist and should
+/// be preferred over the non-TRUE variants when configuring the VMCS.
+pub const VMX_BASIC_TRUE_CONTROLS: u64 = 1 << 55;
 
 pub const IA32_VMX_PINBASED_CTLS: u32 = 0x481;
 pub const IA32_VMX_PROCBASED_CTLS: u32 = 0x482;
@@ -69,46 +73,81 @@ pub const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48B;
 /// INVEPT types. Exists only if the secondary controls allow EPT or VPID.
 pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
 
-/// Primary control bit 31, "activate secondary controls", as it appears in
-/// the allowed (high) half of the primary capability MSR.
-const PRIMARY_ALLOWS_SECONDARY: u64 = 1 << (32 + 31);
-/// Secondary control bit 1 (enable EPT) and bit 5 (enable VPID), in the
-/// allowed half of the secondary capability MSR.
-const SECONDARY_ALLOWS_EPT_OR_VPID: u64 = (1 << (32 + 1)) | (1 << (32 + 5));
+/// One raw VMX control capability MSR, for one 32-bit control field.
+///
+/// The low 32 bits require control bits to be 1; the high 32 bits allow
+/// control bits to be 1. At the same bit position: (low, high) = (0, 0)
+/// means must be 0, (0, 1) means either value, and (1, 1) means must be 1.
+/// (1, 0) is inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlCapability(pub u64);
 
-/// Raw VMX control capability MSRs, not the values currently in the VMCS.
-/// For each control MSR, the low 32 bits require control bits to be 1;
-/// the high 32 bits allow control bits to be 1. At the same bit position:
-/// (low, high) = (0, 0) means must be 0, (0, 1) means either value,
-/// and (1, 1) means must be 1. (1, 0) is inconsistent.
-/// `basic` and `ept_vpid_cap` have different layouts and are not
-/// control-bit masks.
+/// A control value the CPU does not allow: a requested bit outside the
+/// allowed half, or a capability whose required bits are not allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedControl;
+
+impl ControlCapability {
+    /// Bits that must be 1 (the low half).
+    pub fn required(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Bits that may be 1 (the high half).
+    pub fn allowed(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Whether every bit of `bits` may be 1.
+    pub fn allows(self, bits: u32) -> bool {
+        self.allowed() & bits == bits
+    }
+
+    /// The control value for `desired`: its bits plus the required ones.
+    /// Rejects an inconsistent capability or a requested bit the CPU
+    /// cannot enable.
+    pub fn choose(self, desired: u32) -> Result<u32, UnsupportedControl> {
+        if !self.allows(self.required()) || !self.allows(desired) {
+            return Err(UnsupportedControl);
+        }
+        // Add mandatory bits without changing any other requested bits.
+        Ok(desired | self.required())
+    }
+}
+
+/// Raw VMX capability MSRs, not the values currently in the VMCS.
+/// `basic` and `ept_vpid_cap` have their own layouts; the rest are
+/// [`ControlCapability`] pairs.
 #[derive(Debug, Clone, Copy)]
 pub struct VmcsControlMsrs {
     pub basic: u64,
-    pub pinbased: u64,
-    pub primary: u64,
-    pub exit: u64,
-    pub entry: u64,
+    pub pinbased: ControlCapability,
+    pub primary: ControlCapability,
+    pub exit: ControlCapability,
+    pub entry: ControlCapability,
     /// IA32_VMX_PROCBASED_CTLS2, or 0 when the CPU has no secondary
     /// controls. 0 allows no bit, so every secondary request is refused.
-    pub secondary: u64,
+    pub secondary: ControlCapability,
     /// IA32_VMX_EPT_VPID_CAP, or 0 when the CPU supports neither EPT nor
     /// VPID.
     pub ept_vpid_cap: u64,
 }
 
 /// Read IA32_VMX_BASIC and the four control MSRs, selecting the true variants
-/// when BASIC bit 55 reports them, plus the secondary controls and the
-/// EPT/VPID capabilities where they exist. This does not write VMCS fields.
+/// when [`VMX_BASIC_TRUE_CONTROLS`] reports them, plus the secondary controls
+/// and the EPT/VPID capabilities where they exist. This does not write VMCS
+/// fields.
 ///
 /// # Safety
 ///
 /// The caller must first confirm CPU support for VMX before reading VMX MSRs.
 pub unsafe fn read_vmcs_control_msrs() -> VmcsControlMsrs {
+    // SAFETY: the caller confirmed VMX support, so IA32_VMX_BASIC and the
+    // control MSRs exist; the optional ones are read only when the MSR
+    // before them says they exist.
     unsafe {
         let basic = rdmsr(IA32_VMX_BASIC);
-        let use_true_controls = basic & (1u64 << 55) != 0;
+        let use_true_controls = basic & VMX_BASIC_TRUE_CONTROLS != 0;
         let (pin_id, primary_id, exit_id, entry_id) = if use_true_controls {
             (
                 IA32_VMX_TRUE_PINBASED_CTLS,
@@ -124,18 +163,18 @@ pub unsafe fn read_vmcs_control_msrs() -> VmcsControlMsrs {
                 IA32_VMX_ENTRY_CTLS,
             )
         };
-        let pinbased = rdmsr(pin_id);
-        let primary = rdmsr(primary_id);
-        let exit = rdmsr(exit_id);
-        let entry = rdmsr(entry_id);
+        let pinbased = ControlCapability(rdmsr(pin_id));
+        let primary = ControlCapability(rdmsr(primary_id));
+        let exit = ControlCapability(rdmsr(exit_id));
+        let entry = ControlCapability(rdmsr(entry_id));
         // Reading an MSR the CPU does not have raises #GP, so each one is
         // read only when the MSR before it says it exists.
-        let secondary = if primary & PRIMARY_ALLOWS_SECONDARY != 0 {
+        let secondary = ControlCapability(if primary.allows(CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) {
             rdmsr(IA32_VMX_PROCBASED_CTLS2)
         } else {
             0
-        };
-        let ept_vpid_cap = if secondary & SECONDARY_ALLOWS_EPT_OR_VPID != 0 {
+        });
+        let ept_vpid_cap = if secondary.allows(SECONDARY_ENABLE_EPT) || secondary.allows(SECONDARY_ENABLE_VPID) {
             rdmsr(IA32_VMX_EPT_VPID_CAP)
         } else {
             0
@@ -178,3 +217,7 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 
     ((high as u64) << 32) | low as u64
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/vmx/msr.rs"]
+mod tests;
