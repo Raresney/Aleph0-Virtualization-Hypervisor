@@ -1,6 +1,7 @@
 //! Why bring-up stopped, and how that gets printed.
 
 use crate::vmx;
+use crate::vmx::ept::EptError;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host_tables::{GdtError, TssError};
@@ -20,6 +21,9 @@ pub enum BringUpError {
     GuestMemory(GuestMemoryError),
     VmxNotSupportedByCpu,
     VmxDisabledByFirmware,
+    /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
+    /// failed. Both happen before VMXON.
+    Ept(EptError),
     VmxOn(VmxOnError),
     /// A VMCS step failed; `operation` names the step for the report.
     /// `instruction_error` is the VM-instruction error number of a
@@ -66,6 +70,12 @@ impl From<VmExitStackError> for BringUpError {
 impl From<GuestMemoryError> for BringUpError {
     fn from(error: GuestMemoryError) -> Self {
         Self::GuestMemory(error)
+    }
+}
+
+impl From<EptError> for BringUpError {
+    fn from(error: EptError) -> Self {
+        Self::Ept(error)
     }
 }
 
@@ -121,6 +131,11 @@ pub fn report_error(error: BringUpError) {
         BringUpError::GuestMemory(error) => log!("Guest memory setup failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
+        BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(
+            "EPT setup failed: the memory map reaches {end:#x}, past the {:#x} one PDPT maps.",
+            vmx::ept::MAX_IDENTITY_MAP,
+        ),
+        BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
         BringUpError::VmxOn(error) => log!("VMXON failed: {error:?}"),
         BringUpError::Vmcs { operation, error, instruction_error } => {
             report_vmcs_error(operation, error, instruction_error)

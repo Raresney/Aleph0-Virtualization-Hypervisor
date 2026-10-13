@@ -36,8 +36,9 @@ pub(super) fn segment_state() {
     }
 }
 
-/// Prints the VMX capability MSRs: IA32_VMX_BASIC and, for each of the four
-/// control fields, which bits must be 1 (low half) and may be 1 (high half).
+/// Prints the VMX capability MSRs: IA32_VMX_BASIC; for each of the four
+/// control fields and the secondary controls, which bits must be 1 (low
+/// half) and may be 1 (high half); and IA32_VMX_EPT_VPID_CAP.
 pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     log!(
         "VMX BASIC={:#018x}; true controls={}",
@@ -54,6 +55,18 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
             value as u32, (value >> 32) as u32,
         );
     }
+    log!(
+        "VMX secondary: required={:#010x} allowed={:#010x}; EPT/VPID capabilities={:#018x}",
+        controls.secondary as u32, (controls.secondary >> 32) as u32, controls.ept_vpid_cap,
+    );
+}
+
+/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made.
+pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
+    log!(
+        "EPT built: identity 0x0..{:#x} ({} GiB) with 2 MiB pages, {} table pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        ept.end(), ept.end() >> 30, ept.table_pages(),
+    );
 }
 
 /// Prints how the current page tables, which the guest will share, map the

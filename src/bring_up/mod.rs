@@ -7,11 +7,13 @@
 //!    a nonzero host TR. The firmware's GDTR is recorded first, and put back
 //!    on every return path once this step has succeeded: by `run` if a
 //!    failure comes before VMXON, by step 7 after it.
-//! 2. Allocate the VM-exit stack and the guest's code and stack pages, and
-//!    check how the page tables map the guest pages.
-//! 3. Detect VMX and read its capability MSRs ([`check_vmx_support`]).
+//! 2. Allocate the VM-exit stack and the guest's pages, and check how the
+//!    page tables map the guest pages.
+//! 3. Detect VMX, read its capability MSRs and check EPT support
+//!    ([`check_vmx_support`]), then build the EPT identity map with the
+//!    guest's data page read-only.
 //! 4. Enter VMX root operation and create the VMCS.
-//! 5. Fill in the VMCS: controls, host state, guest state
+//! 5. Fill in the VMCS: controls, EPT pointer, host state, guest state
 //!    ([`prepare_vmcs`]). Then check that none of this disturbed the host's
 //!    descriptor tables, and stop if it did.
 //! 6. Launch the guest with VMLAUNCH. `vmx::vmcs::launch` returns once the
@@ -39,6 +41,7 @@ pub use error::{report_error, BringUpError};
 
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
+use crate::vmx::ept::{self, Ept, InveptType};
 use crate::vmx::guest::GuestMemory;
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
@@ -83,6 +86,7 @@ const _: () = assert!(
         && !core::mem::needs_drop::<GdtRegion>()
         && !core::mem::needs_drop::<VmExitStack>()
         && !core::mem::needs_drop::<GuestMemory>()
+        && !core::mem::needs_drop::<Ept>()
         && !core::mem::needs_drop::<VmxOperation>()
         && !core::mem::needs_drop::<VmcsRegion>()
 );
@@ -96,8 +100,8 @@ const _: () = assert!(
 /// VMX operation. The one exception is a failing VMXOFF: the CPU then stays
 /// in VMX root operation with CR4.VMXE set, and teardown prints that.
 ///
-/// Every region allocated here (TSS, GDT, VM-exit stack, guest pages, VMXON
-/// region, VMCS) stays allocated, even after this returns. None of these
+/// Every region allocated here (TSS, GDT, VM-exit stack, guest pages, EPT
+/// tables, VMXON region, VMCS) stays allocated, even after this returns. None of these
 /// types implement `Drop`, so their pages are never returned to UEFI. TR
 /// keeps pointing at the TSS (see `teardown`).
 pub fn run() -> Result<GuestRun, BringUpError> {
@@ -118,13 +122,13 @@ pub fn run() -> Result<GuestRun, BringUpError> {
             return Err(error);
         }
     };
-    let VmxEntry { vmexit_stack, guest, controls, firmware, vmx_operation } = entry;
+    let VmxEntry { vmexit_stack, guest, ept, controls, firmware, vmx_operation } = entry;
 
     // From here on every path goes through teardown before returning.
     // Only legal now: the VMCS instructions raise #UD outside VMX operation.
     let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
     let result = match &vmcs {
-        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &host_tables),
+        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &ept, &host_tables),
         Err(error) => Err(*error),
     };
     let left = unsafe { teardown::teardown(vmx_operation, vmcs.as_ref().ok(), &firmware) };
@@ -142,15 +146,16 @@ pub fn run() -> Result<GuestRun, BringUpError> {
 struct VmxEntry {
     vmexit_stack: VmExitStack,
     guest: GuestMemory,
+    ept: Ept,
     controls: VmcsControlMsrs,
     firmware: FirmwareState,
     vmx_operation: VmxOperation,
 }
 
 /// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack and the guest's
-/// pages, checks VMX support, and enters VMX root operation. A failure here
-/// leaves the CPU outside VMX operation, so `run` only has to put the
-/// firmware's GDTR back.
+/// pages, checks VMX and EPT support, builds the EPT tables, and enters VMX
+/// root operation. A failure here leaves the CPU outside VMX operation, so
+/// `run` only has to put the firmware's GDTR back.
 fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmexit_stack = VmExitStack::allocate()?;
     log!("VM-exit stack allocated: top={:#018x} size={VM_EXIT_STACK_SIZE}.", vmexit_stack.top());
@@ -167,7 +172,11 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
 
-    let controls = check_vmx_support()?;
+    let (controls, invept) = check_vmx_support()?;
+
+    // The identity mapping makes the data page's address its GPA.
+    let ept = unsafe { Ept::build(guest.data_page(), invept) }?;
+    report::ept(&ept, guest.data_page());
 
     // Recorded before VMXON: once the guest runs, its VM exits clear IF, and
     // teardown turns interrupts back on only if firmware had them on.
@@ -179,7 +188,7 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmx_operation = unsafe { vmx::vmxon::enter_vmx_root_operation() }?;
     log!("Entered VMX root operation.");
 
-    Ok(VmxEntry { vmexit_stack, guest, controls, firmware, vmx_operation })
+    Ok(VmxEntry { vmexit_stack, guest, ept, controls, firmware, vmx_operation })
 }
 
 /// Builds a GDT that adds a TSS descriptor to a copy of the firmware's GDT,
@@ -222,9 +231,10 @@ fn activate_host_tables() -> Result<HostTables, BringUpError> {
     })
 }
 
-/// Detects VMX and reads the capability MSRs the VMCS controls are chosen
-/// from.
-fn check_vmx_support() -> Result<VmcsControlMsrs, BringUpError> {
+/// Detects VMX, reads the capability MSRs the VMCS controls are chosen from,
+/// and checks that the CPU supports the EPT Aleph0 builds. Returns the MSRs
+/// and the INVEPT type to use.
+fn check_vmx_support() -> Result<(VmcsControlMsrs, InveptType), BringUpError> {
     match unsafe { vmx::detect() } {
         VmxCapabilities::Supported => {
             log!("VMX supported and enabled by firmware.");
@@ -235,7 +245,10 @@ fn check_vmx_support() -> Result<VmcsControlMsrs, BringUpError> {
 
     let controls = unsafe { vmx::msr::read_vmcs_control_msrs() };
     report::vmx_capabilities(&controls);
-    Ok(controls)
+
+    let invept = ept::check_support(controls.secondary, controls.ept_vpid_cap)?;
+    log!("EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT {}.", invept.name());
+    Ok((controls, invept))
 }
 
 /// Prepares the current VMCS, checks the host tables, and launches the
@@ -244,21 +257,23 @@ fn launch_guest(
     controls: &VmcsControlMsrs,
     vmexit_stack: &VmExitStack,
     guest: &GuestMemory,
+    ept: &Ept,
     host_tables: &HostTables,
 ) -> Result<GuestRun, BringUpError> {
-    prepare_vmcs(controls, vmexit_stack, guest)?;
+    prepare_vmcs(controls, vmexit_stack, guest, ept)?;
     check_host_tables_preserved(host_tables)?;
 
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
     guest_result(unsafe { vmx::vmcs::launch() })
 }
 
-/// Fills in the current VMCS: controls, host state, and guest state.
-/// VM entry is not attempted.
+/// Fills in the current VMCS: controls, EPT pointer, host state, and guest
+/// state. VM entry is not attempted.
 fn prepare_vmcs(
     controls: &VmcsControlMsrs,
     vmexit_stack: &VmExitStack,
     guest: &GuestMemory,
+    ept: &Ept,
 ) -> Result<(), BringUpError> {
     unsafe { vmx::vmcs::self_test() }.map_err(vmcs_step("self-test"))?;
     log!("VMCS self-test passed: VMREAD returned what VMWRITE stored.");
@@ -266,6 +281,9 @@ fn prepare_vmcs(
     unsafe { vmx::vmcs::configure_controls(controls, DesiredControls::minimal_64_bit_guest()) }
         .map_err(vmcs_step("control setup"))?;
     log!("VMCS controls written and read back successfully.");
+
+    unsafe { vmx::vmcs::set_ept_pointer(ept.eptp()) }.map_err(vmcs_step("EPT pointer setup"))?;
+    log!("VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.", ept.eptp());
 
     unsafe { vmx::vmcs::configure_host_state() }.map_err(vmcs_step("host-state setup"))?;
     let exit_controls = unsafe { vmx::vmcs::vmread(vmx::vmcs::fields::VM_EXIT_CONTROLS) }

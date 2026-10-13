@@ -191,10 +191,8 @@ pub fn eptp(pml4: u64) -> u64 {
     (pml4 & ADDRESS_MASK) | MEMORY_TYPE_WB | EPTP_WALK_LENGTH_4
 }
 
-/// Index into the PML4 for `address`: bits 47:39.
-pub fn pml4_index(address: u64) -> usize {
-    ((address >> 39) & 0x1FF) as usize
-}
+// No PML4 index helper: the map ends at 512 GiB at most, so every address
+// in it uses PML4 entry 0.
 
 /// Index into the PDPT: bits 38:30.
 pub fn pdpt_index(address: u64) -> usize {
@@ -272,7 +270,9 @@ fn fill_identity_map(tables: Tables<'_>, end: u64, protected_page: u64) -> usize
     for (i, entry) in tables.pds.iter_mut().enumerate().take(gibs * ENTRIES) {
         *entry = large_page_entry(i as u64 * SIZE_2M);
     }
-    let split = (protected_page / SIZE_2M) as usize;
+    // The PDs are back to back, one per PDPT entry, so the PD entry for an
+    // address is its PDPT index times 512 plus its PD index.
+    let split = pdpt_index(protected_page) * ENTRIES + pd_index(protected_page);
     tables.pds[split] = table_entry(tables.pt_address);
 
     let region = protected_page & !(SIZE_2M - 1);

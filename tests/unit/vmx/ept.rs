@@ -65,10 +65,7 @@ fn eptp_low_bits_are_write_back_and_4_levels() {
 #[test]
 fn indices_split_the_address() {
     let address = (3 << 39) | (5 << 30) | (7 << 21) | (9 << 12) | 0x123;
-    assert_eq!(
-        (pml4_index(address), pdpt_index(address), pd_index(address), pt_index(address)),
-        (3, 5, 7, 9),
-    );
+    assert_eq!((pdpt_index(address), pd_index(address), pt_index(address)), (5, 7, 9));
 }
 
 #[test]
