@@ -12,8 +12,8 @@
 //!
 //! Lifecycle:
 //!
-//! 1. [`VmcsRegion::allocate`] + [`VmcsRegion::write_revision_id`] — same as
-//!    the VMXON region.
+//! 1. [`VmxRegion::allocate`] — a page with the revision identifier, same
+//!    as the VMXON region.
 //! 2. [`VmcsRegion::vmclear`] — initialise it and flush any cached data the
 //!    CPU holds for that physical address. Required once before first use,
 //!    even on a freshly zeroed page.
@@ -32,26 +32,21 @@
 //! that once a current VMCS exists, VMfailValid also stores a numeric reason
 //! readable via [`vm_instruction_error`].
 
-use core::arch::asm;
-use crate::vmx::msr::{self, VmcsControlMsrs};
+use crate::vmx::ept::Eptp;
+use crate::vmx::instruction::{VmxFail, check_rflags, vmx_asm};
+use crate::vmx::msr::{self, UnsupportedControl, VmcsControlMsrs};
+use crate::vmx::region::VmxRegion;
 use crate::vmx::{cr, segment};
-use crate::vmx::instruction::{check_rflags, VmxFail};
-
-use super::page::{allocate_zeroed_page, PAGE_SIZE};
-use super::vmxon::vmcs_revision_id;
+use core::arch::asm;
 
 pub mod fields;
 mod launch;
 
-pub use launch::{encode_finished, encode_resume_failed, encode_unexpected, launch, GuestStop};
+pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpected, launch};
 
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
 use fields::*;
-
-/// VMCS region size. Architecturally at most 4 KiB; one page is the norm.
-pub const VMCS_REGION_SIZE: usize = 4096;
-const _: () = assert!(VMCS_REGION_SIZE == PAGE_SIZE);
 
 /// Requested control bits; CPU-required bits are added by `configure_controls`.
 #[derive(Debug, Clone, Copy)]
@@ -108,14 +103,15 @@ pub enum VmcsError {
     /// ZF=1: the instruction failed and stored a reason in the current VMCS;
     /// read it with [`vm_instruction_error`].
     VmFailValid,
-    /// [`self_test`] read back something other than what it wrote. Both
-    /// instructions reported success, so this is not a VMX failure.
-    SelfTestMismatch,
+    /// [`write_verified`] read `read` back from `field` after writing
+    /// `written`. Both instructions reported success, so this is not a VMX
+    /// failure.
+    ReadbackMismatch { field: u32, written: u64, read: u64 },
     /// The requested control value is not supported by the processor.
     UnsupportedControlValue,
-    /// A control field read back differently from the value written to it.
-    ControlReadbackMismatch,
-    /// Host state validation failed.
+    /// A host-state value failed its check before being written: a selector
+    /// with RPL or TI set, a null CS or TR, or a null or misaligned
+    /// HOST_RSP/HOST_RIP.
     HostStateValidation,
     /// VMLAUNCH fell through to the next instruction with CF and ZF both
     /// clear. A successful VMLAUNCH never falls through, so the guest was
@@ -138,59 +134,30 @@ impl From<VmxFail> for VmcsError {
     }
 }
 
-/// A 4 KiB, 4 KiB-aligned VMCS region.
+impl From<UnsupportedControl> for VmcsError {
+    fn from(_: UnsupportedControl) -> Self {
+        Self::UnsupportedControlValue
+    }
+}
+
+/// A VMCS: a [`VmxRegion`] used as a VMCS, through VMCLEAR and VMPTRLD.
 pub struct VmcsRegion {
-    /// Physical address of the region. Equal to the virtual address under UEFI.
-    phys_addr: u64,
+    region: VmxRegion,
 }
 
 impl VmcsRegion {
-    /// Allocates and zeroes one page through UEFI Boot Services.
-    pub fn allocate() -> Result<Self, VmcsError> {
-        let ptr = allocate_zeroed_page(VmcsError::AllocationFailed)?;
-
-        Ok(
-            Self {
-                phys_addr: ptr.as_ptr() as u64
-            }
-        )
-    }
-
-    /// Address of the field holding the physical address, for the memory
-    /// operand that VMCLEAR and VMPTRLD take.
-    pub fn phys_addr_ref(&self) -> &u64 {
-        &self.phys_addr
-    }
-
-    /// Writes the VMCS revision identifier into the first four bytes.
-    ///
-    /// # Safety
-    ///
-    /// The region must not be in use as a VMCS when it is modified.
-    pub unsafe fn write_revision_id(&mut self, revision_id: u32) {
-        unsafe {
-            (self.phys_addr as *mut u32).write_volatile(revision_id);
-        }
-    }
-
     /// Initialises the VMCS and flushes CPU-cached data for its address.
     ///
     /// Must run once before the region is first used, and again whenever a
     /// VMCS stops being current on this processor.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must be in VMX root operation.
     pub unsafe fn vmclear(&self) -> Result<(), VmcsError> {
-        let rflags: u64;
-        unsafe {
-            asm!(
-                "vmclear [{0}]",
-                "pushfq",
-                "pop {1}",
-                in(reg) self.phys_addr_ref(),
-                lateout(reg) rflags
-            );
-        }
-
-        Ok(check_rflags(rflags)?)
-
+        // SAFETY: VMCLEAR reads only the 8-byte operand and works on a region
+        // this value owns; the caller guarantees VMX root operation.
+        Ok(unsafe { vmx_asm!("vmclear [{0}]", in(reg) self.region.phys_addr_ref()) }?)
     }
 
     /// Allocates a VMCS, initialises it, and makes it the current VMCS.
@@ -202,31 +169,30 @@ impl VmcsRegion {
     ///
     /// The CPU must be in VMX root operation.
     pub unsafe fn create_current() -> Result<Self, VmcsError> {
+        // SAFETY: VMX root operation (the caller's obligation) implies VMX
+        // support. The revision identifier is written before VMPTRLD, not
+        // just before use: VMPTRLD rejects a region whose identifier does
+        // not match the CPU (error 11).
         unsafe {
-            let mut region = Self::allocate()?;
-            // Before VMPTRLD, not just before use: VMPTRLD rejects a region
-            // whose revision identifier does not match the CPU (error 11).
-            region.write_revision_id(vmcs_revision_id());
-            region.vmclear()?;
-            region.vmptrld()?;
-            Ok(region)
+            let vmcs = Self {
+                region: VmxRegion::allocate(VmcsError::AllocationFailed)?,
+            };
+            vmcs.vmclear()?;
+            vmcs.vmptrld()?;
+            Ok(vmcs)
         }
     }
 
     /// Makes this VMCS the current one for this logical processor.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must be in VMX root operation, and the region must have been
+    /// cleared with [`VmcsRegion::vmclear`].
     pub unsafe fn vmptrld(&self) -> Result<(), VmcsError> {
-        let rflags: u64;
-        unsafe {
-            asm!(
-                "vmptrld [{0}]",
-                "pushfq",
-                "pop {1}",
-                in(reg) self.phys_addr_ref(),
-                lateout(reg) rflags
-            );
-        }
-
-        Ok(check_rflags(rflags)?)
+        // SAFETY: VMPTRLD reads only the 8-byte operand; the caller
+        // guarantees VMX root operation and a cleared region.
+        Ok(unsafe { vmx_asm!("vmptrld [{0}]", in(reg) self.region.phys_addr_ref()) }?)
     }
 }
 
@@ -234,10 +200,17 @@ impl VmcsRegion {
 ///
 /// Operand order is the opposite of [`vmwrite`]: `VMREAD dest, field`, so the
 /// destination register comes first and the encoding second.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU; outside VMX
+/// operation VMREAD raises #UD.
 pub unsafe fn vmread(field_encoding: u32) -> Result<u64, VmcsError> {
     let value: u64;
     let rflags: u64;
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS;
+    // VMREAD writes only `value` and RFLAGS.
     unsafe {
         asm!(
             "vmread {value}, {field:r}",
@@ -261,9 +234,17 @@ pub unsafe fn vmread(field_encoding: u32) -> Result<u64, VmcsError> {
 ///
 /// Operand order is `VMWRITE field, value` — the encoding comes first, which
 /// reads backwards compared to a normal `mov`.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU. The value
+/// takes effect at the next VM entry or exit, so it must be one the rest of
+/// Aleph0 expects in that field.
 pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> {
     let rflags: u64;
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS,
+    // and that the value suits the field; VMWRITE changes only the VMCS.
     unsafe {
         asm!(
             "vmwrite {field:r}, {value}",
@@ -276,6 +257,28 @@ pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> 
     }
 
     Ok(check_rflags(rflags)?)
+}
+
+/// Writes a field in the current VMCS and reads it back, so a value that did
+/// not land as written is caught here rather than as a VM-entry failure.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
+pub unsafe fn write_verified(field: u32, value: u64) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    let read = unsafe {
+        vmwrite(field, value)?;
+        vmread(field)?
+    };
+    if read != value {
+        return Err(VmcsError::ReadbackMismatch {
+            field,
+            written: value,
+            read,
+        });
+    }
+    Ok(())
 }
 
 /// Decodes the RFLAGS left behind when VMLAUNCH falls through. That only
@@ -315,44 +318,31 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 ///
 /// VMX operation must be active and a VMCS must be current on this CPU.
 pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: DesiredControls) -> Result<(), VmcsError> {
-    let pin = choose_control(capabilities.pinbased, desired.pin)?;
-    let primary = choose_control(capabilities.primary, primary_request(desired))?;
+    let pin = capabilities.pinbased.choose(desired.pin)?;
+    let primary = capabilities.primary.choose(primary_request(desired))?;
     let secondary = if desired.secondary != 0 {
-        Some(choose_control(capabilities.secondary, desired.secondary)?)
+        Some(capabilities.secondary.choose(desired.secondary)?)
     } else {
         None
     };
     // NMI-window exiting is only switched on while an NMI waits for
     // injection (`set_nmi_window_exiting`), but the CPU must allow it.
-    choose_control(capabilities.primary, CPU_BASED_NMI_WINDOW_EXITING)
-        .map_err(|_| VmcsError::NmiWindowExitingUnsupported)?;
-    let exit = choose_control(capabilities.exit, desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE)?;
-    let entry = choose_control(capabilities.entry, desired.entry)?;
+    if !capabilities.primary.allows(CPU_BASED_NMI_WINDOW_EXITING) {
+        return Err(VmcsError::NmiWindowExitingUnsupported);
+    }
+    let exit = capabilities
+        .exit
+        .choose(desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE)?;
+    let entry = capabilities.entry.choose(desired.entry)?;
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     unsafe {
-        vmwrite(PIN_BASED_VM_EXEC_CONTROL, pin.into())?;
-        vmwrite(PRIMARY_VM_EXEC_CONTROL, primary.into())?;
-        vmwrite(VM_EXIT_CONTROLS, exit.into())?;
-        vmwrite(VM_ENTRY_CONTROLS, entry.into())?;
-
-        // Verify by reading back
-        if vmread(PIN_BASED_VM_EXEC_CONTROL)? != pin as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-        if vmread(PRIMARY_VM_EXEC_CONTROL)? != primary as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-        if vmread(VM_EXIT_CONTROLS)? != exit as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-        if vmread(VM_ENTRY_CONTROLS)? != entry as u64 {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
+        write_verified(PIN_BASED_VM_EXEC_CONTROL, pin.into())?;
+        write_verified(PRIMARY_VM_EXEC_CONTROL, primary.into())?;
+        write_verified(VM_EXIT_CONTROLS, exit.into())?;
+        write_verified(VM_ENTRY_CONTROLS, entry.into())?;
         if let Some(secondary) = secondary {
-            vmwrite(SECONDARY_VM_EXEC_CONTROL, secondary.into())?;
-            if vmread(SECONDARY_VM_EXEC_CONTROL)? != secondary as u64 {
-                return Err(VmcsError::ControlReadbackMismatch);
-            }
+            write_verified(SECONDARY_VM_EXEC_CONTROL, secondary.into())?;
         }
 
         // VM entry checks these fields, and VMCLEAR does not guarantee that
@@ -369,16 +359,10 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
             PAGE_FAULT_ERROR_CODE_MASK,
             PAGE_FAULT_ERROR_CODE_MATCH,
         ] {
-            vmwrite(field, 0)?;
-            if vmread(field)? != 0 {
-                return Err(VmcsError::ControlReadbackMismatch);
-            }
+            write_verified(field, 0)?;
         }
 
-        vmwrite(EXCEPTION_BITMAP, EXCEPTION_BITMAP_ALL.into())?;
-        if vmread(EXCEPTION_BITMAP)? != u64::from(EXCEPTION_BITMAP_ALL) {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
+        write_verified(EXCEPTION_BITMAP, EXCEPTION_BITMAP_ALL.into())?;
     }
 
     Ok(())
@@ -393,28 +377,39 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
 /// VMX operation must be active, a VMCS must be current on this CPU, and the
 /// host GDT and TSS must already be active and remain valid on VM exit.
 pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
-    // a. Read segment::read_all() and cr::read_cr0/cr3/cr4 after GDT/TSS activation.
-    // b. Check the host selectors' VM-entry constraints before writing them.
-    // c. Pair each HOST_* selector, CR, and base encoding with its live value;
-    //    use vmwrite and vmread to verify every pair, as configure_controls does.
-    // d. Load host PAT/EFER only when selected VM-exit controls require them.
-    // e. Configure HOST_RSP/HOST_RIP separately with configure_host_entry; do not launch.
+    // SAFETY: the caller guarantees the host GDT is active and live, and UEFI
+    // runs in long mode.
     let segments = unsafe { segment::read_all() };
-    let cr0 = unsafe { cr::read_cr0() };
-    let cr3 = unsafe { cr::read_cr3() };
-    let cr4 = unsafe { cr::read_cr4() };
-    let sysenter_cs = u64::from(unsafe { msr::rdmsr(msr::IA32_SYSENTER_CS) } as u32);
-    let sysenter_esp = unsafe { msr::rdmsr(msr::IA32_SYSENTER_ESP) };
-    let sysenter_eip = unsafe { msr::rdmsr(msr::IA32_SYSENTER_EIP) };
+    let cr0 = cr::read_cr0();
+    let cr3 = cr::read_cr3();
+    let cr4 = cr::read_cr4();
+    // SAFETY: the SYSENTER MSRs exist on every x86_64 CPU, and reading
+    // them has no side effects.
+    let (sysenter_cs, sysenter_esp, sysenter_eip) = unsafe {
+        (
+            u64::from(msr::rdmsr(msr::IA32_SYSENTER_CS) as u32),
+            msr::rdmsr(msr::IA32_SYSENTER_ESP),
+            msr::rdmsr(msr::IA32_SYSENTER_EIP),
+        )
+    };
 
+    // VM entry requires every host selector to have RPL and TI clear, and
+    // CS and TR to be non-null.
     {
-
         let selectors = [
-            segments.es, segments.cs, segments.ss, segments.ds,
-            segments.fs, segments.gs, segments.tr,
+            segments.es,
+            segments.cs,
+            segments.ss,
+            segments.ds,
+            segments.fs,
+            segments.gs,
+            segments.tr,
         ];
 
-        if selectors.iter().any(|selector| selector & 0b111 != 0) {
+        if selectors
+            .iter()
+            .any(|selector| selector & segment::SELECTOR_RPL_TI != 0)
+        {
             return Err(VmcsError::HostStateValidation);
         }
     }
@@ -422,36 +417,42 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     if segments.cs == 0 || segments.tr == 0 {
         return Err(VmcsError::HostStateValidation);
     }
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     let exit_controls = unsafe { vmread(VM_EXIT_CONTROLS)? };
-    
+
+    // SAFETY: the caller guarantees VMX operation with a current VMCS. PAT
+    // and EFER are read only when the exit controls load them, which the CPU
+    // allows only if it has them.
+    // Host PAT and EFER are written only when the exit controls load them.
+    // HOST_RSP and HOST_RIP come later, from `configure_host_entry`.
     unsafe {
-        write_host_state(HOST_ES_SELECTOR, segments.es as u64)?;
-        write_host_state(HOST_CS_SELECTOR, segments.cs as u64)?;
-        write_host_state(HOST_SS_SELECTOR, segments.ss as u64)?;
-        write_host_state(HOST_DS_SELECTOR, segments.ds as u64)?;
-        write_host_state(HOST_FS_SELECTOR, segments.fs as u64)?;
-        write_host_state(HOST_GS_SELECTOR, segments.gs as u64)?;
-        write_host_state(HOST_TR_SELECTOR, segments.tr as u64)?;
+        write_verified(HOST_ES_SELECTOR, segments.es as u64)?;
+        write_verified(HOST_CS_SELECTOR, segments.cs as u64)?;
+        write_verified(HOST_SS_SELECTOR, segments.ss as u64)?;
+        write_verified(HOST_DS_SELECTOR, segments.ds as u64)?;
+        write_verified(HOST_FS_SELECTOR, segments.fs as u64)?;
+        write_verified(HOST_GS_SELECTOR, segments.gs as u64)?;
+        write_verified(HOST_TR_SELECTOR, segments.tr as u64)?;
 
-        write_host_state(HOST_CR0, cr0)?;
-        write_host_state(HOST_CR3, cr3)?;
-        write_host_state(HOST_CR4, cr4)?;
+        write_verified(HOST_CR0, cr0)?;
+        write_verified(HOST_CR3, cr3)?;
+        write_verified(HOST_CR4, cr4)?;
 
-        write_host_state(HOST_FS_BASE, segments.fs_base)?;
-        write_host_state(HOST_GS_BASE, segments.gs_base)?;
-        write_host_state(HOST_TR_BASE, segments.tr_base)?;
-        write_host_state(HOST_GDTR_BASE, segments.gdtr.base)?;
-        write_host_state(HOST_IDTR_BASE, segments.idtr.base)?;
+        write_verified(HOST_FS_BASE, segments.fs_base)?;
+        write_verified(HOST_GS_BASE, segments.gs_base)?;
+        write_verified(HOST_TR_BASE, segments.tr_base)?;
+        write_verified(HOST_GDTR_BASE, segments.gdtr.base)?;
+        write_verified(HOST_IDTR_BASE, segments.idtr.base)?;
 
-        write_host_state(HOST_IA32_SYSENTER_CS, sysenter_cs)?;
-        write_host_state(HOST_IA32_SYSENTER_ESP, sysenter_esp)?;
-        write_host_state(HOST_IA32_SYSENTER_EIP, sysenter_eip)?;
+        write_verified(HOST_IA32_SYSENTER_CS, sysenter_cs)?;
+        write_verified(HOST_IA32_SYSENTER_ESP, sysenter_esp)?;
+        write_verified(HOST_IA32_SYSENTER_EIP, sysenter_eip)?;
 
         if exit_controls & VM_EXIT_LOAD_IA32_PAT != 0 {
-            write_host_state(HOST_IA32_PAT, msr::rdmsr(msr::IA32_PAT))?;
+            write_verified(HOST_IA32_PAT, msr::rdmsr(msr::IA32_PAT))?;
         }
         if exit_controls & VM_EXIT_LOAD_IA32_EFER != 0 {
-            write_host_state(HOST_IA32_EFER, msr::rdmsr(msr::IA32_EFER))?;
+            write_verified(HOST_IA32_EFER, msr::rdmsr(msr::IA32_EFER))?;
         }
     }
 
@@ -469,37 +470,12 @@ pub unsafe fn configure_host_entry(stack_top: u64, entry_address: u64) -> Result
         return Err(VmcsError::HostStateValidation);
     }
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     unsafe {
-        write_host_state(HOST_RSP, stack_top)?;
-        write_host_state(HOST_RIP, entry_address)?;
+        write_verified(HOST_RSP, stack_top)?;
+        write_verified(HOST_RIP, entry_address)?;
     }
     Ok(())
-}
-
-/// Write a host state field and verify it by reading it back.
-unsafe fn write_host_state(field_encoding: u32, value: u64) -> Result<(), VmcsError> {
-    unsafe {
-        vmwrite(field_encoding, value)?;
-        let read_back = vmread(field_encoding)?;
-        if read_back != value {
-            return Err(VmcsError::HostStateValidation);
-        }
-        Ok(())
-    }
-}
-
-/// Choose a 32-bit VMCS control value using one raw capability MSR.
-/// The low half forces bits to 1; the high half permits bits to be 1.
-/// Reject an inconsistent mask or a requested bit the CPU cannot enable.
-fn choose_control(capability: u64, desired: u32) -> Result<u32, VmcsError> {
-    let required = capability as u32;
-    let allowed = (capability >> 32) as u32;
-    if required & !allowed != 0 || desired & !allowed != 0 {
-        return Err(VmcsError::UnsupportedControlValue);
-    }
-
-    // Add mandatory bits without changing any other requested bits.
-    Ok(desired | required)
 }
 
 /// `primary` with NMI-window exiting turned on or off, other bits unchanged.
@@ -517,25 +493,23 @@ fn with_nmi_window_exiting(primary: u64, on: bool) -> u64 {
 /// VMX operation with a current VMCS. `configure_controls` has checked that
 /// the CPU allows the bit.
 pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     let primary = unsafe { vmread(PRIMARY_VM_EXEC_CONTROL)? };
+    // SAFETY: the caller guarantees VMX operation with a current VMCS. Only
+    // the NMI-window bit changes, which the caller checked the CPU allows.
     unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
 }
 
-/// Writes the EPT pointer (see `vmx::ept::eptp`) and reads it back. VM entry
-/// checks it only when the "enable EPT" secondary control is set.
+/// Writes the EPT pointer and reads it back. VM entry checks it only when
+/// the "enable EPT" secondary control is set.
 ///
 /// # Safety
 ///
 /// VMX operation with a current VMCS. The tables `eptp` names must stay
 /// allocated for as long as the VMCS may be used.
-pub unsafe fn set_ept_pointer(eptp: u64) -> Result<(), VmcsError> {
-    unsafe {
-        vmwrite(EPT_POINTER, eptp)?;
-        if vmread(EPT_POINTER)? != eptp {
-            return Err(VmcsError::ControlReadbackMismatch);
-        }
-    }
-    Ok(())
+pub unsafe fn set_ept_pointer(eptp: Eptp) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    unsafe { write_verified(EPT_POINTER, eptp.raw()) }
 }
 
 /// The numeric reason the last VMX instruction failed.
@@ -548,8 +522,13 @@ pub unsafe fn set_ept_pointer(eptp: u64) -> Result<(), VmcsError> {
 ///
 /// Never call this to diagnose a failed [`vmread`]: this *is* a `vmread`, so
 /// it would fail the same way and recurse.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
 pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
     // VM_INSTRUCTION_ERROR is a 32-bit field; VMREAD zero-extends it.
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     Ok(unsafe { vmread(VM_INSTRUCTION_ERROR)? } as u32)
 }
 
@@ -568,6 +547,9 @@ pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
 /// either.
 pub unsafe fn instruction_error_for(error: VmcsError) -> Option<u32> {
     if error == VmcsError::VmFailValid {
+        // SAFETY: a VmFailValid comes from a VMX instruction run in VMX
+        // operation with a current VMCS, which the caller guarantees is still
+        // current.
         unsafe { vm_instruction_error() }.ok()
     } else {
         None
@@ -599,22 +581,20 @@ pub fn vm_instruction_error_name(error: u32) -> &'static str {
 /// Proves the access path to the current VMCS works: write a field, read
 /// it back.
 ///
-/// Requires VMX operation and a current VMCS ([`VmcsRegion::create_current`]).
 /// Leaves the test pattern in GUEST_RIP; guest-state setup overwrites it.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU
+/// ([`VmcsRegion::create_current`]).
 pub unsafe fn self_test() -> Result<(), VmcsError> {
     // Bits set in both halves, so a write that only lands in the low 32 bits
     // is caught. Canonical (bits 63:47 clear), which GUEST_RIP will need once
     // VM entry starts checking it.
     const PATTERN: u64 = 0x0000_7FFF_DEAD_BEEF;
 
-    unsafe {
-        vmwrite(GUEST_RIP, PATTERN)?;
-        if vmread(GUEST_RIP)? != PATTERN {
-            return Err(VmcsError::SelfTestMismatch);
-        }
-    }
-
-    Ok(())
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    unsafe { write_verified(GUEST_RIP, PATTERN) }
 }
 
 #[cfg(test)]

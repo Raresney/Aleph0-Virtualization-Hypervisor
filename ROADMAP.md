@@ -27,6 +27,8 @@ Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tr
 
 - [x] Enable EPT with an identity map of all memory, make the guest's data page read-only, and handle the guest's write to it: an intentional EPT violation after which Aleph0 grants write, runs INVEPT and retries the write (see section 5 and [docs/EPT.md](docs/EPT.md)).
 
+- [x] Refactor without changing behaviour: shared register accessors and descriptor decoding, one `vmx_asm!` for the VMX instructions and one `VmxRegion` for the VMXON region and the VMCS, `write_verified` for every checked VMCS write, types for raw values (`SegmentDescriptor`, `ControlCapability`, `EptEntry`, `Eptp`, `InterruptionInfo`, `EptQualification`, `ResumePlan`, `ProtectedPage`), the fixes from the PR #5 review, the `vmexit` module split into stub, handler and report, and a `SAFETY` comment on every `unsafe` block. Host tests, `cargo clippy` and `cargo fmt --check` pass, and a QEMU boot prints the same lines as before.
+
 There is no OS boot yet.
 
 **Next:** section 5: the necessary exits (CPUID, I/O) toward a larger guest, and before an OS guest, EPT memory types from the MTRRs and hiding Aleph0's own pages through EPT. EPT is confirmed on Hyper-V.
@@ -154,4 +156,4 @@ Open questions to settle before this section starts: which game or test target, 
 - Run `scripts/run-hyperv.ps1` from an elevated PowerShell session and inspect the VM console and the serial stream in the PowerShell window (also saved to `run\serial.log`). The runner turns off the named test VM and recreates its ESP VHDX; do not keep irreplaceable data there. VM-exit diagnostics appear only on serial.
 - Record observed VMX instruction errors and VM-exit reasons as milestones are reached. QEMU without nested VMX can still test non-VMX diagnostics, but cannot validate `VMLAUNCH`.
 
-Relevant code: `src/main.rs`, `src/bring_up/`, `src/serial.rs`, `src/output.rs`, `src/vmx/segment.rs`, `src/vmx/vmxon.rs`, `src/vmx/vmcs/`, `src/vmx/vmexit.rs`, `src/vmx/exit_decision.rs`, `src/vmx/ept.rs`, `src/vmx/guest.rs`, `src/vmx/paging.rs`, `src/vmx/guest_state.rs`, `scripts/run-hyperv.ps1`, and `scripts/read-serial.ps1`.
+Relevant code: `src/main.rs`, `src/bring_up/`, `src/serial.rs`, `src/output.rs`, `src/vmx/segment.rs`, `src/vmx/vmxon.rs`, `src/vmx/vmcs/`, `src/vmx/region.rs`, `src/vmx/vmexit/`, `src/vmx/exit_decision.rs`, `src/vmx/ept.rs`, `src/vmx/guest.rs`, `src/vmx/paging.rs`, `src/vmx/guest_state.rs`, `scripts/run-hyperv.ps1`, and `scripts/read-serial.ps1`.

@@ -8,7 +8,7 @@ that says why the guest stopped, the teardown order and the reasons for it,
 and what the Hyper-V run printed.
 
 Code: `src/vmx/vmcs/launch.rs` (launch stub and stop value),
-`src/vmx/vmexit.rs` (exit stub and handler), `src/bring_up/teardown.rs`,
+`src/vmx/vmexit/` (exit stub and handler), `src/bring_up/teardown.rs`,
 `src/bring_up/mod.rs` (`run`), `src/vmx/vmxon.rs` (`VmxOperation::leave`),
 `src/main.rs` (timer check and return).
 
@@ -301,8 +301,8 @@ with ABORTED.`
 | `vmx_return_to_launcher` | `vmcs/launch.rs` | reload RSP, pop 8 regs, `ret` with the stop value in RAX |
 | `VMX_LAUNCH_RSP` | `vmcs/launch.rs` | the saved RSP |
 | `GuestStop` | `vmcs/launch.rs` | `Finished`, `Unexpected`, `LaunchFailed`, `ResumeFailed` |
-| `RESUME_GUEST` (0) | `vmexit.rs` | handler return value: resume |
-| `stub_return` | `vmexit.rs` | `ExitAction` to `0` or a stop value |
+| `RESUME_GUEST` (0) | `vmexit/handler.rs` | handler return value: resume |
+| `stub_return` | `vmexit/handler.rs` | `ExitAction` to `0` or a stop value |
 | `VmxOperation::leave` | `vmxon.rs` | VMXOFF, then CR0/CR4 from before VMXON |
 | `load_gdtr`, `load_idtr` | `segment.rs` | LGDT/LIDT from a `DescriptorTable` |
 | `teardown` | `bring_up/teardown.rs` | tables, VMCLEAR, VMXOFF + CRs, phase, STI, report |

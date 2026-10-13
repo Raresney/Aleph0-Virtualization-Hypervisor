@@ -32,7 +32,8 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
-use super::page::{allocate_zeroed_pages_of_type, PAGE_SIZE};
+use super::exit_decision::NMI_VECTOR;
+use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable};
 
@@ -137,7 +138,9 @@ unsafe extern "C" {
 fn guest_code() -> &'static [u8] {
     let start = &raw const guest_code_start;
     let end = &raw const guest_code_end;
-    // Both labels come from the one asm block above, start before end.
+    // SAFETY: both labels come from the one asm block above, start before
+    // end, so the range is the assembled code: initialised, in the image for
+    // as long as it runs, and never written.
     unsafe { core::slice::from_raw_parts(start, end.offset_from(start) as usize) }
 }
 
@@ -146,18 +149,19 @@ fn guest_code() -> &'static [u8] {
 fn nmi_handler_offset() -> usize {
     let start = &raw const guest_code_start;
     let handler = &raw const guest_nmi_handler;
-    // Both labels come from the one asm block above, start before handler.
+    // SAFETY: both labels come from the one asm block above, so they point
+    // into the same object, start before handler.
     unsafe { handler.offset_from(start) as usize }
 }
 
-/// IDT vector of NMI.
-const NMI_VECTOR: usize = 2;
 /// Size of one 64-bit IDT gate.
 const GATE_SIZE: usize = 16;
+/// Byte offset of the NMI gate (vector 2) in the guest IDT.
+const NMI_GATE_OFFSET: usize = NMI_VECTOR as usize * GATE_SIZE;
 /// GUEST_IDTR limit: three gates, vectors 0 to 2. Only vector 2 is present.
 const GUEST_IDT_LIMIT: u16 = (3 * GATE_SIZE - 1) as u16;
 // The NMI gate must lie inside the IDT limit, or the guest would #GP on an NMI.
-const _: () = assert!(NMI_VECTOR * GATE_SIZE + GATE_SIZE - 1 <= GUEST_IDT_LIMIT as usize);
+const _: () = assert!(NMI_GATE_OFFSET + GATE_SIZE - 1 <= GUEST_IDT_LIMIT as usize);
 
 /// A 64-bit interrupt gate to `handler` through code segment `selector`:
 /// present, DPL 0, no IST.
@@ -219,6 +223,22 @@ pub enum GuestMemoryError {
     /// The data page is a user page and CR4.SMAP is set, so the ring-0
     /// guest's accesses to it would fault before reaching EPT.
     DataBlockedBySmap,
+    /// The page tables map a guest page somewhere other than itself. Guest
+    /// RIP, RSP and IDTR are these virtual addresses, and the EPT identity
+    /// map and its protected GPA assume virtual = guest-physical = physical.
+    NotIdentityMapped { virtual_address: u64, physical: u64 },
+}
+
+/// Checks that `mapping`, the page-table walk of `virtual_address`, maps it
+/// to the same physical address.
+fn check_identity(virtual_address: u64, mapping: &Mapping) -> Result<(), GuestMemoryError> {
+    if mapping.physical != virtual_address {
+        return Err(GuestMemoryError::NotIdentityMapped {
+            virtual_address,
+            physical: mapping.physical,
+        });
+    }
+    Ok(())
 }
 
 /// Checks that a ring-0 guest running with `cr4` can execute from `code`
@@ -299,31 +319,23 @@ impl GuestMemory {
             return Err(GuestMemoryError::CodeTooLarge);
         }
 
-        let code = allocate_zeroed_pages_of_type(
-            2,
-            MemoryType::LOADER_CODE,
-            GuestMemoryError::CodeAllocationFailed,
-        )?;
-        let stack = allocate_zeroed_pages_of_type(
-            1,
-            MemoryType::LOADER_DATA,
-            GuestMemoryError::StackAllocationFailed,
-        )?;
-        let idt = allocate_zeroed_pages_of_type(
-            1,
-            MemoryType::LOADER_DATA,
-            GuestMemoryError::IdtAllocationFailed,
-        )?;
+        let code = allocate_zeroed_pages_of_type(2, MemoryType::LOADER_CODE, GuestMemoryError::CodeAllocationFailed)?;
+        let stack = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::StackAllocationFailed)?;
+        let idt = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::IdtAllocationFailed)?;
 
+        // SAFETY: `code` is a fresh two-page allocation, and the code is at
+        // most one page (checked above).
         unsafe { core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code.as_ptr(), code_bytes.len()) };
         let memory = Self { code, stack, idt };
-        // The data page is 4 KiB-aligned, so a u32 at its start is aligned.
+        // SAFETY: the data page is the second page of the fresh `code`
+        // allocation, 4 KiB-aligned, so a u32 at its start is in bounds and
+        // aligned.
         unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
-        let gate = interrupt_gate(memory.nmi_handler(), unsafe { segment::read_cs() });
-        unsafe {
-            core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_VECTOR * GATE_SIZE), GATE_SIZE)
-        };
+        let gate = interrupt_gate(memory.nmi_handler(), segment::read_cs());
+        // SAFETY: `idt` is a fresh page, and the gate ends within the IDT
+        // limit (asserted at compile time), far inside it.
+        unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_GATE_OFFSET), GATE_SIZE) };
         Ok(memory)
     }
 
@@ -352,6 +364,8 @@ impl GuestMemory {
 
     /// Top of the downward-growing guest stack, for GUEST_RSP.
     pub fn stack_top(&self) -> u64 {
+        // SAFETY: the stack is one page, so this is one past its end, which
+        // `add` allows.
         let top = unsafe { self.stack.as_ptr().add(PAGE_SIZE) } as usize;
         assert_eq!(top % 16, 0);
         top as u64
@@ -360,12 +374,16 @@ impl GuestMemory {
     /// The guest's own IDT, for GUEST_IDTR: vectors 0 to 2, only vector 2
     /// (NMI) present.
     pub fn idt(&self) -> DescriptorTable {
-        DescriptorTable { base: self.idt.as_ptr() as u64, limit: GUEST_IDT_LIMIT }
+        DescriptorTable {
+            base: self.idt.as_ptr() as u64,
+            limit: GUEST_IDT_LIMIT,
+        }
     }
 
     /// Walks the current page tables for the four pages and checks that
-    /// the code page is executable, the stack and data pages writable, and
-    /// the IDT page readable by the CPU on the ring-0 guest's behalf.
+    /// each is identity-mapped ([`check_identity`]), the code page
+    /// executable, the stack and data pages writable, and the IDT page
+    /// readable by the CPU on the ring-0 guest's behalf.
     ///
     /// The guest will use these same tables (guest CR3 = host CR3); EPT
     /// translates their result a second time.
@@ -382,16 +400,24 @@ impl GuestMemory {
     ///
     /// Boot services must still be active; see [`paging::walk_current`].
     pub unsafe fn check_mappings(&self) -> Result<GuestMappings, GuestMemoryError> {
-        let code = unsafe { paging::walk_current(self.code_base()) }
-            .map_err(GuestMemoryError::CodeNotMapped)?;
-        let stack = unsafe { paging::walk_current(self.stack.as_ptr() as u64) }
-            .map_err(GuestMemoryError::StackNotMapped)?;
-        let idt = unsafe { paging::walk_current(self.idt().base) }
-            .map_err(GuestMemoryError::IdtNotMapped)?;
-        let data = unsafe { paging::walk_current(self.data_page()) }
-            .map_err(GuestMemoryError::DataNotMapped)?;
+        let stack_base = self.stack.as_ptr() as u64;
+        // SAFETY: the caller guarantees boot services are active, which is
+        // what `walk_current` needs.
+        let walk = |address| unsafe { paging::walk_current(address) };
+        let code = walk(self.code_base()).map_err(GuestMemoryError::CodeNotMapped)?;
+        let stack = walk(stack_base).map_err(GuestMemoryError::StackNotMapped)?;
+        let idt = walk(self.idt().base).map_err(GuestMemoryError::IdtNotMapped)?;
+        let data = walk(self.data_page()).map_err(GuestMemoryError::DataNotMapped)?;
+        for (virtual_address, mapping) in [
+            (self.code_base(), &code),
+            (stack_base, &stack),
+            (self.idt().base, &idt),
+            (self.data_page(), &data),
+        ] {
+            check_identity(virtual_address, mapping)?;
+        }
 
-        let cr4 = unsafe { read_cr4() };
+        let cr4 = read_cr4();
         check_permissions(&code, &stack, cr4)?;
         check_idt_permissions(&idt, cr4)?;
         check_data_permissions(&data, cr4)?;

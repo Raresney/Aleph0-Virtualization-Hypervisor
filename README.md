@@ -37,14 +37,21 @@ cargo build            # produces target\x86_64-unknown-uefi\debug\aleph0hypervi
 
 ```powershell
 cargo test-host        # alias for: cargo test --target x86_64-pc-windows-msvc
+cargo fmt --check      # formatting (rustfmt.toml: 120 columns)
+cargo clippy           # lints for the UEFI build
+cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
 ```
+
+All four pass without warnings. `clippy::undocumented_unsafe_blocks` is on,
+so every `unsafe` block needs a `// SAFETY:` comment saying why it is sound,
+and every `unsafe fn` has a `# Safety` section for its callers.
 
 Unit tests cover the pure logic (RFLAGS decoding, control-value selection,
 descriptor encoding/decoding) and run on the host. Nothing that executes VMX
 instructions can be unit-tested; that still needs a boot under Hyper-V.
 
 The tests live in `tests/unit/`, which mirrors `src/`: the tests for
-`src/vmx/vmexit.rs` are in `tests/unit/vmx/vmexit.rs`. Each source file
+`src/vmx/vmexit/handler.rs` are in `tests/unit/vmx/vmexit/handler.rs`. Each source file
 includes its test file with `#[cfg(test)] #[path = "..."] mod tests;`, so the
 tests stay a child module that can reach private items, and none of them is
 compiled into the `.efi`.
@@ -80,11 +87,13 @@ diagnostics that run before VMXON.
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
 | `src/vmx/host_tables.rs`, `segment.rs` | Host GDT/TSS setup and segmentation state |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
+| `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
-| `src/vmx/vmexit.rs`, `exit_decision.rs` | VM-exit stack, entry stub (with the VMRESUME path) and exit handler; the pure decision for each exit (VMCALLs, NMI reinjection) |
+| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge and apply (`handler.rs`); its report lines (`report.rs`) |
+| `src/vmx/exit_decision.rs` | The pure decision for each exit (the EPT write, VMCALLs, NMI reinjection), and the types of the exit fields it reads |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |

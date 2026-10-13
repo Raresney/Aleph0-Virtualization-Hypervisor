@@ -2,11 +2,12 @@
 
 use crate::vmx;
 use crate::vmx::ept::EptError;
+use crate::vmx::exit_decision::ExitReason;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host_tables::{GdtError, TssError};
 use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmexit::{ExitReason, VmExitStackError};
+use crate::vmx::vmexit::VmExitStackError;
 use crate::vmx::vmxon::VmxOnError;
 
 use super::teardown::TeardownError;
@@ -29,10 +30,17 @@ pub enum BringUpError {
     /// `instruction_error` is the VM-instruction error number of a
     /// VmFailValid, read when the error was created: after teardown it can
     /// no longer be read.
-    Vmcs { operation: &'static str, error: VmcsError, instruction_error: Option<u32> },
+    Vmcs {
+        operation: &'static str,
+        error: VmcsError,
+        instruction_error: Option<u32>,
+    },
     /// Building or writing the guest state failed. For a VMCS failure,
     /// `instruction_error` is captured as for [`BringUpError::Vmcs`].
-    GuestState { error: GuestStateError, instruction_error: Option<u32> },
+    GuestState {
+        error: GuestStateError,
+        instruction_error: Option<u32>,
+    },
     /// GDTR, TR, the TSS base or IDTR changed between activation and the
     /// launch. The VMCS host fields were written from the activated tables,
     /// so a VM exit would load stale ones.
@@ -40,9 +48,15 @@ pub enum BringUpError {
     /// The guest stopped at exit `number`, which the exit handler did not
     /// resume: it does not handle that exit, or it is an expected VMCALL the
     /// handler could not step past. Its lines on serial say which.
-    UnexpectedExit { number: u64, reason: ExitReason },
+    UnexpectedExit {
+        number: u64,
+        reason: ExitReason,
+    },
     /// VMRESUME failed after an exit the handler resumed.
-    ResumeFailed { error: VmcsError, instruction_error: Option<u32> },
+    ResumeFailed {
+        error: VmcsError,
+        instruction_error: Option<u32>,
+    },
     /// Leaving VMX operation failed. Returned only when nothing failed
     /// before teardown; otherwise that earlier error is returned and this
     /// one was printed when it happened.
@@ -94,7 +108,10 @@ pub(super) fn guest_state_error(error: GuestStateError) -> BringUpError {
         GuestStateError::Vmcs { error, .. } => unsafe { vmx::vmcs::instruction_error_for(error) },
         _ => None,
     };
-    BringUpError::GuestState { error, instruction_error }
+    BringUpError::GuestState {
+        error,
+        instruction_error,
+    }
 }
 
 impl From<TeardownError> for BringUpError {
@@ -123,11 +140,17 @@ pub fn report_error(error: BringUpError) {
         BringUpError::Tss(error) => log!("Host TSS allocation failed: {error:?}"),
         // Only this variant comes after LGDT/LTR; every other GdtError is
         // returned before the CPU's tables are touched.
-        BringUpError::Gdt(GdtError::ActivationVerificationFailed) => log!(
-            "Host GDT/TSS activation failed verification; the CPU may already use the new tables."
-        ),
+        BringUpError::Gdt(GdtError::ActivationVerificationFailed) => {
+            log!("Host GDT/TSS activation failed verification; the CPU may already use the new tables.")
+        }
         BringUpError::Gdt(error) => log!("Host GDT/TSS setup failed: {error:?}; GDTR/TR unchanged."),
         BringUpError::VmExitStack(error) => log!("VM-exit stack allocation failed: {error:?}"),
+        BringUpError::GuestMemory(GuestMemoryError::NotIdentityMapped {
+            virtual_address,
+            physical,
+        }) => log!(
+            "Guest memory setup failed: page {virtual_address:#018x} is mapped at {physical:#018x}, not identity-mapped."
+        ),
         BringUpError::GuestMemory(error) => log!("Guest memory setup failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
@@ -137,9 +160,19 @@ pub fn report_error(error: BringUpError) {
         ),
         BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
         BringUpError::VmxOn(error) => log!("VMXON failed: {error:?}"),
-        BringUpError::Vmcs { operation, error, instruction_error } => {
-            report_vmcs_error(operation, error, instruction_error)
-        }
+        BringUpError::Vmcs {
+            operation,
+            error,
+            instruction_error,
+        } => report_vmcs_error(operation, error, instruction_error),
+        BringUpError::GuestState {
+            error:
+                GuestStateError::Vmcs {
+                    field,
+                    error: VmcsError::ReadbackMismatch { written, read, .. },
+                },
+            ..
+        } => log!("Guest-state field {field:#06x} read back {read:#x}, but {written:#x} was written."),
         BringUpError::GuestState {
             error: GuestStateError::Vmcs { field, error },
             instruction_error,
@@ -147,25 +180,20 @@ pub fn report_error(error: BringUpError) {
             log!("Guest-state field {field:#06x} failed:");
             report_vmcs_error("guest-state write", error, instruction_error);
         }
-        BringUpError::GuestState {
-            error: GuestStateError::ReadbackMismatch { field, written, read },
-            ..
-        } => log!(
-            "Guest-state field {field:#06x} read back {read:#x}, but {written:#x} was written."
-        ),
         BringUpError::GuestState { error, .. } => log!("Guest state invalid: {error:x?}"),
-        BringUpError::HostTablesChanged => log!(
-            "Host descriptor tables changed after VMX/UEFI calls; the guest was not launched."
-        ),
+        BringUpError::HostTablesChanged => {
+            log!("Host descriptor tables changed after VMX/UEFI calls; the guest was not launched.")
+        }
         BringUpError::UnexpectedExit { number, reason } => log!(
             "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",
             reason.basic,
-            vmx::vmexit::exit_reason_name(reason.basic),
+            vmx::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
         ),
-        BringUpError::ResumeFailed { error, instruction_error } => {
-            report_vmcs_error("resume", error, instruction_error)
-        }
+        BringUpError::ResumeFailed {
+            error,
+            instruction_error,
+        } => report_vmcs_error("resume", error, instruction_error),
         BringUpError::Teardown(error) => log!("Leaving VMX operation failed: {error:?}."),
     }
 }
@@ -180,6 +208,9 @@ fn report_vmcs_error(operation: &str, error: VmcsError, instruction_error: Optio
         }
         (VmcsError::VmFailValid, None) => {
             log!("VMCS {operation} failed: VmFailValid, error number unreadable");
+        }
+        (VmcsError::ReadbackMismatch { field, written, read }, _) => {
+            log!("VMCS {operation} failed: field {field:#06x} read back {read:#x}, but {written:#x} was written.");
         }
         _ => log!("VMCS {operation} failed: {error:?}"),
     }

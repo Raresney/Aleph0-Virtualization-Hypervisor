@@ -73,7 +73,8 @@ pub(super) fn interrupts_enabled() -> bool {
 
 fn read_rflags() -> u64 {
     let rflags: u64;
-    // PUSHFQ writes to the stack, so no `nostack`.
+    // SAFETY: PUSHFQ and POP only use the stack below RSP, which `asm!`
+    // allows once `nostack` is left out, and change nothing else.
     unsafe { asm!("pushfq", "pop {0}", out(reg) rflags, options(preserves_flags)) };
     rflags
 }
@@ -97,18 +98,25 @@ pub(super) unsafe fn teardown(
 ) -> Result<(), TeardownError> {
     let mut result = Ok(());
 
+    // SAFETY: `firmware` holds the firmware's own tables, which boot
+    // services keep live (the caller's obligation).
     unsafe {
         segment::load_gdtr(&firmware.gdtr);
         segment::load_idtr(&firmware.idtr);
     }
 
-    if let Some(vmcs) = vmcs {
-        if let Err(error) = unsafe { vmcs.vmclear() } {
-            log!("Teardown: VMCLEAR failed: {error:?}.");
-            result = Err(TeardownError::Vmclear(error));
-        }
+    if let Some(vmcs) = vmcs
+        // SAFETY: still in VMX operation, with `vmcs` this CPU's VMCS;
+        // VMXOFF comes next.
+        && let Err(error) = unsafe { vmcs.vmclear() }
+    {
+        log!("Teardown: VMCLEAR failed: {error:?}.");
+        result = Err(TeardownError::Vmclear(error));
     }
 
+    // SAFETY: the VMCS was cleared above (or its failure printed, which only
+    // leaves that VMCS's memory stale), and no VMX instruction runs after
+    // this.
     if let Err(fail) = unsafe { vmx_operation.leave() } {
         log!("Teardown: VMXOFF failed: {fail:?}; still in VMX operation, CR4.VMXE left set.");
         result = result.and(Err(TeardownError::Vmxoff(fail)));
@@ -116,6 +124,8 @@ pub(super) unsafe fn teardown(
 
     output::set_phase(Phase::BootServices);
     if firmware.interrupts_enabled {
+        // SAFETY: firmware had interrupts on, and its IDT is loaded again, so
+        // every interrupt reaches a firmware handler.
         unsafe { asm!("sti", options(nostack)) };
     }
 
@@ -126,9 +136,8 @@ pub(super) unsafe fn teardown(
 /// Prints whether teardown left the CPU as firmware expects. Reaches the
 /// console too: the phase is boot services again.
 fn report(firmware: &FirmwareState) {
-    let vmxe = unsafe { cr::read_cr4() } & CR4_VMXE != 0;
-    let tables_restored = unsafe { segment::read_gdtr() } == firmware.gdtr
-        && unsafe { segment::read_idtr() } == firmware.idtr;
+    let vmxe = cr::read_cr4() & CR4_VMXE != 0;
+    let tables_restored = segment::read_gdtr() == firmware.gdtr && segment::read_idtr() == firmware.idtr;
     log!(
         "Teardown: CR4.VMXE={} firmware GDTR/IDTR restored={tables_restored} IF={}.",
         u8::from(vmxe),

@@ -175,7 +175,7 @@
 //! `0x7ea00000 | (0x7eb19000 & 0x1FFFFF)` = the same `0x7eb19000`. The PT
 //! index bits simply become part of the offset.
 
-use super::cr::{read_cr3, read_cr4, CR4_LA57};
+use super::cr::{CR4_LA57, read_cr3, read_cr4};
 
 // Entry bits used by the walk; the full layout is in the module docs.
 
@@ -299,11 +299,15 @@ pub fn walk(cr3: u64, virtual_address: u64, read_entry: impl Fn(u64) -> u64) -> 
 /// themselves must be identity-mapped. UEFI guarantees that while boot
 /// services are active; after `ExitBootServices` it no longer holds.
 pub unsafe fn walk_current(virtual_address: u64) -> Result<Mapping, WalkError> {
-    if unsafe { read_cr4() } & CR4_LA57 != 0 {
+    if read_cr4() & CR4_LA57 != 0 {
         return Err(WalkError::FiveLevelPaging);
     }
-    let cr3 = unsafe { read_cr3() };
-    walk(cr3, virtual_address, |physical| unsafe { (physical as *const u64).read_volatile() })
+    let cr3 = read_cr3();
+    // SAFETY: the caller guarantees boot services are active, so the tables
+    // are identity-mapped and each entry is readable at its physical address.
+    walk(cr3, virtual_address, |physical| unsafe {
+        (physical as *const u64).read_volatile()
+    })
 }
 
 /// The tests build small fake page tables in a `HashMap` (physical address

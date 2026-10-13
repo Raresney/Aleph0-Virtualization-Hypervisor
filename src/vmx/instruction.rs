@@ -34,6 +34,24 @@ pub fn check_rflags(rflags: u64) -> Result<(), VmxFail> {
     }
 }
 
+/// Runs one VMX instruction and decodes its outcome from RFLAGS.
+///
+/// Expands to the instruction, then `pushfq; pop` into a fresh register,
+/// then [`check_rflags`], and evaluates to `Result<(), VmxFail>`. Operands
+/// follow the template as in `asm!`, without a trailing comma. Use it
+/// inside an `unsafe` block whose `SAFETY` comment covers the instruction.
+///
+/// VMREAD and VMWRITE do not use it: they have an output, or operands whose
+/// width needs spelling out, so they stay explicit `asm!` blocks.
+macro_rules! vmx_asm {
+    ($template:literal $(, $($operands:tt)+)?) => {{
+        let rflags: u64;
+        ::core::arch::asm!($template, "pushfq", "pop {rflags}", $($($operands)+,)? rflags = lateout(reg) rflags);
+        $crate::vmx::instruction::check_rflags(rflags)
+    }};
+}
+pub(crate) use vmx_asm;
+
 #[cfg(test)]
 #[path = "../../tests/unit/vmx/instruction.rs"]
 mod tests;

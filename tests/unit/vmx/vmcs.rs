@@ -6,36 +6,9 @@
 
 use super::*;
 
-/// Build a capability MSR from its required (low) and allowed (high) halves.
-fn capability(required: u32, allowed: u32) -> u64 {
-    (u64::from(allowed) << 32) | u64::from(required)
-}
-
 #[test]
-fn required_bits_are_added() {
-    assert_eq!(choose_control(capability(0x16, 0xFF), 0), Ok(0x16));
-}
-
-#[test]
-fn allowed_desired_bits_are_kept() {
-    assert_eq!(choose_control(capability(0x16, 0xFFFF), 0x200), Ok(0x216));
-}
-
-#[test]
-fn desired_bit_not_allowed_is_rejected() {
-    assert_eq!(
-        choose_control(capability(0x16, 0xFF), 0x200),
-        Err(VmcsError::UnsupportedControlValue),
-    );
-}
-
-#[test]
-fn required_bit_not_allowed_is_rejected() {
-    // (low, high) = (1, 0) is inconsistent: required but not allowed.
-    assert_eq!(
-        choose_control(capability(0x1, 0x0), 0),
-        Err(VmcsError::UnsupportedControlValue),
-    );
+fn an_unsupported_control_is_a_vmcs_error() {
+    assert_eq!(VmcsError::from(UnsupportedControl), VmcsError::UnsupportedControlValue);
 }
 
 const CF: u64 = 1 << 0;
@@ -86,6 +59,7 @@ fn only_vm_fail_valid_has_an_instruction_error_to_read() {
         VmcsError::ResumeReturned,
         VmcsError::AllocationFailed,
     ] {
+        // SAFETY: none of these is VmFailValid, so no VMREAD runs.
         assert_eq!(unsafe { instruction_error_for(error) }, None);
     }
 }
@@ -99,7 +73,11 @@ fn secondary_controls_activate_primary_bit_31() {
 
 #[test]
 fn no_secondary_controls_leave_the_primary_request_alone() {
-    let desired = DesiredControls { primary: 0x10, secondary: 0, ..DesiredControls::minimal_64_bit_guest() };
+    let desired = DesiredControls {
+        primary: 0x10,
+        secondary: 0,
+        ..DesiredControls::minimal_64_bit_guest()
+    };
     assert_eq!(primary_request(desired), 0x10);
 }
 

@@ -164,6 +164,8 @@ pub const fn divisor(baud: u32) -> u16 {
 /// Port writes reach hardware directly; the port must belong to a device
 /// this code owns.
 unsafe fn outb(port: u16, value: u8) {
+    // SAFETY: OUT touches only the I/O port, which the caller guarantees
+    // belongs to a device this code owns.
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
     }
@@ -182,6 +184,8 @@ unsafe fn outb(port: u16, value: u8) {
 /// this code owns.
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
+    // SAFETY: IN touches only the I/O port, which the caller guarantees
+    // belongs to a device this code owns.
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
     }
@@ -204,6 +208,8 @@ pub enum SerialError {
 pub fn init() -> Result<(), SerialError> {
     let [divisor_low, divisor_high] = divisor(115_200).to_le_bytes();
 
+    // SAFETY: every port below is a COM1 register, the UART this driver
+    // owns.
     unsafe {
         // Step 2a: no UART interrupts. This driver polls the status
         // register instead, and no interrupt handler exists.
@@ -213,9 +219,9 @@ pub fn init() -> Result<(), SerialError> {
         // the chip produces it as 115200 / divisor. The divisor is 16 bits,
         // split across offsets 0 (low) and 1 (high), which only hold it
         // while DLAB (line control bit 7) is set, like holding Shift.
-        outb(COM1 + LINE_CONTROL, LINE_DLAB);           // 0b1000_0000: DLAB on
-        outb(COM1 + DATA, divisor_low);                 // offset 0 = divisor low
-        outb(COM1 + INTERRUPT_ENABLE, divisor_high);    // offset 1 = divisor high
+        outb(COM1 + LINE_CONTROL, LINE_DLAB); // 0b1000_0000: DLAB on
+        outb(COM1 + DATA, divisor_low); // offset 0 = divisor low
+        outb(COM1 + INTERRUPT_ENABLE, divisor_high); // offset 1 = divisor high
 
         // Step 2c: frame format 8N1 (8 data bits, no parity, 1 stop bit).
         // Writing 0b0000_0011 also clears bit 7, turning DLAB off, so
@@ -269,6 +275,8 @@ pub fn write_byte(byte: u8) {
         return;
     }
 
+    // SAFETY: COM1's status and data registers, the UART this driver
+    // owns; `init` found it there.
     unsafe {
         // Wait for "can take a byte", but never forever: a missing or
         // stuck UART must not hang the hypervisor.

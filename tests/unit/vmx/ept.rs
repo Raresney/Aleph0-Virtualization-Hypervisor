@@ -6,60 +6,72 @@
 
 use super::*;
 
+/// A secondary capability MSR that allows EPT and nothing else.
+const EPT_ALLOWED: ControlCapability = ControlCapability((SECONDARY_ENABLE_EPT as u64) << 32);
+
 /// The EPT/VPID capabilities Aleph0 needs: 4-level walk, WB, 2 MiB pages,
 /// INVEPT with both types.
-const FULL_CAP: u64 = CAP_WALK_LENGTH_4
-    | CAP_WRITE_BACK
-    | CAP_2M_PAGES
-    | CAP_INVEPT
-    | CAP_INVEPT_SINGLE_CONTEXT
-    | CAP_INVEPT_ALL_CONTEXT;
+const FULL_CAP: u64 =
+    CAP_WALK_LENGTH_4 | CAP_WRITE_BACK | CAP_2M_PAGES | CAP_INVEPT | CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT;
 
 #[test]
 fn full_support_picks_single_context() {
-    assert_eq!(check_support(SECONDARY_ALLOWS_EPT, FULL_CAP), Ok(InveptType::SingleContext));
+    assert_eq!(check_support(EPT_ALLOWED, FULL_CAP), Ok(InveptType::SingleContext));
 }
 
 #[test]
 fn all_context_is_the_fallback() {
     let cap = FULL_CAP & !CAP_INVEPT_SINGLE_CONTEXT;
-    assert_eq!(check_support(SECONDARY_ALLOWS_EPT, cap), Ok(InveptType::AllContext));
+    assert_eq!(check_support(EPT_ALLOWED, cap), Ok(InveptType::AllContext));
 }
 
 #[test]
 fn each_missing_capability_has_its_error() {
-    assert_eq!(check_support(0, FULL_CAP), Err(EptError::EptUnsupported));
+    assert_eq!(
+        check_support(ControlCapability(0), FULL_CAP),
+        Err(EptError::EptUnsupported)
+    );
     for (missing, error) in [
         (CAP_WALK_LENGTH_4, EptError::PageWalkLength4Unsupported),
         (CAP_WRITE_BACK, EptError::WriteBackUnsupported),
         (CAP_2M_PAGES, EptError::LargePagesUnsupported),
         (CAP_INVEPT, EptError::InveptUnsupported),
-        (CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT, EptError::InveptUnsupported),
+        (
+            CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT,
+            EptError::InveptUnsupported,
+        ),
     ] {
-        assert_eq!(check_support(SECONDARY_ALLOWS_EPT, FULL_CAP & !missing), Err(error));
+        assert_eq!(check_support(EPT_ALLOWED, FULL_CAP & !missing), Err(error));
     }
 }
 
 #[test]
 fn table_entry_allows_everything() {
-    assert_eq!(table_entry(0x7e00_1000), 0x7e00_1007);
+    assert_eq!(EptEntry::table(0x7e00_1000), EptEntry(0x7e00_1007));
 }
 
 #[test]
 fn large_page_entry_is_rwx_write_back_2m() {
     // 0x7 RWX | 6 << 3 = 0x30 WB | 0x80 large page.
-    assert_eq!(large_page_entry(0x4020_0000), 0x4020_00B7);
+    assert_eq!(EptEntry::large_page(0x4020_0000), EptEntry(0x4020_00B7));
 }
 
 #[test]
 fn read_only_page_entry_has_only_r() {
-    assert_eq!(page_entry(0x7eb1_d000, EPT_READ), 0x7eb1_d031);
-    assert_eq!(page_entry(0x7eb1_d000, EPT_RWX), 0x7eb1_d037);
+    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_READ), EptEntry(0x7eb1_d031));
+    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_RWX), EptEntry(0x7eb1_d037));
+}
+
+#[test]
+fn with_access_replaces_only_the_permission_bits() {
+    let read_only = EptEntry::page(0x7eb1_d000, EPT_READ);
+    assert_eq!(read_only.with_access(EPT_READ | EPT_WRITE), EptEntry(0x7eb1_d033));
+    assert_eq!(read_only.with_access(0), EptEntry(0x7eb1_d030));
 }
 
 #[test]
 fn eptp_low_bits_are_write_back_and_4_levels() {
-    assert_eq!(eptp(0x7e00_0000), 0x7e00_001E);
+    assert_eq!(Eptp::new(0x7e00_0000).raw(), 0x7e00_001e);
 }
 
 #[test]
@@ -82,7 +94,7 @@ fn map_end_on_a_gib_boundary_is_not_rounded_further() {
 
 #[test]
 fn map_end_past_one_pdpt_is_refused() {
-    let past = MAX_IDENTITY_MAP + SIZE_4K;
+    let past = MAX_IDENTITY_MAP + PAGE_SIZE as u64;
     assert_eq!(
         identity_map_end([(MAX_IDENTITY_MAP, 1)].into_iter()),
         Err(EptError::RangeTooLarge { end: past }),
@@ -96,9 +108,14 @@ fn empty_memory_map_is_refused() {
 
 /// Fills a 2 GiB identity map with made-up table addresses and returns the
 /// tables and the protected PT index.
-fn filled(protected_page: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, usize) {
-    let (mut pml4, mut pdpt, mut pds, mut pt) =
-        (vec![0; ENTRIES], vec![0; ENTRIES], vec![0; 2 * ENTRIES], vec![0; ENTRIES]);
+fn filled(protected_page: u64) -> (Vec<EptEntry>, Vec<EptEntry>, Vec<EptEntry>, Vec<EptEntry>, usize) {
+    let empty = EptEntry::default();
+    let (mut pml4, mut pdpt, mut pds, mut pt) = (
+        vec![empty; ENTRIES],
+        vec![empty; ENTRIES],
+        vec![empty; 2 * ENTRIES],
+        vec![empty; ENTRIES],
+    );
     let protected = fill_identity_map(
         Tables {
             pml4: &mut pml4,
@@ -109,7 +126,7 @@ fn filled(protected_page: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, usize
             pds_address: 0x2000,
             pt_address: 0x4000,
         },
-        2 * SIZE_1G,
+        2,
         protected_page,
     );
     (pml4, pdpt, pds, pt, protected)
@@ -118,29 +135,38 @@ fn filled(protected_page: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, usize
 #[test]
 fn identity_map_links_the_levels() {
     let (pml4, pdpt, _, _, _) = filled(0x7eb1_d000);
-    assert_eq!(pml4[0], table_entry(0x1000));
-    assert_eq!(pml4[1], 0);
-    assert_eq!(pdpt[0], table_entry(0x2000));
-    assert_eq!(pdpt[1], table_entry(0x3000));
-    assert_eq!(pdpt[2], 0);
+    assert_eq!(pml4[0], EptEntry::table(0x1000));
+    assert_eq!(pml4[1], EptEntry(0));
+    assert_eq!(pdpt[0], EptEntry::table(0x2000));
+    assert_eq!(pdpt[1], EptEntry::table(0x3000));
+    assert_eq!(pdpt[2], EptEntry(0));
 }
 
 #[test]
 fn identity_map_uses_2m_pages_outside_the_split_region() {
     let (_, _, pds, _, _) = filled(0x7eb1_d000);
-    assert_eq!(pds[0], large_page_entry(0));
-    assert_eq!(pds[1023], large_page_entry(1023 * SIZE_2M));
+    assert_eq!(pds[0], EptEntry::large_page(0));
+    assert_eq!(pds[1023], EptEntry::large_page(1023 * SIZE_2M));
     // 0x7eb1_d000 is in the 2 MiB region 0x7ea0_0000, entry 0x3F5.
-    assert_eq!(pds[0x3F5], table_entry(0x4000));
-    assert_eq!(pds[0x3F4], large_page_entry(0x7e80_0000));
+    assert_eq!(pds[0x3F5], EptEntry::table(0x4000));
+    assert_eq!(pds[0x3F4], EptEntry::large_page(0x7e80_0000));
 }
 
 #[test]
 fn identity_map_makes_only_the_protected_page_read_only() {
     let (_, _, _, pt, protected) = filled(0x7eb1_d000);
     assert_eq!(protected, 0x11D);
-    assert_eq!(pt[0x11D], page_entry(0x7eb1_d000, EPT_READ));
-    assert_eq!(pt[0x11C], page_entry(0x7eb1_c000, EPT_RWX));
-    assert_eq!(pt[0], page_entry(0x7ea0_0000, EPT_RWX));
-    assert_eq!(pt[511], page_entry(0x7ebf_f000, EPT_RWX));
+    assert_eq!(pt[0x11D], EptEntry::page(0x7eb1_d000, EPT_READ));
+    assert_eq!(pt[0x11C], EptEntry::page(0x7eb1_c000, EPT_RWX));
+    assert_eq!(pt[0], EptEntry::page(0x7ea0_0000, EPT_RWX));
+    assert_eq!(pt[511], EptEntry::page(0x7ebf_f000, EPT_RWX));
+}
+
+#[test]
+fn only_published_invept_types_decode() {
+    assert_eq!(decode_invept(0), None, "nothing published");
+    assert_eq!(decode_invept(1), Some(InveptType::SingleContext));
+    assert_eq!(decode_invept(2), Some(InveptType::AllContext));
+    assert_eq!(decode_invept(3), None);
+    assert_eq!(decode_invept(0xFF), None);
 }

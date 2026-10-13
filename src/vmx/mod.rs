@@ -1,13 +1,12 @@
 //! VMX (Intel VT-x) support detection.
 //!
-//! Checking whether the CPU can enter VMX operation requires three
-//! independent checks, each gated behind its own stub below:
+//! Checking whether the CPU can enter VMX operation takes two checks,
+//! which [`detect`] combines into the single entry point the rest of the
+//! hypervisor calls:
 //!
 //! 1. [`cpuid::is_vmx_supported`] — CPUID.1:ECX.VMX\[bit 5\] is set.
 //! 2. [`msr::feature_control_vmx_enabled`] — IA32_FEATURE_CONTROL MSR
 //!    (0x3A) has the lock bit set and the "VMX outside SMX" bit set.
-//! 3. [`detect`] — combines the two checks above into the single entry
-//!    point the rest of the hypervisor should call.
 //!
 //! The CPUID check must run before the MSR check: IA32_FEATURE_CONTROL is
 //! only guaranteed to exist on CPUs that support VMX or SMX, so reading it
@@ -15,20 +14,21 @@
 //! installed yet.
 
 pub mod cpuid;
-pub mod instruction;
-pub mod msr;
 pub mod cr;
-pub mod vmxon;
-pub mod vmcs;
-pub mod vmexit;
-pub mod exit_decision;
 pub mod ept;
+pub mod exit_decision;
 pub mod guest;
 pub mod guest_state;
-pub mod segment;
 pub mod host_tables;
+pub mod instruction;
+pub mod msr;
 pub mod page;
 pub mod paging;
+pub mod region;
+pub mod segment;
+pub mod vmcs;
+pub mod vmexit;
+pub mod vmxon;
 
 /// Overall VMX support/readiness state for the current CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,19 +46,16 @@ pub enum VmxCapabilities {
 ///
 /// Checks CPUID first; the MSR check only runs if CPUID confirms VMX
 /// support, since IA32_FEATURE_CONTROL isn't guaranteed to exist otherwise.
-pub unsafe fn detect() -> VmxCapabilities {
+/// That order is what makes this safe to call on any CPU.
+pub fn detect() -> VmxCapabilities {
     if !cpuid::is_vmx_supported() {
         return VmxCapabilities::NotSupportedByCpu;
     }
-    
-    let result: VmxCapabilities;
-    unsafe {
-        if msr::feature_control_vmx_enabled() {
-            result = VmxCapabilities::Supported;
-        } else {
-            result = VmxCapabilities::DisabledByFirmware;
-        }
-    }
 
-    result
+    // SAFETY: CPUID reports VMX, so IA32_FEATURE_CONTROL exists.
+    if unsafe { msr::feature_control_vmx_enabled() } {
+        VmxCapabilities::Supported
+    } else {
+        VmxCapabilities::DisabledByFirmware
+    }
 }

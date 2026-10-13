@@ -34,17 +34,19 @@
 //! Aleph0 builds an identity map (GPA = HPA) of all memory, so the guest
 //! runs exactly as without EPT. One 4 KiB page, the guest's data page, is
 //! mapped read-only: a guest write to it is the intentional EPT violation,
-//! and [`grant_write`] makes it writable when that exit arrives. The
+//! and [`ProtectedPage::grant_write`] makes it writable when that exit
+//! arrives. The
 //! longer walkthrough is in `docs/EPT.md`.
 
-use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
 
-use super::instruction::{check_rflags, VmxFail};
-use super::page::{allocate_zeroed_pages, PAGE_SIZE};
+use super::instruction::{VmxFail, vmx_asm};
+use super::msr::ControlCapability;
+use super::page::{PAGE_SIZE, allocate_zeroed_pages};
+use super::vmcs::fields::SECONDARY_ENABLE_EPT;
 
 /// Entry bit 0: reads allowed.
 pub const EPT_READ: u64 = 1 << 0;
@@ -68,7 +70,6 @@ const EPTP_WALK_LENGTH_4: u64 = 3 << 3;
 
 /// Entries per table: 4096 bytes / 8 bytes per entry.
 const ENTRIES: usize = 512;
-const SIZE_4K: u64 = 1 << 12;
 const SIZE_2M: u64 = 1 << 21;
 const SIZE_1G: u64 = 1 << 30;
 /// How far one PDPT reaches (512 entries of 1 GiB). Aleph0 builds one PDPT,
@@ -88,9 +89,6 @@ const CAP_INVEPT: u64 = 1 << 20;
 const CAP_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
 /// Bit 26: all-context INVEPT (every EPTP's translations).
 const CAP_INVEPT_ALL_CONTEXT: u64 = 1 << 26;
-/// Secondary control bit 1 (enable EPT), in the allowed (high) half of
-/// IA32_VMX_PROCBASED_CTLS2.
-const SECONDARY_ALLOWS_EPT: u64 = 1 << (32 + 1);
 
 /// Which cached EPT translations INVEPT drops. The value is the INVEPT type
 /// operand.
@@ -134,6 +132,9 @@ pub enum EptError {
     ProtectedPageOutsideMap,
     /// UEFI could not provide the table pages.
     AllocationFailed,
+    /// An EPT was already built and its protected page published; the exit
+    /// handler knows one protected page only.
+    AlreadyBuilt,
 }
 
 /// Checks that this CPU supports the EPT Aleph0 builds, and picks the INVEPT
@@ -141,8 +142,8 @@ pub enum EptError {
 ///
 /// `secondary` is IA32_VMX_PROCBASED_CTLS2 and `ept_vpid_cap`
 /// IA32_VMX_EPT_VPID_CAP, both 0 when the CPU lacks them.
-pub fn check_support(secondary: u64, ept_vpid_cap: u64) -> Result<InveptType, EptError> {
-    if secondary & SECONDARY_ALLOWS_EPT == 0 {
+pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<InveptType, EptError> {
+    if !secondary.allows(SECONDARY_ENABLE_EPT) {
         return Err(EptError::EptUnsupported);
     }
     if ept_vpid_cap & CAP_WALK_LENGTH_4 == 0 {
@@ -166,29 +167,53 @@ pub fn check_support(secondary: u64, ept_vpid_cap: u64) -> Result<InveptType, Ep
     }
 }
 
-/// A non-leaf entry pointing to the next table at `address`, allowing every
-/// access. A non-leaf entry only limits what lies below it, so the leaf
-/// entries decide the permissions.
-pub fn table_entry(address: u64) -> u64 {
-    (address & ADDRESS_MASK) | EPT_RWX
+/// One EPT entry, laid out as in the module docs. `repr(transparent)`, so
+/// a table page is 512 of these back to back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct EptEntry(u64);
+
+impl EptEntry {
+    /// A non-leaf entry pointing to the next table at `address`, allowing
+    /// every access. A non-leaf entry only limits what lies below it, so the
+    /// leaf entries decide the permissions.
+    pub fn table(address: u64) -> Self {
+        Self((address & ADDRESS_MASK) | EPT_RWX)
+    }
+
+    /// A PD entry mapping the 2 MiB page at `address`: RWX, write-back.
+    pub fn large_page(address: u64) -> Self {
+        Self((address & ADDRESS_MASK) | EPT_RWX | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT) | LARGE_PAGE)
+    }
+
+    /// A PT entry mapping the 4 KiB page at `address` with `access` (a mix
+    /// of [`EPT_READ`], [`EPT_WRITE`], [`EPT_EXECUTE`]), write-back.
+    pub fn page(address: u64, access: u64) -> Self {
+        Self((address & ADDRESS_MASK) | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT)).with_access(access)
+    }
+
+    /// The same entry with its R, W and X bits replaced by `access`.
+    pub fn with_access(self, access: u64) -> Self {
+        Self((self.0 & !EPT_RWX) | (access & EPT_RWX))
+    }
 }
 
-/// A PD entry mapping the 2 MiB page at `address`: RWX, write-back.
-pub fn large_page_entry(address: u64) -> u64 {
-    (address & ADDRESS_MASK) | EPT_RWX | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT) | LARGE_PAGE
-}
+/// An EPT pointer: the value of the VMCS EPT_POINTER field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eptp(u64);
 
-/// A PT entry mapping the 4 KiB page at `address` with `access` (a mix of
-/// [`EPT_READ`], [`EPT_WRITE`], [`EPT_EXECUTE`]), write-back.
-pub fn page_entry(address: u64, access: u64) -> u64 {
-    (address & ADDRESS_MASK) | (access & EPT_RWX) | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT)
-}
+impl Eptp {
+    /// The EPT pointer for the PML4 table at `pml4`: write-back (bits 2:0 =
+    /// 6), 4-level walk (bits 5:3 = 3), no accessed/dirty flags (bit 6 = 0).
+    /// So the low bits are always 0x1E.
+    pub fn new(pml4: u64) -> Self {
+        Self((pml4 & ADDRESS_MASK) | MEMORY_TYPE_WB | EPTP_WALK_LENGTH_4)
+    }
 
-/// The EPT pointer for the PML4 table at `pml4`: write-back (bits 2:0 = 6),
-/// 4-level walk (bits 5:3 = 3), no accessed/dirty flags (bit 6 = 0). So the
-/// low bits are always 0x1E.
-pub fn eptp(pml4: u64) -> u64 {
-    (pml4 & ADDRESS_MASK) | MEMORY_TYPE_WB | EPTP_WALK_LENGTH_4
+    /// The pointer as the CPU reads it.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 // No PML4 index helper: the map ends at 512 GiB at most, so every address
@@ -219,7 +244,7 @@ pub fn identity_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64
     let mut highest = 0u64;
     for (start, pages) in regions {
         let end = pages
-            .checked_mul(SIZE_4K)
+            .checked_mul(PAGE_SIZE as u64)
             .and_then(|size| start.checked_add(size))
             .ok_or(EptError::RangeTooLarge { end: u64::MAX })?;
         highest = highest.max(end);
@@ -241,61 +266,61 @@ pub fn identity_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64
 /// one has. Under UEFI's identity mapping a table's physical address is its
 /// virtual one; on the host tests these are made-up numbers.
 struct Tables<'a> {
-    pml4: &'a mut [u64],
-    pdpt: &'a mut [u64],
+    pml4: &'a mut [EptEntry],
+    pdpt: &'a mut [EptEntry],
     /// One PD per GiB of the map, back to back.
-    pds: &'a mut [u64],
-    pt: &'a mut [u64],
+    pds: &'a mut [EptEntry],
+    pt: &'a mut [EptEntry],
     pdpt_address: u64,
     pds_address: u64,
     pt_address: u64,
 }
 
-/// Fills `tables` with an identity map of `[0, end)`: 2 MiB pages, RWX,
-/// write-back, except the 2 MiB region holding `protected_page`. That
+/// Fills `tables` with an identity map of the first `gibs` GiB: 2 MiB pages,
+/// RWX, write-back, except the 2 MiB region holding `protected_page`. That
 /// region goes through the PT in 4 KiB pages, and `protected_page` itself
 /// is read-only. Returns the PT index of `protected_page`.
 ///
-/// `end` is a multiple of 1 GiB, `pds` holds `end / 1 GiB` tables, and
-/// `protected_page` is 4 KiB-aligned and below `end`; [`Ept::build`]
-/// checks all three.
-fn fill_identity_map(tables: Tables<'_>, end: u64, protected_page: u64) -> usize {
-    let gibs = (end / SIZE_1G) as usize;
-    tables.pml4[0] = table_entry(tables.pdpt_address);
+/// `pds` holds `gibs` tables, and `protected_page` is 4 KiB-aligned and
+/// inside the map; [`Ept::build`] checks both.
+fn fill_identity_map(tables: Tables<'_>, gibs: usize, protected_page: u64) -> usize {
+    debug_assert!(tables.pds.len() == gibs * ENTRIES);
+    tables.pml4[0] = EptEntry::table(tables.pdpt_address);
     for gib in 0..gibs {
-        tables.pdpt[gib] = table_entry(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
+        tables.pdpt[gib] = EptEntry::table(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
     }
 
     // PD entry number `i` across all PDs maps GPA i * 2 MiB.
-    for (i, entry) in tables.pds.iter_mut().enumerate().take(gibs * ENTRIES) {
-        *entry = large_page_entry(i as u64 * SIZE_2M);
+    for (i, entry) in tables.pds.iter_mut().enumerate() {
+        *entry = EptEntry::large_page(i as u64 * SIZE_2M);
     }
     // The PDs are back to back, one per PDPT entry, so the PD entry for an
     // address is its PDPT index times 512 plus its PD index.
     let split = pdpt_index(protected_page) * ENTRIES + pd_index(protected_page);
-    tables.pds[split] = table_entry(tables.pt_address);
+    tables.pds[split] = EptEntry::table(tables.pt_address);
 
     let region = protected_page & !(SIZE_2M - 1);
     for (i, entry) in tables.pt.iter_mut().enumerate() {
-        *entry = page_entry(region + i as u64 * SIZE_4K, EPT_RWX);
+        *entry = EptEntry::page(region + (i * PAGE_SIZE) as u64, EPT_RWX);
     }
     let protected = pt_index(protected_page);
-    tables.pt[protected] = page_entry(protected_page, EPT_READ);
+    tables.pt[protected] = EptEntry::page(protected_page, EPT_READ);
     protected
 }
 
 /// One EPT identity map. Its table pages are never freed: the CPU walks them
 /// on every guest access for as long as the VMCS points at them.
 pub struct Ept {
-    eptp: u64,
+    eptp: Eptp,
     end: u64,
     table_pages: usize,
 }
 
 impl Ept {
     /// Builds the identity map from the UEFI memory map, with
-    /// `protected_page` read-only, and publishes what [`grant_write`] needs
-    /// later in the exit handler.
+    /// `protected_page` read-only, and publishes the [`ProtectedPage`] the
+    /// exit handler needs later. Refuses a second build with
+    /// [`EptError::AlreadyBuilt`]: the handler knows one page only.
     ///
     /// # Safety
     ///
@@ -305,7 +330,7 @@ impl Ept {
     pub unsafe fn build(protected_page: u64, invept: InveptType) -> Result<Self, EptError> {
         let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| EptError::MemoryMapUnavailable)?;
         let end = identity_map_end(map.entries().map(|region| (region.phys_start, region.page_count)))?;
-        if protected_page >= end || protected_page % SIZE_4K != 0 {
+        if protected_page >= end || !protected_page.is_multiple_of(PAGE_SIZE as u64) {
             return Err(EptError::ProtectedPageOutsideMap);
         }
 
@@ -318,7 +343,7 @@ impl Ept {
         // SAFETY: each allocation above is page-aligned, zeroed and as long
         // as its slice, and nothing else refers to it yet.
         let table = |address: u64, pages: usize| unsafe {
-            core::slice::from_raw_parts_mut(address as *mut u64, pages * ENTRIES)
+            core::slice::from_raw_parts_mut(address as *mut EptEntry, pages * ENTRIES)
         };
         let protected = fill_identity_map(
             Tables {
@@ -330,20 +355,26 @@ impl Ept {
                 pds_address: pds,
                 pt_address: pt,
             },
-            end,
+            gibs,
             protected_page,
         );
 
-        let ept = Self { eptp: eptp(pml4), end, table_pages: gibs + 3 };
-        PROTECTED_PAGE.store(protected_page, Ordering::Relaxed);
-        PROTECTED_ENTRY.store(pt + protected as u64 * 8, Ordering::Relaxed);
-        PUBLISHED_EPTP.store(ept.eptp, Ordering::Relaxed);
-        INVEPT_TYPE.store(invept as u64, Ordering::Relaxed);
+        let ept = Self {
+            eptp: Eptp::new(pml4),
+            end,
+            table_pages: gibs + 3,
+        };
+        publish(ProtectedPage {
+            gpa: protected_page,
+            entry: (pt as *mut EptEntry).wrapping_add(protected),
+            eptp: ept.eptp,
+            invept,
+        })?;
         Ok(ept)
     }
 
     /// The value for the VMCS EPT_POINTER field.
-    pub fn eptp(&self) -> u64 {
+    pub fn eptp(&self) -> Eptp {
         self.eptp
     }
 
@@ -358,59 +389,88 @@ impl Ept {
     }
 }
 
+/// The page [`Ept::build`] maps read-only, with what making it writable
+/// needs: its PT entry, the EPTP, and the INVEPT type to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectedPage {
+    /// Guest-physical address of the page.
+    pub gpa: u64,
+    /// Its entry in the PT [`Ept::build`] filled.
+    entry: *mut EptEntry,
+    eptp: Eptp,
+    invept: InveptType,
+}
+
+impl ProtectedPage {
+    /// Makes the page writable and drops cached translations with INVEPT.
+    /// Returns the INVEPT type used, for the report.
+    ///
+    /// The CPU already drops the translation that caused an EPT violation,
+    /// so the retried write would see the new entry even without INVEPT.
+    /// INVEPT is still the architectural way to publish an EPT change, and
+    /// changes not caused by a violation need it.
+    ///
+    /// # Safety
+    ///
+    /// VMX root operation, and [`Ept::build`]'s tables still in place. Called
+    /// from the exit handler, while the guest is not running.
+    pub unsafe fn grant_write(&self) -> Result<InveptType, VmxFail> {
+        // SAFETY: `entry` points into the PT `Ept::build` filled, which is
+        // never freed, and the guest is not running to race with the write.
+        // The caller guarantees VMX root operation for INVEPT.
+        unsafe {
+            self.entry
+                .write_volatile(self.entry.read_volatile().with_access(EPT_READ | EPT_WRITE));
+            invalidate(self.invept, self.eptp)?;
+        }
+        Ok(self.invept)
+    }
+}
+
 // What `Ept::build` publishes for the exit handler, which cannot take
 // arguments from bring-up. Written once before VMLAUNCH; read only in exit
-// context, on the one CPU that runs the guest.
-/// GPA of the read-only page, 0 before `build`.
-static PROTECTED_PAGE: AtomicU64 = AtomicU64::new(0);
-/// Address of its PT entry, 0 before `build`.
-static PROTECTED_ENTRY: AtomicU64 = AtomicU64::new(0);
+// context, on the one CPU that runs the guest. Atomics rather than a
+// `static mut` or a lock: this `no_std` build has neither an allocator for
+// `Once`-style cells nor a `Mutex`.
+static PROTECTED_GPA: AtomicU64 = AtomicU64::new(0);
+static PROTECTED_ENTRY: AtomicPtr<EptEntry> = AtomicPtr::new(core::ptr::null_mut());
 static PUBLISHED_EPTP: AtomicU64 = AtomicU64::new(0);
-/// An [`InveptType`] as its operand value.
-static INVEPT_TYPE: AtomicU64 = AtomicU64::new(0);
+/// The [`InveptType`] as its operand value, and the "published" flag: 0
+/// until [`publish`] has stored everything else. Written last (Release),
+/// read first (Acquire), so a reader that sees a type sees the rest.
+static INVEPT_TYPE: AtomicU8 = AtomicU8::new(0);
 
-/// GPA of the page [`Ept::build`] made read-only, or 0 before it ran.
-pub fn protected_page() -> u64 {
-    PROTECTED_PAGE.load(Ordering::Relaxed)
+/// The INVEPT type stored as `value`, or `None` for anything [`publish`]
+/// never stores: 0 (nothing published) or an unknown type.
+fn decode_invept(value: u8) -> Option<InveptType> {
+    match value {
+        1 => Some(InveptType::SingleContext),
+        2 => Some(InveptType::AllContext),
+        _ => None,
+    }
 }
 
-/// Why [`grant_write`] failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantError {
-    /// [`Ept::build`] never ran, so there is no page to unprotect.
-    NothingProtected,
-    /// INVEPT failed: CF (invalid) or ZF (valid, see the VM-instruction
-    /// error).
-    Invept(VmxFail),
+/// Publishes `page` for [`protected_page`]. Refuses a second publication.
+fn publish(page: ProtectedPage) -> Result<(), EptError> {
+    if decode_invept(INVEPT_TYPE.load(Ordering::Acquire)).is_some() {
+        return Err(EptError::AlreadyBuilt);
+    }
+    PROTECTED_GPA.store(page.gpa, Ordering::Relaxed);
+    PROTECTED_ENTRY.store(page.entry, Ordering::Relaxed);
+    PUBLISHED_EPTP.store(page.eptp.raw(), Ordering::Relaxed);
+    INVEPT_TYPE.store(page.invept as u8, Ordering::Release);
+    Ok(())
 }
 
-/// Makes the protected page writable and drops cached translations with
-/// INVEPT. Returns the INVEPT type used, for the report.
-///
-/// The CPU already drops the translation that caused an EPT violation, so
-/// the retried write would see the new entry even without INVEPT. INVEPT is
-/// still the architectural way to publish an EPT change, and changes not
-/// caused by a violation need it.
-///
-/// # Safety
-///
-/// VMX root operation, and [`Ept::build`]'s tables still in place. Called
-/// from the exit handler, while the guest is not running.
-pub unsafe fn grant_write() -> Result<InveptType, GrantError> {
-    let entry = PROTECTED_ENTRY.load(Ordering::Relaxed);
-    if entry == 0 {
-        return Err(GrantError::NothingProtected);
-    }
-    let invept = match INVEPT_TYPE.load(Ordering::Relaxed) {
-        1 => InveptType::SingleContext,
-        _ => InveptType::AllContext,
-    };
-    unsafe {
-        let entry = entry as *mut u64;
-        entry.write_volatile(entry.read_volatile() | EPT_WRITE);
-        invalidate(invept, PUBLISHED_EPTP.load(Ordering::Relaxed)).map_err(GrantError::Invept)?;
-    }
-    Ok(invept)
+/// The page [`Ept::build`] made read-only, or `None` before it ran.
+pub fn protected_page() -> Option<ProtectedPage> {
+    let invept = decode_invept(INVEPT_TYPE.load(Ordering::Acquire))?;
+    Some(ProtectedPage {
+        gpa: PROTECTED_GPA.load(Ordering::Relaxed),
+        entry: PROTECTED_ENTRY.load(Ordering::Relaxed),
+        eptp: Eptp(PUBLISHED_EPTP.load(Ordering::Relaxed)),
+        invept,
+    })
 }
 
 /// The 128-bit INVEPT descriptor: the EPTP, then 64 reserved bits that must
@@ -423,20 +483,24 @@ struct InveptDescriptor {
 
 /// Runs INVEPT. Like the other VMX instructions it reports failure through
 /// RFLAGS.
-unsafe fn invalidate(kind: InveptType, eptp: u64) -> Result<(), VmxFail> {
-    let descriptor = InveptDescriptor { eptp, reserved: 0 };
-    let rflags: u64;
+///
+/// # Safety
+///
+/// The CPU must be in VMX root operation.
+unsafe fn invalidate(kind: InveptType, eptp: Eptp) -> Result<(), VmxFail> {
+    let descriptor = InveptDescriptor {
+        eptp: eptp.raw(),
+        reserved: 0,
+    };
+    // SAFETY: INVEPT reads only the 16-byte descriptor, which lives on this
+    // stack frame; the caller guarantees VMX root operation.
     unsafe {
-        asm!(
+        vmx_asm!(
             "invept {kind}, [{descriptor}]",
-            "pushfq",
-            "pop {rflags}",
             kind = in(reg) kind as u64,
-            descriptor = in(reg) &descriptor,
-            rflags = lateout(reg) rflags,
-        );
+            descriptor = in(reg) &descriptor
+        )
     }
-    check_rflags(rflags)
 }
 
 #[cfg(test)]

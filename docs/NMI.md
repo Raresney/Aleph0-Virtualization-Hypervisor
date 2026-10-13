@@ -12,7 +12,7 @@ guest runs:
 Code:
 - `src/vmx/guest.rs`: guest code, guest IDT;
 - `src/vmx/exit_decision.rs`: the pure decision `decide`;
-- `src/vmx/vmexit.rs`: the handler that applies it;
+- `src/vmx/vmexit/`: the handler that applies it;
 - `src/vmx/vmcs/mod.rs` and `fields.rs`: the controls;
 - `scripts/run-hyperv.ps1 -InjectNmi`: the test.
 
@@ -271,6 +271,6 @@ with `rcx = 0`: the loop ran out.
 | `PIN_BASED_NMI_EXITING`, `PIN_BASED_VIRTUAL_NMIS` | `vmcs/fields.rs` | pin bits 3 and 5 |
 | `CPU_BASED_NMI_WINDOW_EXITING` | `vmcs/fields.rs` | primary bit 22 |
 | `set_nmi_window_exiting` | `vmcs/mod.rs` | turns the NMI window on or off |
-| `INJECT_NMI` (`0x80000202`) | `exit_decision.rs` | `VM_ENTRY_INTERRUPTION_INFO` value |
+| `InterruptionInfo::NMI` (`0x80000202`) | `exit_decision.rs` | `VM_ENTRY_INTERRUPTION_INFO` value |
 | `decide` | `exit_decision.rs` | the decision table of section 6 |
 | `-InjectNmi` | `scripts/run-hyperv.ps1` | one vCPU, `Debug-VM` NMI after VMCALL #1 |

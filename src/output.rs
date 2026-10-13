@@ -16,9 +16,9 @@
 //! Host unit tests link `std`, which brings its own panic handler; two would
 //! not link, so the handler and its state are compiled out under `cfg(test)`.
 
-use core::sync::atomic::{AtomicU8, Ordering};
 #[cfg(not(test))]
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Set by the first panic. A second panic, raised while the first is still
 /// printing (for example from a `Display` impl or the console driver), sees
@@ -78,10 +78,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ///
 /// `-> !` ("never") tells the compiler this function does not return, which
 /// is what lets the panic handler end with a call to it.
+///
+/// Not compiled for host tests, whose `std` panic handler replaces Aleph0's.
+#[cfg(not(test))]
 pub fn halt_forever() -> ! {
     loop {
-        // `nomem`/`nostack`: no memory or stack access. `preserves_flags` is
-        // deliberately absent, because CLI changes RFLAGS.
+        // SAFETY: CLI and HLT only stop this CPU, which is what this
+        // function is for; they touch no memory (`nomem`) and no stack
+        // (`nostack`). `preserves_flags` is deliberately absent, because CLI
+        // changes RFLAGS.
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
     }
 }

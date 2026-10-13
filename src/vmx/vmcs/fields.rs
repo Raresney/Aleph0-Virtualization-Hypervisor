@@ -41,6 +41,10 @@ pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 /// Secondary control bit 1: guest-physical addresses are translated through
 /// the EPT tables named by [`EPT_POINTER`].
 pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+/// Secondary control bit 5: the guest's TLB entries are tagged with a
+/// virtual-processor identifier. Aleph0 does not enable it; the EPT/VPID
+/// capability MSR exists if either this or EPT is allowed.
+pub const SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 /// Exception bitmap: bit N set makes guest exception vector N cause a VM exit
 /// (reason 0) instead of being delivered through the guest's IDT.
 pub const EXCEPTION_BITMAP: u32 = 0x4004;
@@ -77,7 +81,7 @@ pub const SECONDARY_VM_EXEC_CONTROL: u32 = 0x401E;
 // ── Control fields (64-bit) ──────────────────────────────────────────────
 
 /// EPT pointer (EPTP): the physical address of the EPT PML4 table, with the
-/// memory type and page-walk length in its low bits (see `vmx::ept::eptp`).
+/// memory type and page-walk length in its low bits (see `vmx::ept::Eptp`).
 pub const EPT_POINTER: u32 = 0x201A;
 
 // ── Bits inside the control fields ───────────────────────────────────────
@@ -156,7 +160,7 @@ pub const GUEST_GDTR_LIMIT: u32 = 0x4810;
 pub const GUEST_IDTR_LIMIT: u32 = 0x4812;
 
 /// Guest segment access rights (32-bit), in the format of
-/// [`crate::vmx::segment::descriptor_access_rights`].
+/// [`crate::vmx::segment::SegmentDescriptor::access_rights`].
 pub const GUEST_ES_ACCESS_RIGHTS: u32 = 0x4814;
 pub const GUEST_CS_ACCESS_RIGHTS: u32 = 0x4816;
 pub const GUEST_SS_ACCESS_RIGHTS: u32 = 0x4818;

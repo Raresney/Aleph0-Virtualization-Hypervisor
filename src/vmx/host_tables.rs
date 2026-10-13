@@ -1,14 +1,25 @@
-//! Host descriptor tables for a future VMX guest launch.
+//! The host's own GDT and TSS, which every VM exit loads.
 //!
-//! TODO:
-//! - Provide RSP0/IST stacks if the host IDT or privilege transitions will
-//!   use them; the TSS currently has zeroed stack fields.
+//! VM entry rejects a host TR selector of 0, and firmware may leave TR unset
+//! (Hyper-V's does). So Aleph0 copies the firmware's GDT into a page of its
+//! own, appends a 64-bit TSS descriptor, and loads both
+//! ([`GdtRegion::activate`]).
+//!
+//! The TSS stack fields (RSP0-2, IST1-7) stay 0: the host never changes
+//! privilege level, and `activate` refuses an IDT with a gate that would
+//! switch to an IST stack.
 
-use core::{arch::asm, ptr::{self, NonNull, copy_nonoverlapping}};
-use crate::vmx::segment::{DescriptorTable, read_cs, read_gdtr, read_idtr, read_ss, read_tr, segment_base_from_gdt};
+use crate::vmx::segment::{
+    self, DescriptorTable, SegmentDescriptor, descriptor_offset, read_cs, read_gdtr, read_idtr, read_ss, read_tr,
+    segment_base_from_gdt, system_descriptor_base,
+};
+use core::{
+    arch::asm,
+    ptr::{self, NonNull, copy_nonoverlapping},
+};
 use uefi::boot;
 
-use super::page::{allocate_zeroed_page, PAGE_SIZE};
+use super::page::{PAGE_SIZE, allocate_zeroed_page};
 #[repr(C, packed)]
 struct Tss {
     reserved1: u32,
@@ -53,6 +64,8 @@ impl TssRegion {
     pub fn allocate() -> Result<Self, TssError> {
         let page = allocate_zeroed_page(TssError::AllocationFailed)?;
         let tss = page.cast::<Tss>().as_ptr();
+        // SAFETY: `page` is a fresh, zeroed page, larger than a `Tss`. The
+        // write is unaligned because `Tss` is packed.
         unsafe {
             ptr::addr_of_mut!((*tss).iomap_base).write_unaligned(core::mem::size_of::<Tss>() as u16);
         }
@@ -88,14 +101,24 @@ pub enum GdtError {
     ActivationVerificationFailed,
 }
 
+/// Descriptor byte 5 of an available 64-bit TSS: present (bit 7), DPL 0,
+/// S = 0, type 0x9.
+const TSS_AVAILABLE_PRESENT: u8 = 0x89;
+/// Size of a 64-bit system descriptor (TSS) and of an IDT gate.
+const SYSTEM_DESCRIPTOR_SIZE: usize = 16;
+/// IDT gate byte 5, bit 7: the gate is present.
+const GATE_PRESENT: u8 = 0x80;
+/// IDT gate byte 4, bits 2:0: the IST index (0 = no IST).
+const GATE_IST_MASK: u8 = 0x07;
+
 /// Encode a present, available 64-bit TSS descriptor (type 0x9, DPL 0)
 /// with byte granularity. Only the low 20 bits of `limit` are encodable.
-fn tss_descriptor(base: u64, limit: u32) -> [u8; 16] {
-    let mut descriptor = [0u8; 16];
+fn tss_descriptor(base: u64, limit: u32) -> [u8; SYSTEM_DESCRIPTOR_SIZE] {
+    let mut descriptor = [0u8; SYSTEM_DESCRIPTOR_SIZE];
     descriptor[0..2].copy_from_slice(&(limit as u16).to_le_bytes());
     descriptor[2..4].copy_from_slice(&(base as u16).to_le_bytes());
     descriptor[4] = (base >> 16) as u8;
-    descriptor[5] = 0x89;
+    descriptor[5] = TSS_AVAILABLE_PRESENT;
     descriptor[6] = ((limit >> 16) & 0x0f) as u8;
     descriptor[7] = (base >> 24) as u8;
     descriptor[8..12].copy_from_slice(&((base >> 32) as u32).to_le_bytes());
@@ -115,11 +138,15 @@ impl GdtRegion {
     /// and that table must remain stable while it is copied.
     pub unsafe fn copy_active() -> Result<Self, GdtError> {
         let page = allocate_zeroed_page(GdtError::AllocationFailed)?;
+        // SAFETY: `page` was just allocated and nothing refers to it, so it
+        // may be freed; the copy reads the active GDT, which the caller
+        // guarantees is readable through its limit, into the page, which it
+        // fits (checked first).
         unsafe {
             let descriptor_table = read_gdtr();
             let original_length = descriptor_table.limit as usize + 1;
             let offset = (original_length + 7) & !7;
-            if offset + 16 > PAGE_SIZE {
+            if offset + SYSTEM_DESCRIPTOR_SIZE > PAGE_SIZE {
                 boot::free_pages(page, 1).expect("failed to free oversized GDT page");
                 return Err(GdtError::TooLarge);
             }
@@ -128,11 +155,7 @@ impl GdtRegion {
                 return Err(GdtError::InvalidSource);
             }
 
-            copy_nonoverlapping(
-                descriptor_table.base as *const u8,
-                page.as_ptr(),
-                original_length,
-            );
+            copy_nonoverlapping(descriptor_table.base as *const u8, page.as_ptr(), original_length);
 
             Ok(Self {
                 page,
@@ -152,7 +175,7 @@ impl GdtRegion {
         let selector = self.tss_selector?;
         Some(DescriptorTable {
             base: self.base(),
-            limit: selector + 15,
+            limit: selector + SYSTEM_DESCRIPTOR_SIZE as u16 - 1,
         })
     }
 
@@ -164,12 +187,14 @@ impl GdtRegion {
         }
 
         let offset = self.original_length.next_multiple_of(8);
-        if offset + 16 > PAGE_SIZE {
+        if offset + SYSTEM_DESCRIPTOR_SIZE > PAGE_SIZE {
             return Err(GdtError::TooLarge);
         }
 
         let descriptor = tss_descriptor(tss_region.base(), (core::mem::size_of::<Tss>() - 1) as u32);
 
+        // SAFETY: the 16 bytes at `offset` lie within the GDT page (checked
+        // above), which this region owns; the CPU does not use the copy yet.
         unsafe {
             copy_nonoverlapping(descriptor.as_ptr(), self.page.as_ptr().add(offset), descriptor.len());
         }
@@ -185,22 +210,20 @@ impl GdtRegion {
             return false;
         };
         let offset = selector as usize;
-        if selector == 0 || selector & 7 != 0 || offset + 16 > PAGE_SIZE {
+        if selector == 0 || selector & segment::SELECTOR_RPL_TI != 0 || offset + SYSTEM_DESCRIPTOR_SIZE > PAGE_SIZE {
             return false;
         }
 
-        let descriptor = unsafe { core::slice::from_raw_parts(self.page.as_ptr().add(offset), 16) };
-        let limit = u16::from_le_bytes([descriptor[0], descriptor[1]]) as u32
-            | (((descriptor[6] & 0x0f) as u32) << 16);
-        let base = u16::from_le_bytes([descriptor[2], descriptor[3]]) as u64
-            | ((descriptor[4] as u64) << 16)
-            | ((descriptor[7] as u64) << 24)
-            | ((u32::from_le_bytes([descriptor[8], descriptor[9], descriptor[10], descriptor[11]]) as u64) << 32);
+        // SAFETY: the descriptor lies within the GDT page (checked above),
+        // which this region owns and nothing else writes.
+        let descriptor = unsafe { &*self.page.as_ptr().add(offset).cast::<[u8; SYSTEM_DESCRIPTOR_SIZE]>() };
+        // G is 0 in a TSS descriptor Aleph0 writes, so this is the raw limit.
+        let low = SegmentDescriptor(u64::from_le_bytes(descriptor[..8].try_into().expect("8 bytes")));
 
-        limit == (core::mem::size_of::<Tss>() - 1) as u32
-            && base == tss_region.base()
-            && descriptor[5] == 0x89
-            && descriptor[6] & 0xf0 == 0
+        low.limit() == (core::mem::size_of::<Tss>() - 1) as u32
+            && system_descriptor_base(descriptor) == tss_region.base()
+            && descriptor[5] == TSS_AVAILABLE_PRESENT
+            && descriptor[6] & 0xF0 == 0
             && descriptor[12..16] == [0; 4]
     }
 
@@ -215,61 +238,56 @@ impl GdtRegion {
     /// descriptor busy, so the pre-load verifier will reject a second call.
     /// If post-load verification fails, the CPU still uses the new tables.
     pub unsafe fn activate(&self, tss_region: &TssRegion) -> Result<(), GdtError> {
-        if !self.verify_tss_descriptor(&tss_region) {
+        if !self.verify_tss_descriptor(tss_region) {
             return Err(GdtError::TssVerificationFailed);
         }
         let gdtr = self.prepared_gdtr().ok_or(GdtError::GdtrPreparationFailed)?;
 
-        let (cs, ss) = unsafe { 
-            (read_cs(), read_ss()) 
+        // The selectors in use must name descriptors inside the copied part of
+        // the GDT. SS may be null in 64-bit mode.
+        let (cs, ss) = (read_cs(), read_ss());
+        let copied = DescriptorTable {
+            base: self.base(),
+            limit: (self.original_length - 1) as u16,
         };
-
-        let cs_offset = (cs & !7) as usize;
-        let ss_offset = (ss & !7) as usize;
-        if cs & 0x4 != 0 || ss & 0x4 != 0
-            || cs_offset == 0
-            || cs_offset + 8 > self.original_length
-            || (ss_offset != 0 && ss_offset + 8 > self.original_length)
-        {
+        let ss_is_null = ss & !segment::SELECTOR_RPL == 0;
+        if descriptor_offset(&copied, cs, 8).is_none() || !(ss_is_null || descriptor_offset(&copied, ss, 8).is_some()) {
             return Err(GdtError::GdtrPreparationFailed);
         }
 
-        let idtr = unsafe { read_idtr() };
+        let idtr = read_idtr();
         let idt_length = idtr.limit as usize + 1;
-        if idtr.base == 0 || idt_length % 16 != 0 {
+        if idtr.base == 0 || !idt_length.is_multiple_of(SYSTEM_DESCRIPTOR_SIZE) {
             return Err(GdtError::InvalidIdt);
         }
         let idt = idtr.base as *const u8;
-        for offset in (0..idt_length).step_by(16) {
-            let (ist, attributes) = unsafe {
-                (idt.add(offset + 4).read_volatile(), idt.add(offset + 5).read_volatile())
-            };
-            if attributes & 0x80 != 0 && ist & 0x07 != 0 {
+        for offset in (0..idt_length).step_by(SYSTEM_DESCRIPTOR_SIZE) {
+            // SAFETY: the gate lies within the IDT limit, and the caller
+            // guarantees the IDT is readable through it.
+            let (ist, attributes) =
+                unsafe { (idt.add(offset + 4).read_volatile(), idt.add(offset + 5).read_volatile()) };
+            if attributes & GATE_PRESENT != 0 && ist & GATE_IST_MASK != 0 {
                 return Err(GdtError::IdtRequiresIst);
             }
         }
 
-        let mut gdtr_operand = [0u8; 10];
-        gdtr_operand[..2].copy_from_slice(&gdtr.limit.to_le_bytes());
-        gdtr_operand[2..].copy_from_slice(&gdtr.base.to_le_bytes());
-
         let selector = self.tss_selector.ok_or(GdtError::GdtrPreparationFailed)?;
+        // SAFETY: the copied GDT keeps the active CS/SS descriptors (checked
+        // above) and holds the verified TSS descriptor at `selector`; the
+        // caller keeps both pages live.
         unsafe {
-            asm!(
-                "lgdt [{operand}]",
-                "ltr {selector:x}",
-                operand = in(reg) gdtr_operand.as_ptr(),
-                selector = in(reg) selector,
-                options(nostack, preserves_flags),
-            );
+            segment::load_gdtr(&gdtr);
+            asm!("ltr {selector:x}", selector = in(reg) selector, options(nostack, preserves_flags));
         }
 
-        let loaded_gdtr = unsafe { read_gdtr() };
-        let loaded_tr = unsafe { read_tr() };
-        if loaded_gdtr.base != gdtr.base || loaded_gdtr.limit != gdtr.limit
-            || loaded_tr != selector
-            || unsafe { segment_base_from_gdt(&loaded_gdtr, loaded_tr) } != tss_region.base()
-        {
+        let loaded_gdtr = read_gdtr();
+        let loaded_tr = read_tr();
+        if loaded_gdtr != gdtr || loaded_tr != selector {
+            return Err(GdtError::ActivationVerificationFailed);
+        }
+        // SAFETY: `loaded_gdtr` is the copied GDT (checked above), which this
+        // region owns.
+        if unsafe { segment_base_from_gdt(&loaded_gdtr, loaded_tr) } != tss_region.base() {
             return Err(GdtError::ActivationVerificationFailed);
         }
 
