@@ -9,8 +9,9 @@
 //!
 //! `bring_up::run` enters the guest through `vmcs::launch`, so the guest's
 //! first VM exit lands here. The handler prints each exit over serial, and
-//! `exit_decision::decide` says what it is: a VMCALL to resume past, an NMI
-//! to reinject, an NMI window to inject in, the last planned VMCALL, or
+//! `exit_decision::decide` says what it is: a write to the EPT-protected
+//! data page to allow and retry, a VMCALL to resume past, an NMI to
+//! reinject, an NMI window to inject in, the last planned VMCALL, or
 //! something unexpected. To resume, the handler updates the VMCS and returns
 //! 0, and the stub executes VMRESUME. To stop, it returns a stop value, and
 //! the stub jumps back into `vmcs::launch`, which returns to bring-up (see
@@ -19,16 +20,19 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use super::ept::{self, InveptType};
 use super::exit_decision::{
     self, decide, expected_main_rax, ExitAction, ExitEvent, ExitInfo, ExitState,
+    EPT_ACCESS_FETCH, EPT_ACCESS_READ, EPT_ACCESS_WRITE, EPT_LINEAR_VALID, EPT_PAGE_EXECUTABLE,
+    EPT_PAGE_READABLE, EPT_PAGE_WRITABLE, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION,
     EXIT_REASON_EXCEPTION_OR_NMI, INJECT_NMI, PLANNED_MAIN_VMCALLS,
 };
 use super::page::{allocate_zeroed_pages, PAGE_SIZE};
 use super::vmcs::{self, encode_finished, encode_resume_failed, encode_unexpected, VmcsError};
 use super::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO,
-    VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO,
-    VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS,
+    GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN,
+    VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
 
 pub const VM_EXIT_STACK_PAGES: usize = 4;
@@ -229,6 +233,7 @@ static MAIN_VMCALLS: AtomicU32 = AtomicU32::new(0);
 static NMI_PENDING: AtomicBool = AtomicBool::new(false);
 static NMIS_INJECTED: AtomicU32 = AtomicU32::new(0);
 static NMIS_HANDLED: AtomicU32 = AtomicU32::new(0);
+static EPT_WRITES_GRANTED: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
@@ -236,6 +241,7 @@ fn load_state() -> ExitState {
         nmi_pending: NMI_PENDING.load(Ordering::Relaxed),
         nmis_injected: NMIS_INJECTED.load(Ordering::Relaxed),
         nmis_handled: NMIS_HANDLED.load(Ordering::Relaxed),
+        ept_writes_granted: EPT_WRITES_GRANTED.load(Ordering::Relaxed),
     }
 }
 
@@ -244,6 +250,7 @@ fn store_state(state: ExitState) {
     NMI_PENDING.store(state.nmi_pending, Ordering::Relaxed);
     NMIS_INJECTED.store(state.nmis_injected, Ordering::Relaxed);
     NMIS_HANDLED.store(state.nmis_handled, Ordering::Relaxed);
+    EPT_WRITES_GRANTED.store(state.ept_writes_granted, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -264,6 +271,30 @@ fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
 /// is valid (bit 31). Bits 7:0 hold the vector.
 fn exception_vector(info: u32) -> Option<u8> {
     (info & (1 << 31) != 0).then_some(info as u8)
+}
+
+/// The kind of access an EPT violation's exit qualification reports. Only
+/// one is named; a write wins, since that is the access Aleph0 handles.
+fn ept_access_name(qualification: u64) -> &'static str {
+    if qualification & EPT_ACCESS_WRITE != 0 {
+        "write"
+    } else if qualification & EPT_ACCESS_FETCH != 0 {
+        "instruction fetch"
+    } else if qualification & EPT_ACCESS_READ != 0 {
+        "read"
+    } else {
+        "no access bit set"
+    }
+}
+
+/// What the EPT entries allowed for the page, from exit qualification bits
+/// 5:3, as `(R, W, X)` with 1 for allowed.
+fn ept_page_permissions(qualification: u64) -> (u8, u8, u8) {
+    (
+        u8::from(qualification & EPT_PAGE_READABLE != 0),
+        u8::from(qualification & EPT_PAGE_WRITABLE != 0),
+        u8::from(qualification & EPT_PAGE_EXECUTABLE != 0),
+    )
 }
 
 /// Reads one VMCS field for the diagnostic, printing instead of failing.
@@ -313,9 +344,20 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
             report_exception(number);
         }
     }
-    if let Some(qualification) = read_or_report("EXIT_QUALIFICATION", EXIT_QUALIFICATION) {
+    let qualification = read_or_report("EXIT_QUALIFICATION", EXIT_QUALIFICATION);
+    if let Some(qualification) = qualification {
         crate::serial_println!("{tag} VM exit #{number}: qualification={qualification:#018x}");
     }
+    let guest_physical = match reason {
+        Some(reason)
+            if !reason.entry_failure
+                && matches!(reason.basic, EXIT_REASON_EPT_VIOLATION | EXIT_REASON_EPT_MISCONFIG) =>
+        {
+            report_ept_exit(number, reason.basic, qualification.unwrap_or(0))
+        }
+        // Meaningful only for EPT exits; decide never looks at it otherwise.
+        _ => Some(0),
+    };
     let rip = read_or_report("GUEST_RIP", GUEST_RIP);
     let length = read_or_report("VM_EXIT_INSTRUCTION_LEN", VM_EXIT_INSTRUCTION_LEN);
     if let (Some(rip), Some(length)) = (rip, length) {
@@ -336,14 +378,19 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
     let interruption_info = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO);
     let interruptibility = read_or_report("GUEST_INTERRUPTIBILITY_STATE", GUEST_INTERRUPTIBILITY_STATE);
     let idt_vectoring = read_or_report("IDT_VECTORING_INFO", IDT_VECTORING_INFO);
-    let exit = match (reason, interruption_info, interruptibility, idt_vectoring) {
-        (Some(reason), Some(info), Some(blocking), Some(vectoring)) => Some(ExitInfo {
-            reason,
-            interruption_info: info as u32,
-            guest_rax: frame.rax,
-            interruptibility: blocking as u32,
-            idt_vectoring_valid: vectoring & (1 << 31) != 0,
-        }),
+    let exit = match (reason, interruption_info, interruptibility, idt_vectoring, qualification, guest_physical) {
+        (Some(reason), Some(info), Some(blocking), Some(vectoring), Some(qualification), Some(guest_physical)) => {
+            Some(ExitInfo {
+                reason,
+                interruption_info: info as u32,
+                guest_rax: frame.rax,
+                interruptibility: blocking as u32,
+                idt_vectoring_valid: vectoring & (1 << 31) != 0,
+                exit_qualification: qualification,
+                guest_physical,
+                protected_page: ept::protected_page(),
+            })
+        }
         // An unreadable field was printed; without it the exit cannot be
         // judged.
         _ => None,
@@ -357,16 +404,14 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
     store_state(next);
 
     let action = match event.action() {
-        ExitAction::Resume { advance_rip, inject_nmi, nmi_window } => {
-            match prepare_resume(number, rip, length, advance_rip, inject_nmi, nmi_window) {
-                Some(resume_rip) => {
-                    report_event(number, event, exit, next, Some(resume_rip));
-                    ExitAction::Resume { advance_rip, inject_nmi, nmi_window }
-                }
-                // Why the guest cannot go on was printed.
-                None => ExitAction::Unexpected,
+        resume @ ExitAction::Resume { .. } => match prepare_resume(number, rip, length, resume) {
+            Some(resumed) => {
+                report_event(number, event, exit, next, Some(resumed));
+                resume
             }
-        }
+            // Why the guest cannot go on was printed.
+            None => ExitAction::Unexpected,
+        },
         stop => {
             report_event(number, event, exit, next, None);
             stop
@@ -379,18 +424,24 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
     stub_return(action, number, raw_reason.unwrap_or(u32::from(UNREADABLE_REASON)))
 }
 
-/// Prepares the VMCS for a `Resume` action: moves GUEST_RIP past the exiting
-/// instruction, queues an NMI for injection at the next VM entry, and turns
-/// NMI-window exiting on or off. Returns the RIP the guest resumes at, or
-/// `None` after printing why it cannot resume.
-fn prepare_resume(
-    number: u64,
-    rip: Option<u64>,
-    length: Option<u64>,
-    advance_rip: bool,
-    inject_nmi: bool,
-    nmi_window: Option<bool>,
-) -> Option<u64> {
+/// How the guest goes on after [`prepare_resume`].
+#[derive(Debug, Clone, Copy)]
+struct Resumed {
+    /// Where the guest resumes.
+    rip: u64,
+    /// The INVEPT type used, if the protected page was made writable.
+    invept: Option<InveptType>,
+}
+
+/// Prepares the VMCS (and EPT) for a `Resume` action: moves GUEST_RIP past
+/// the exiting instruction, queues an NMI for injection at the next VM
+/// entry, turns NMI-window exiting on or off, and makes the protected page
+/// writable. Returns how the guest resumes, or `None` after printing why it
+/// cannot.
+fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: ExitAction) -> Option<Resumed> {
+    let ExitAction::Resume { advance_rip, inject_nmi, nmi_window, grant_write } = action else {
+        return None;
+    };
     let tag = crate::TAG;
     let Some(rip) = rip else {
         crate::serial_println!("{tag} VM exit #{number}: guest RIP unreadable; not resuming.");
@@ -411,7 +462,8 @@ fn prepare_resume(
         rip + length
     } else {
         // An NMI exit: the guest goes on at the instruction it was about to
-        // run, and the injected NMI is delivered before it.
+        // run, and the injected NMI is delivered before it. An EPT
+        // violation: the faulting write runs again.
         rip
     };
 
@@ -432,17 +484,66 @@ fn prepare_resume(
             return None;
         }
     }
-    Some(resume_rip)
+    let invept = if grant_write {
+        match unsafe { ept::grant_write() } {
+            Ok(invept) => Some(invept),
+            Err(error) => {
+                crate::serial_println!(
+                    "{tag} VM exit #{number}: could not make the protected page writable ({error:?}); not resuming."
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    Some(Resumed { rip: resume_rip, invept })
+}
+
+/// Prints an EPT exit's addresses and what the EPT entries allowed, and
+/// returns GUEST_PHYSICAL_ADDRESS (`None` if unreadable, after printing why).
+fn report_ept_exit(number: u64, basic: u16, qualification: u64) -> Option<u64> {
+    let tag = crate::TAG;
+    let guest_physical = read_or_report("GUEST_PHYSICAL_ADDRESS", GUEST_PHYSICAL_ADDRESS)?;
+    if basic == EXIT_REASON_EPT_MISCONFIG {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: EPT misconfiguration at GPA {guest_physical:#018x}: an EPT entry for it is invalid."
+        );
+        return Some(guest_physical);
+    }
+
+    let (r, w, x) = ept_page_permissions(qualification);
+    let access = ept_access_name(qualification);
+    // The linear address is only valid with qualification bit 7.
+    match (qualification & EPT_LINEAR_VALID != 0)
+        .then(|| read_or_report("GUEST_LINEAR_ADDRESS", GUEST_LINEAR_ADDRESS))
+        .flatten()
+    {
+        Some(linear) => crate::serial_println!(
+            "{tag} VM exit #{number}: EPT violation at GPA {guest_physical:#018x} (linear {linear:#018x}): {access}; page R={r} W={w} X={x}."
+        ),
+        None => crate::serial_println!(
+            "{tag} VM exit #{number}: EPT violation at GPA {guest_physical:#018x} (no linear address): {access}; page R={r} W={w} X={x}."
+        ),
+    }
+    Some(guest_physical)
 }
 
 /// Prints what exit `number` turned out to be and what Aleph0 does about
-/// it. `state` is the state after the exit; `resume_rip` is where the guest
-/// goes on, for events that resume it.
-fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: ExitState, resume_rip: Option<u64>) {
+/// it. `state` is the state after the exit; `resumed` is how the guest goes
+/// on, for events that resume it.
+fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: ExitState, resumed: Option<Resumed>) {
     let tag = crate::TAG;
     let rax = exit.map_or(0, |exit| exit.guest_rax);
-    let rip = resume_rip.unwrap_or(0);
+    let rip = resumed.map_or(0, |resumed| resumed.rip);
     match event {
+        ExitEvent::EptWriteGranted => crate::serial_println!(
+            "{tag} VM exit #{number}: write to the protected data page: write granted (W=1), INVEPT {}; retrying the write at rip={rip:#018x}.",
+            resumed.and_then(|resumed| resumed.invept).map_or("not run", InveptType::name),
+        ),
+        ExitEvent::EptWriteMissing => crate::serial_println!(
+            "{tag} VM exit #{number}: main VMCALL (rax={rax:#x}) before any EPT violation: the guest's write to its data page was not caught, so EPT did not protect it."
+        ),
         ExitEvent::MainVmcall => crate::serial_println!(
             "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); resuming the guest at rip={rip:#018x}."
         ),
@@ -477,6 +578,12 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),
         ),
+    }
+    if event == ExitEvent::LastMainVmcall {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: EPT: {} write violation(s) on the protected data page, write granted.",
+            state.ept_writes_granted,
+        );
     }
 }
 

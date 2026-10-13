@@ -33,7 +33,8 @@ fn exception_vector_needs_the_valid_bit() {
     assert_eq!(exception_vector(0x0000_0B0E), None);
 }
 
-const RESUME: ExitAction = ExitAction::Resume { advance_rip: true, inject_nmi: false, nmi_window: None };
+const RESUME: ExitAction =
+    ExitAction::Resume { advance_rip: true, inject_nmi: false, nmi_window: None, grant_write: false };
 
 #[test]
 fn resume_tells_the_stub_to_resume() {
@@ -60,4 +61,27 @@ fn unreadable_reason_has_its_own_name() {
 #[test]
 fn nmi_window_exit_has_a_name() {
     assert_eq!(exit_reason_name(8), "NMI window");
+}
+
+#[test]
+fn ept_exits_have_names() {
+    assert_eq!(exit_reason_name(EXIT_REASON_EPT_VIOLATION), "EPT violation");
+    assert_eq!(exit_reason_name(EXIT_REASON_EPT_MISCONFIG), "EPT misconfiguration");
+}
+
+#[test]
+fn ept_access_name_prefers_write() {
+    assert_eq!(ept_access_name(0x18A), "write");
+    // Hardware may report a read along with the write of a read-modify-write.
+    assert_eq!(ept_access_name(EPT_ACCESS_READ | EPT_ACCESS_WRITE), "write");
+    assert_eq!(ept_access_name(EPT_ACCESS_FETCH), "instruction fetch");
+    assert_eq!(ept_access_name(EPT_ACCESS_READ), "read");
+    assert_eq!(ept_access_name(0), "no access bit set");
+}
+
+#[test]
+fn ept_page_permissions_come_from_bits_5_to_3() {
+    // The guest's data page: readable only.
+    assert_eq!(ept_page_permissions(0x18A), (1, 0, 0));
+    assert_eq!(ept_page_permissions(0x38), (1, 1, 1));
 }

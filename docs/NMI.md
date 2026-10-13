@@ -76,7 +76,11 @@ supervisor access.
 
 ## 3. The guest code
 
-49 bytes, copied into the code page (`0x7eb0c000` on the Hyper-V run):
+49 bytes, copied into the code page (`0x7eb0c000` on the Hyper-V run).
+This is the code as of the NMI step; the offsets and the run in section 7
+refer to it. Since EPT, 24 bytes come first (the data-page read, write and
+read back, `docs/EPT.md` section 5), so every offset below moves by 24:
+the handler is at +56 and `dec ecx` at +45.
 
 ```text
 +0   31 DB            xor ebx, ebx            ; no NMI handled yet

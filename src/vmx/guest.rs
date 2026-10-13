@@ -1,17 +1,25 @@
-//! Guest memory: one code page, one stack page and one IDT page.
+//! Guest memory: a code page with a data page right after it, one stack
+//! page and one IDT page.
 //!
 //! The guest's instructions are assembled into the `.efi` image between
 //! `guest_code_start` and `guest_code_end`, then copied into a page of their
 //! own, so the guest never executes from host code pages. The copy only
 //! works because the code is position-independent: no absolute addresses,
-//! only relative jumps.
+//! only relative jumps and RIP-relative addressing.
+//!
+//! The data page is the one EPT maps read-only (`vmx::ept`). It is allocated
+//! together with the code page, so the guest finds it at a fixed distance
+//! from its own code (`lea rdi, [rip + guest_code_start]`, plus one page)
+//! without being told an address. The guest reads it (allowed), writes it
+//! (an EPT violation, after which Aleph0 makes it writable and the write is
+//! retried), and reads it back.
 //!
 //! Guest RIP is [`GuestMemory::code_base`], guest RSP
 //! [`GuestMemory::stack_top`], and guest IDTR [`GuestMemory::idt`];
 //! `GuestState::write` (in `guest_state`) writes them to the VMCS.
 //! [`GuestMemory::check_mappings`] confirms that the current page tables,
-//! which the guest shares, map the code page executable, the stack page
-//! writable, and the IDT page readable for the ring-0 guest.
+//! which the guest shares, map the code page executable, the stack and data
+//! pages writable, and the IDT page readable for the ring-0 guest.
 //!
 //! The guest has its own IDT because Aleph0 reinjects NMIs into it: the
 //! firmware's IDT would run the firmware's default NMI handler, which
@@ -48,6 +56,16 @@ pub const GUEST_NMI_MARKER: u32 = 0x004E_4D49;
 /// real time.
 pub const GUEST_WAIT_ITERATIONS: u32 = 0x2000_0000;
 
+/// Value Aleph0 writes at the start of the guest data page before launch.
+/// The guest reads it into ECX, so seeing it at main VMCALL #1 shows the
+/// read went through EPT.
+pub const GUEST_DATA_SEED: u32 = 0xDA7A;
+
+/// Value the guest writes to its data page: "EPT" in ASCII. The write is the
+/// intentional EPT violation; the guest reads the page back into EDX, so
+/// seeing it at main VMCALL #1 shows the retried write landed.
+pub const GUEST_EPT_VALUE: u32 = 0x0045_5054;
+
 core::arch::global_asm!(
     r#"
     .globl guest_code_start
@@ -57,6 +75,18 @@ guest_code_start:
     // No NMI handled yet. General-purpose registers are not VMCS fields, so
     // without this EBX would hold whatever the host had at VMLAUNCH.
     xor ebx, ebx
+    // The data page follows the code page. RIP-relative, so this still
+    // finds it after the code is copied.
+    lea rdi, [rip + guest_code_start]
+    add rdi, 0x1000
+    // Read: EPT allows it, ECX = GUEST_DATA_SEED.
+    mov ecx, dword ptr [rdi]
+    // Write: EPT maps the page read-only, so this exits (EPT violation).
+    // Aleph0 makes the page writable and resumes at this same instruction,
+    // which then succeeds.
+    mov dword ptr [rdi], {ept_value}
+    // Read back: EDX = GUEST_EPT_VALUE.
+    mov edx, dword ptr [rdi]
     mov eax, {marker}
     vmcall
     // Main VMCALL #1 is done and Aleph0 advanced RIP past it. Wait for an
@@ -94,6 +124,7 @@ guest_code_end:
     marker = const GUEST_MARKER,
     iterations = const GUEST_WAIT_ITERATIONS,
     nmi_marker = const GUEST_NMI_MARKER,
+    ept_value = const GUEST_EPT_VALUE,
 );
 
 unsafe extern "C" {
@@ -154,7 +185,7 @@ fn interrupt_gate(handler: u64, selector: u16) -> [u8; GATE_SIZE] {
 pub enum GuestMemoryError {
     /// The assembled guest code does not fit in one page.
     CodeTooLarge,
-    /// Failed to allocate the guest code page.
+    /// Failed to allocate the guest code and data pages.
     CodeAllocationFailed,
     /// Failed to allocate the guest stack page.
     StackAllocationFailed,
@@ -166,6 +197,8 @@ pub enum GuestMemoryError {
     StackNotMapped(WalkError),
     /// The page-table walk for the IDT page failed.
     IdtNotMapped(WalkError),
+    /// The page-table walk for the data page failed.
+    DataNotMapped(WalkError),
     /// The code page is mapped with XD set at some level.
     CodeNotExecutable,
     /// The code page is a user page and CR4.SMEP is set, so the ring-0
@@ -179,6 +212,13 @@ pub enum GuestMemoryError {
     /// The IDT page is a user page and CR4.SMAP is set, so the CPU could
     /// not read the NMI gate while delivering an NMI to the guest.
     IdtBlockedBySmap,
+    /// The data page is read-only at some level of the guest's page
+    /// tables. The guest's write would then be a page fault, not the EPT
+    /// violation the test needs.
+    DataNotWritable,
+    /// The data page is a user page and CR4.SMAP is set, so the ring-0
+    /// guest's accesses to it would fault before reaching EPT.
+    DataBlockedBySmap,
 }
 
 /// Checks that a ring-0 guest running with `cr4` can execute from `code`
@@ -213,29 +253,46 @@ fn check_idt_permissions(idt: &Mapping, cr4: u64) -> Result<(), GuestMemoryError
     Ok(())
 }
 
-/// How the current page tables map the three guest pages.
+/// Checks that the ring-0 guest can read and write the data page through
+/// the page tables it shares with the host, so its write reaches EPT
+/// instead of causing a page fault first.
+fn check_data_permissions(data: &Mapping, cr4: u64) -> Result<(), GuestMemoryError> {
+    if !data.writable {
+        return Err(GuestMemoryError::DataNotWritable);
+    }
+    if data.user && cr4 & cr::CR4_SMAP != 0 {
+        return Err(GuestMemoryError::DataBlockedBySmap);
+    }
+    Ok(())
+}
+
+/// How the current page tables map the four guest pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestMappings {
     pub code: Mapping,
     pub stack: Mapping,
     pub idt: Mapping,
+    pub data: Mapping,
 }
 
-/// Owns the guest code, stack and IDT pages. Never freed: the guest may run
-/// from them for as long as the CPU stays in VMX operation.
+/// Owns the guest code and data, stack and IDT pages. Never freed: the
+/// guest may run from them for as long as the CPU stays in VMX operation.
 pub struct GuestMemory {
+    /// Two pages: the code, then the data page.
     code: NonNull<u8>,
     stack: NonNull<u8>,
     idt: NonNull<u8>,
 }
 
 impl GuestMemory {
-    /// Allocate the three pages, copy the guest code into the code page, and
-    /// write the NMI gate into the IDT page.
+    /// Allocate the pages, copy the guest code into the code page, write the
+    /// seed into the data page, and write the NMI gate into the IDT page.
     ///
-    /// The code page is `LOADER_CODE` because firmware may map
-    /// `LOADER_DATA` no-execute; the stack and IDT pages are `LOADER_DATA`.
-    /// The gate uses the current CS selector, which the guest state copies.
+    /// The code and data pages are one two-page `LOADER_CODE` allocation:
+    /// `LOADER_CODE` because firmware may map `LOADER_DATA` no-execute, and
+    /// one allocation because the guest finds the data page right after its
+    /// code. The stack and IDT pages are `LOADER_DATA`. The gate uses the
+    /// current CS selector, which the guest state copies.
     pub fn allocate() -> Result<Self, GuestMemoryError> {
         let code_bytes = guest_code();
         if code_bytes.len() > PAGE_SIZE {
@@ -243,7 +300,7 @@ impl GuestMemory {
         }
 
         let code = allocate_zeroed_pages_of_type(
-            1,
+            2,
             MemoryType::LOADER_CODE,
             GuestMemoryError::CodeAllocationFailed,
         )?;
@@ -260,6 +317,8 @@ impl GuestMemory {
 
         unsafe { core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code.as_ptr(), code_bytes.len()) };
         let memory = Self { code, stack, idt };
+        // The data page is 4 KiB-aligned, so a u32 at its start is aligned.
+        unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
         let gate = interrupt_gate(memory.nmi_handler(), unsafe { segment::read_cs() });
         unsafe {
@@ -284,6 +343,13 @@ impl GuestMemory {
         self.code_base() + nmi_handler_offset() as u64
     }
 
+    /// Address of the data page, right after the code page. Under the
+    /// identity mappings it is also the page's guest-physical address, the
+    /// one EPT maps read-only.
+    pub fn data_page(&self) -> u64 {
+        self.code_base() + PAGE_SIZE as u64
+    }
+
     /// Top of the downward-growing guest stack, for GUEST_RSP.
     pub fn stack_top(&self) -> u64 {
         let top = unsafe { self.stack.as_ptr().add(PAGE_SIZE) } as usize;
@@ -297,11 +363,12 @@ impl GuestMemory {
         DescriptorTable { base: self.idt.as_ptr() as u64, limit: GUEST_IDT_LIMIT }
     }
 
-    /// Walks the current page tables for the three pages and checks that
-    /// the code page is executable, the stack page writable, and the IDT
-    /// page readable by the CPU on the ring-0 guest's behalf.
+    /// Walks the current page tables for the four pages and checks that
+    /// the code page is executable, the stack and data pages writable, and
+    /// the IDT page readable by the CPU on the ring-0 guest's behalf.
     ///
-    /// The guest will use these same tables (guest CR3 = host CR3, no EPT).
+    /// The guest will use these same tables (guest CR3 = host CR3); EPT
+    /// translates their result a second time.
     /// Each page is 4 KiB-aligned, so one walk covers the whole page: a page
     /// can never straddle two mappings.
     ///
@@ -321,11 +388,14 @@ impl GuestMemory {
             .map_err(GuestMemoryError::StackNotMapped)?;
         let idt = unsafe { paging::walk_current(self.idt().base) }
             .map_err(GuestMemoryError::IdtNotMapped)?;
+        let data = unsafe { paging::walk_current(self.data_page()) }
+            .map_err(GuestMemoryError::DataNotMapped)?;
 
         let cr4 = unsafe { read_cr4() };
         check_permissions(&code, &stack, cr4)?;
         check_idt_permissions(&idt, cr4)?;
-        Ok(GuestMappings { code, stack, idt })
+        check_data_permissions(&data, cr4)?;
+        Ok(GuestMappings { code, stack, idt, data })
     }
 }
 

@@ -7,11 +7,19 @@
 use super::*;
 
 #[test]
-fn guest_code_waits_for_an_nmi_between_two_vmcalls() {
+fn guest_code_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls() {
     assert_eq!(
         guest_code(),
         [
             0x31, 0xDB,                   // xor ebx, ebx
+            0x48, 0x8D, 0x3D,             // lea rdi, [rip + guest_code_start]:
+            0xF7, 0xFF, 0xFF, 0xFF,       //   -9, back to byte 0
+            0x48, 0x81, 0xC7,             // add rdi, 0x1000
+            0x00, 0x10, 0x00, 0x00,
+            0x8B, 0x0F,                   // mov ecx, [rdi]
+            0xC7, 0x07,                   // mov dword ptr [rdi], GUEST_EPT_VALUE
+            0x54, 0x50, 0x45, 0x00,
+            0x8B, 0x17,                   // mov edx, [rdi]
             0xB8, 0xE0, 0xA1, 0x00, 0x00, // mov eax, GUEST_MARKER
             0x0F, 0x01, 0xC1,             // vmcall (main VMCALL #1)
             0xB9, 0x00, 0x00, 0x00, 0x20, // mov ecx, GUEST_WAIT_ITERATIONS
@@ -35,8 +43,13 @@ fn guest_code_waits_for_an_nmi_between_two_vmcalls() {
 
 #[test]
 fn nmi_handler_starts_after_the_main_code() {
-    // Byte 32 in the listing above: right after the ud2.
-    assert_eq!(nmi_handler_offset(), 32);
+    // Byte 56 in the listing above: right after the ud2.
+    assert_eq!(nmi_handler_offset(), 56);
+}
+
+#[test]
+fn ept_value_spells_ept() {
+    assert_eq!(GUEST_EPT_VALUE.to_be_bytes(), [0, b'E', b'P', b'T']);
 }
 
 #[test]
@@ -113,6 +126,24 @@ fn user_stack_is_refused_only_under_smap() {
 #[test]
 fn kernel_idt_passes_under_smap() {
     assert_eq!(check_idt_permissions(&kernel_page(), SMEP_AND_SMAP), Ok(()));
+}
+
+#[test]
+fn writable_kernel_data_page_passes_under_smap() {
+    assert_eq!(check_data_permissions(&kernel_page(), SMEP_AND_SMAP), Ok(()));
+}
+
+#[test]
+fn read_only_data_page_is_refused() {
+    let data = Mapping { writable: false, ..kernel_page() };
+    assert_eq!(check_data_permissions(&data, 0), Err(GuestMemoryError::DataNotWritable));
+}
+
+#[test]
+fn user_data_page_is_refused_only_under_smap() {
+    let data = Mapping { user: true, ..kernel_page() };
+    assert_eq!(check_data_permissions(&data, 0), Ok(()));
+    assert_eq!(check_data_permissions(&data, cr::CR4_SMAP), Err(GuestMemoryError::DataBlockedBySmap));
 }
 
 #[test]

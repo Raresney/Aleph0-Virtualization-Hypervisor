@@ -91,6 +91,19 @@ fn only_vm_fail_valid_has_an_instruction_error_to_read() {
 }
 
 #[test]
+fn secondary_controls_activate_primary_bit_31() {
+    let desired = DesiredControls::minimal_64_bit_guest();
+    assert_eq!(desired.secondary, SECONDARY_ENABLE_EPT);
+    assert_eq!(primary_request(desired), desired.primary | (1 << 31));
+}
+
+#[test]
+fn no_secondary_controls_leave_the_primary_request_alone() {
+    let desired = DesiredControls { primary: 0x10, secondary: 0, ..DesiredControls::minimal_64_bit_guest() };
+    assert_eq!(primary_request(desired), 0x10);
+}
+
+#[test]
 fn nmi_window_on_sets_only_bit_22() {
     assert_eq!(with_nmi_window_exiting(0x8401_E172, true), 0x8441_E172);
 }

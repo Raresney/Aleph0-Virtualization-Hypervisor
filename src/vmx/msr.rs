@@ -64,12 +64,28 @@ pub const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x48E;
 pub const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48F;
 pub const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 
+/// Secondary processor-based controls: same layout as the other control
+/// MSRs. It has no "true" variant. Exists only if the primary controls allow
+/// bit 31 (activate secondary controls).
+pub const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48B;
+/// What EPT and VPID support: page-walk lengths, memory types, page sizes,
+/// INVEPT types. Exists only if the secondary controls allow EPT or VPID.
+pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
+
+/// Primary control bit 31, "activate secondary controls", as it appears in
+/// the allowed (high) half of the primary capability MSR.
+const PRIMARY_ALLOWS_SECONDARY: u64 = 1 << (32 + 31);
+/// Secondary control bit 1 (enable EPT) and bit 5 (enable VPID), in the
+/// allowed half of the secondary capability MSR.
+const SECONDARY_ALLOWS_EPT_OR_VPID: u64 = (1 << (32 + 1)) | (1 << (32 + 5));
+
 /// Raw VMX control capability MSRs, not the values currently in the VMCS.
 /// For each control MSR, the low 32 bits require control bits to be 1;
 /// the high 32 bits allow control bits to be 1. At the same bit position:
 /// (low, high) = (0, 0) means must be 0, (0, 1) means either value,
 /// and (1, 1) means must be 1. (1, 0) is inconsistent.
-/// `basic` has a different layout and is not a control-bit mask.
+/// `basic` and `ept_vpid_cap` have different layouts and are not
+/// control-bit masks.
 #[derive(Debug, Clone, Copy)]
 pub struct VmcsControlMsrs {
     pub basic: u64,
@@ -77,10 +93,17 @@ pub struct VmcsControlMsrs {
     pub primary: u64,
     pub exit: u64,
     pub entry: u64,
+    /// IA32_VMX_PROCBASED_CTLS2, or 0 when the CPU has no secondary
+    /// controls. 0 allows no bit, so every secondary request is refused.
+    pub secondary: u64,
+    /// IA32_VMX_EPT_VPID_CAP, or 0 when the CPU supports neither EPT nor
+    /// VPID.
+    pub ept_vpid_cap: u64,
 }
 
 /// Read IA32_VMX_BASIC and the four control MSRs, selecting the true variants
-/// when BASIC bit 55 reports them. This does not write VMCS fields.
+/// when BASIC bit 55 reports them, plus the secondary controls and the
+/// EPT/VPID capabilities where they exist. This does not write VMCS fields.
 ///
 /// # Safety
 ///
@@ -100,6 +123,18 @@ pub unsafe fn read_vmcs_control_msrs() -> VmcsControlMsrs {
         let primary = rdmsr(primary_id);
         let exit = rdmsr(exit_id);
         let entry = rdmsr(entry_id);
+        // Reading an MSR the CPU does not have raises #GP, so each one is
+        // read only when the MSR before it says it exists.
+        let secondary = if primary & PRIMARY_ALLOWS_SECONDARY != 0 {
+            rdmsr(IA32_VMX_PROCBASED_CTLS2)
+        } else {
+            0
+        };
+        let ept_vpid_cap = if secondary & SECONDARY_ALLOWS_EPT_OR_VPID != 0 {
+            rdmsr(IA32_VMX_EPT_VPID_CAP)
+        } else {
+            0
+        };
 
         VmcsControlMsrs {
             basic,
@@ -107,7 +142,9 @@ pub unsafe fn read_vmcs_control_msrs() -> VmcsControlMsrs {
             primary,
             exit,
             entry,
-        } 
+            secondary,
+            ept_vpid_cap,
+        }
     }
 }
 

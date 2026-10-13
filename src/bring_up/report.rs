@@ -36,8 +36,9 @@ pub(super) fn segment_state() {
     }
 }
 
-/// Prints the VMX capability MSRs: IA32_VMX_BASIC and, for each of the four
-/// control fields, which bits must be 1 (low half) and may be 1 (high half).
+/// Prints the VMX capability MSRs: IA32_VMX_BASIC; for each of the four
+/// control fields and the secondary controls, which bits must be 1 (low
+/// half) and may be 1 (high half); and IA32_VMX_EPT_VPID_CAP.
 pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     log!(
         "VMX BASIC={:#018x}; true controls={}",
@@ -54,6 +55,18 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
             value as u32, (value >> 32) as u32,
         );
     }
+    log!(
+        "VMX secondary: required={:#010x} allowed={:#010x}; EPT/VPID capabilities={:#018x}",
+        controls.secondary as u32, (controls.secondary >> 32) as u32, controls.ept_vpid_cap,
+    );
+}
+
+/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made.
+pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
+    log!(
+        "EPT built: identity 0x0..{:#x} ({} GiB) with 2 MiB pages, {} table pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        ept.end(), ept.end() >> 30, ept.table_pages(),
+    );
 }
 
 /// Prints how the current page tables, which the guest will share, map the
@@ -64,6 +77,7 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
         ("code", guest.code_base(), mappings.code),
         ("stack", stack_base, mappings.stack),
         ("IDT", guest.idt().base, mappings.idt),
+        ("data", guest.data_page(), mappings.data),
     ] {
         log!(
             "Guest {name} page: virt={virtual_address:#018x} phys={:#018x} identity={} size={:?} writable={} user={} xd={}",
@@ -77,7 +91,7 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     let nxe = unsafe { vmx::msr::rdmsr(vmx::msr::IA32_EFER) } & vmx::msr::EFER_NXE != 0;
     let cr4 = unsafe { vmx::cr::read_cr4() };
     log!(
-        "Guest code page executable and stack page writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
+        "Guest code page executable, stack and data pages writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
         cr4 & vmx::cr::CR4_SMEP != 0, cr4 & vmx::cr::CR4_SMAP != 0,
     );
 }
