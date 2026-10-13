@@ -22,10 +22,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::ept::{self, InveptType};
 use super::exit_decision::{
-    self, EPT_ACCESS_FETCH, EPT_ACCESS_READ, EPT_ACCESS_WRITE, EPT_LINEAR_VALID, EPT_PAGE_EXECUTABLE,
-    EPT_PAGE_READABLE, EPT_PAGE_WRITABLE, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION,
-    EXIT_REASON_EXCEPTION_OR_NMI, ExitAction, ExitEvent, ExitInfo, ExitState, INJECT_NMI, PLANNED_MAIN_VMCALLS, decide,
-    expected_main_rax,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, EptQualification, ExitAction,
+    ExitEvent, ExitInfo, ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, decide, expected_main_rax,
 };
 use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::fields::{
@@ -266,36 +264,6 @@ fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
     }
 }
 
-/// The exception vector in a VM_EXIT_INTERRUPTION_INFO value, if the field
-/// is valid (bit 31). Bits 7:0 hold the vector.
-fn exception_vector(info: u32) -> Option<u8> {
-    (info & (1 << 31) != 0).then_some(info as u8)
-}
-
-/// The kind of access an EPT violation's exit qualification reports. Only
-/// one is named; a write wins, since that is the access Aleph0 handles.
-fn ept_access_name(qualification: u64) -> &'static str {
-    if qualification & EPT_ACCESS_WRITE != 0 {
-        "write"
-    } else if qualification & EPT_ACCESS_FETCH != 0 {
-        "instruction fetch"
-    } else if qualification & EPT_ACCESS_READ != 0 {
-        "read"
-    } else {
-        "no access bit set"
-    }
-}
-
-/// What the EPT entries allowed for the page, from exit qualification bits
-/// 5:3, as `(R, W, X)` with 1 for allowed.
-fn ept_page_permissions(qualification: u64) -> (u8, u8, u8) {
-    (
-        u8::from(qualification & EPT_PAGE_READABLE != 0),
-        u8::from(qualification & EPT_PAGE_WRITABLE != 0),
-        u8::from(qualification & EPT_PAGE_EXECUTABLE != 0),
-    )
-}
-
 /// Reads one VMCS field for the diagnostic, printing instead of failing.
 fn read_or_report(name: &str, field: u32) -> Option<u64> {
     match unsafe { vmcs::vmread(field) } {
@@ -356,7 +324,7 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
             if !reason.entry_failure
                 && matches!(reason.basic, EXIT_REASON_EPT_VIOLATION | EXIT_REASON_EPT_MISCONFIG) =>
         {
-            report_ept_exit(number, reason.basic, qualification.unwrap_or(0))
+            report_ept_exit(number, reason.basic, EptQualification(qualification.unwrap_or(0)))
         }
         // Meaningful only for EPT exits; decide never looks at it otherwise.
         _ => Some(0),
@@ -395,11 +363,12 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
         (Some(reason), Some(info), Some(blocking), Some(vectoring), Some(qualification), Some(guest_physical)) => {
             Some(ExitInfo {
                 reason,
-                interruption_info: info as u32,
+                interruption_info: InterruptionInfo(info as u32),
                 guest_rax: frame.rax,
                 interruptibility: blocking as u32,
-                idt_vectoring_valid: vectoring & (1 << 31) != 0,
-                exit_qualification: qualification,
+                // IDT_VECTORING_INFO has the interruption-information layout.
+                idt_vectoring_valid: InterruptionInfo(vectoring as u32).is_valid(),
+                exit_qualification: EptQualification(qualification),
                 guest_physical,
                 protected_page: ept::protected_page(),
             })
@@ -484,7 +453,9 @@ fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: Ex
         rip
     };
 
-    if inject_nmi && let Err(error) = unsafe { vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, INJECT_NMI.into()) } {
+    if inject_nmi
+        && let Err(error) = unsafe { vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, InterruptionInfo::NMI.0.into()) }
+    {
         crate::serial_println!(
             "{tag} VM exit #{number}: could not queue the NMI for injection ({error:?}); not resuming."
         );
@@ -520,7 +491,7 @@ fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: Ex
 
 /// Prints an EPT exit's addresses and what the EPT entries allowed, and
 /// returns GUEST_PHYSICAL_ADDRESS (`None` if unreadable, after printing why).
-fn report_ept_exit(number: u64, basic: u16, qualification: u64) -> Option<u64> {
+fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification) -> Option<u64> {
     let tag = crate::TAG;
     let guest_physical = read_or_report("GUEST_PHYSICAL_ADDRESS", GUEST_PHYSICAL_ADDRESS)?;
     if basic == EXIT_REASON_EPT_MISCONFIG {
@@ -530,10 +501,11 @@ fn report_ept_exit(number: u64, basic: u16, qualification: u64) -> Option<u64> {
         return Some(guest_physical);
     }
 
-    let (r, w, x) = ept_page_permissions(qualification);
-    let access = ept_access_name(qualification);
+    let (r, w, x) = qualification.permissions();
+    let access = qualification.access_name();
     // The linear address is only valid with qualification bit 7.
-    match (qualification & EPT_LINEAR_VALID != 0)
+    match qualification
+        .linear_valid()
         .then(|| read_or_report("GUEST_LINEAR_ADDRESS", GUEST_LINEAR_ADDRESS))
         .flatten()
     {
@@ -572,7 +544,7 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ),
         ExitEvent::NmiInjected => crate::serial_println!(
             "{tag} VM exit #{number}: NMI (interruption info={:#010x}); reinjecting it into the guest at rip={rip:#018x}.",
-            exit.map_or(0, |exit| exit.interruption_info),
+            exit.map_or(0, |exit| exit.interruption_info.0),
         ),
         ExitEvent::NmiDeferred => crate::serial_println!(
             "{tag} VM exit #{number}: NMI cannot be injected yet (interruptibility={:#x}); waiting for the NMI window.",
@@ -620,10 +592,11 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
 fn report_exception(number: u64) {
     let tag = crate::TAG;
     if let Some(info) = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO) {
-        if exit_decision::is_nmi(info as u32) {
+        let interruption = InterruptionInfo(info as u32);
+        if interruption.is_nmi() {
             return;
         }
-        match exception_vector(info as u32) {
+        match interruption.vector() {
             Some(vector) => crate::serial_println!(
                 "{tag} VM exit #{number}: guest exception vector={vector} (interruption info={info:#010x})"
             ),

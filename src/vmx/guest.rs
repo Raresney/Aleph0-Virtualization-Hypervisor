@@ -32,6 +32,7 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
+use super::exit_decision::NMI_VECTOR;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable};
@@ -150,14 +151,14 @@ fn nmi_handler_offset() -> usize {
     unsafe { handler.offset_from(start) as usize }
 }
 
-/// IDT vector of NMI.
-const NMI_VECTOR: usize = 2;
 /// Size of one 64-bit IDT gate.
 const GATE_SIZE: usize = 16;
+/// Byte offset of the NMI gate (vector 2) in the guest IDT.
+const NMI_GATE_OFFSET: usize = NMI_VECTOR as usize * GATE_SIZE;
 /// GUEST_IDTR limit: three gates, vectors 0 to 2. Only vector 2 is present.
 const GUEST_IDT_LIMIT: u16 = (3 * GATE_SIZE - 1) as u16;
 // The NMI gate must lie inside the IDT limit, or the guest would #GP on an NMI.
-const _: () = assert!(NMI_VECTOR * GATE_SIZE + GATE_SIZE - 1 <= GUEST_IDT_LIMIT as usize);
+const _: () = assert!(NMI_GATE_OFFSET + GATE_SIZE - 1 <= GUEST_IDT_LIMIT as usize);
 
 /// A 64-bit interrupt gate to `handler` through code segment `selector`:
 /// present, DPL 0, no IST.
@@ -309,7 +310,7 @@ impl GuestMemory {
         unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
         let gate = interrupt_gate(memory.nmi_handler(), segment::read_cs());
-        unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_VECTOR * GATE_SIZE), GATE_SIZE) };
+        unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_GATE_OFFSET), GATE_SIZE) };
         Ok(memory)
     }
 

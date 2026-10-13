@@ -69,7 +69,6 @@ const EPTP_WALK_LENGTH_4: u64 = 3 << 3;
 
 /// Entries per table: 4096 bytes / 8 bytes per entry.
 const ENTRIES: usize = 512;
-const SIZE_4K: u64 = 1 << 12;
 const SIZE_2M: u64 = 1 << 21;
 const SIZE_1G: u64 = 1 << 30;
 /// How far one PDPT reaches (512 entries of 1 GiB). Aleph0 builds one PDPT,
@@ -164,29 +163,53 @@ pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<
     }
 }
 
-/// A non-leaf entry pointing to the next table at `address`, allowing every
-/// access. A non-leaf entry only limits what lies below it, so the leaf
-/// entries decide the permissions.
-pub fn table_entry(address: u64) -> u64 {
-    (address & ADDRESS_MASK) | EPT_RWX
+/// One EPT entry, laid out as in the module docs. `repr(transparent)`, so
+/// a table page is 512 of these back to back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct EptEntry(u64);
+
+impl EptEntry {
+    /// A non-leaf entry pointing to the next table at `address`, allowing
+    /// every access. A non-leaf entry only limits what lies below it, so the
+    /// leaf entries decide the permissions.
+    pub fn table(address: u64) -> Self {
+        Self((address & ADDRESS_MASK) | EPT_RWX)
+    }
+
+    /// A PD entry mapping the 2 MiB page at `address`: RWX, write-back.
+    pub fn large_page(address: u64) -> Self {
+        Self((address & ADDRESS_MASK) | EPT_RWX | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT) | LARGE_PAGE)
+    }
+
+    /// A PT entry mapping the 4 KiB page at `address` with `access` (a mix
+    /// of [`EPT_READ`], [`EPT_WRITE`], [`EPT_EXECUTE`]), write-back.
+    pub fn page(address: u64, access: u64) -> Self {
+        Self((address & ADDRESS_MASK) | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT)).with_access(access)
+    }
+
+    /// The same entry with its R, W and X bits replaced by `access`.
+    pub fn with_access(self, access: u64) -> Self {
+        Self((self.0 & !EPT_RWX) | (access & EPT_RWX))
+    }
 }
 
-/// A PD entry mapping the 2 MiB page at `address`: RWX, write-back.
-pub fn large_page_entry(address: u64) -> u64 {
-    (address & ADDRESS_MASK) | EPT_RWX | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT) | LARGE_PAGE
-}
+/// An EPT pointer: the value of the VMCS EPT_POINTER field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eptp(u64);
 
-/// A PT entry mapping the 4 KiB page at `address` with `access` (a mix of
-/// [`EPT_READ`], [`EPT_WRITE`], [`EPT_EXECUTE`]), write-back.
-pub fn page_entry(address: u64, access: u64) -> u64 {
-    (address & ADDRESS_MASK) | (access & EPT_RWX) | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT)
-}
+impl Eptp {
+    /// The EPT pointer for the PML4 table at `pml4`: write-back (bits 2:0 =
+    /// 6), 4-level walk (bits 5:3 = 3), no accessed/dirty flags (bit 6 = 0).
+    /// So the low bits are always 0x1E.
+    pub fn new(pml4: u64) -> Self {
+        Self((pml4 & ADDRESS_MASK) | MEMORY_TYPE_WB | EPTP_WALK_LENGTH_4)
+    }
 
-/// The EPT pointer for the PML4 table at `pml4`: write-back (bits 2:0 = 6),
-/// 4-level walk (bits 5:3 = 3), no accessed/dirty flags (bit 6 = 0). So the
-/// low bits are always 0x1E.
-pub fn eptp(pml4: u64) -> u64 {
-    (pml4 & ADDRESS_MASK) | MEMORY_TYPE_WB | EPTP_WALK_LENGTH_4
+    /// The pointer as the CPU reads it.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 // No PML4 index helper: the map ends at 512 GiB at most, so every address
@@ -217,7 +240,7 @@ pub fn identity_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64
     let mut highest = 0u64;
     for (start, pages) in regions {
         let end = pages
-            .checked_mul(SIZE_4K)
+            .checked_mul(PAGE_SIZE as u64)
             .and_then(|size| start.checked_add(size))
             .ok_or(EptError::RangeTooLarge { end: u64::MAX })?;
         highest = highest.max(end);
@@ -239,11 +262,11 @@ pub fn identity_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64
 /// one has. Under UEFI's identity mapping a table's physical address is its
 /// virtual one; on the host tests these are made-up numbers.
 struct Tables<'a> {
-    pml4: &'a mut [u64],
-    pdpt: &'a mut [u64],
+    pml4: &'a mut [EptEntry],
+    pdpt: &'a mut [EptEntry],
     /// One PD per GiB of the map, back to back.
-    pds: &'a mut [u64],
-    pt: &'a mut [u64],
+    pds: &'a mut [EptEntry],
+    pt: &'a mut [EptEntry],
     pdpt_address: u64,
     pds_address: u64,
     pt_address: u64,
@@ -259,33 +282,33 @@ struct Tables<'a> {
 /// checks all three.
 fn fill_identity_map(tables: Tables<'_>, end: u64, protected_page: u64) -> usize {
     let gibs = (end / SIZE_1G) as usize;
-    tables.pml4[0] = table_entry(tables.pdpt_address);
+    tables.pml4[0] = EptEntry::table(tables.pdpt_address);
     for gib in 0..gibs {
-        tables.pdpt[gib] = table_entry(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
+        tables.pdpt[gib] = EptEntry::table(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
     }
 
     // PD entry number `i` across all PDs maps GPA i * 2 MiB.
     for (i, entry) in tables.pds.iter_mut().enumerate().take(gibs * ENTRIES) {
-        *entry = large_page_entry(i as u64 * SIZE_2M);
+        *entry = EptEntry::large_page(i as u64 * SIZE_2M);
     }
     // The PDs are back to back, one per PDPT entry, so the PD entry for an
     // address is its PDPT index times 512 plus its PD index.
     let split = pdpt_index(protected_page) * ENTRIES + pd_index(protected_page);
-    tables.pds[split] = table_entry(tables.pt_address);
+    tables.pds[split] = EptEntry::table(tables.pt_address);
 
     let region = protected_page & !(SIZE_2M - 1);
     for (i, entry) in tables.pt.iter_mut().enumerate() {
-        *entry = page_entry(region + i as u64 * SIZE_4K, EPT_RWX);
+        *entry = EptEntry::page(region + (i * PAGE_SIZE) as u64, EPT_RWX);
     }
     let protected = pt_index(protected_page);
-    tables.pt[protected] = page_entry(protected_page, EPT_READ);
+    tables.pt[protected] = EptEntry::page(protected_page, EPT_READ);
     protected
 }
 
 /// One EPT identity map. Its table pages are never freed: the CPU walks them
 /// on every guest access for as long as the VMCS points at them.
 pub struct Ept {
-    eptp: u64,
+    eptp: Eptp,
     end: u64,
     table_pages: usize,
 }
@@ -303,7 +326,7 @@ impl Ept {
     pub unsafe fn build(protected_page: u64, invept: InveptType) -> Result<Self, EptError> {
         let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| EptError::MemoryMapUnavailable)?;
         let end = identity_map_end(map.entries().map(|region| (region.phys_start, region.page_count)))?;
-        if protected_page >= end || !protected_page.is_multiple_of(SIZE_4K) {
+        if protected_page >= end || !protected_page.is_multiple_of(PAGE_SIZE as u64) {
             return Err(EptError::ProtectedPageOutsideMap);
         }
 
@@ -316,7 +339,7 @@ impl Ept {
         // SAFETY: each allocation above is page-aligned, zeroed and as long
         // as its slice, and nothing else refers to it yet.
         let table = |address: u64, pages: usize| unsafe {
-            core::slice::from_raw_parts_mut(address as *mut u64, pages * ENTRIES)
+            core::slice::from_raw_parts_mut(address as *mut EptEntry, pages * ENTRIES)
         };
         let protected = fill_identity_map(
             Tables {
@@ -333,19 +356,19 @@ impl Ept {
         );
 
         let ept = Self {
-            eptp: eptp(pml4),
+            eptp: Eptp::new(pml4),
             end,
             table_pages: gibs + 3,
         };
         PROTECTED_PAGE.store(protected_page, Ordering::Relaxed);
-        PROTECTED_ENTRY.store(pt + protected as u64 * 8, Ordering::Relaxed);
-        PUBLISHED_EPTP.store(ept.eptp, Ordering::Relaxed);
+        PROTECTED_ENTRY.store(pt + (protected * size_of::<EptEntry>()) as u64, Ordering::Relaxed);
+        PUBLISHED_EPTP.store(ept.eptp.raw(), Ordering::Relaxed);
         INVEPT_TYPE.store(invept as u64, Ordering::Relaxed);
         Ok(ept)
     }
 
     /// The value for the VMCS EPT_POINTER field.
-    pub fn eptp(&self) -> u64 {
+    pub fn eptp(&self) -> Eptp {
         self.eptp
     }
 
@@ -408,9 +431,9 @@ pub unsafe fn grant_write() -> Result<InveptType, GrantError> {
         _ => InveptType::AllContext,
     };
     unsafe {
-        let entry = entry as *mut u64;
-        entry.write_volatile(entry.read_volatile() | EPT_WRITE);
-        invalidate(invept, PUBLISHED_EPTP.load(Ordering::Relaxed)).map_err(GrantError::Invept)?;
+        let entry = entry as *mut EptEntry;
+        entry.write_volatile(entry.read_volatile().with_access(EPT_READ | EPT_WRITE));
+        invalidate(invept, Eptp(PUBLISHED_EPTP.load(Ordering::Relaxed))).map_err(GrantError::Invept)?;
     }
     Ok(invept)
 }
@@ -429,8 +452,11 @@ struct InveptDescriptor {
 /// # Safety
 ///
 /// The CPU must be in VMX root operation.
-unsafe fn invalidate(kind: InveptType, eptp: u64) -> Result<(), VmxFail> {
-    let descriptor = InveptDescriptor { eptp, reserved: 0 };
+unsafe fn invalidate(kind: InveptType, eptp: Eptp) -> Result<(), VmxFail> {
+    let descriptor = InveptDescriptor {
+        eptp: eptp.raw(),
+        reserved: 0,
+    };
     // SAFETY: INVEPT reads only the 16-byte descriptor, which lives on this
     // stack frame; the caller guarantees VMX root operation.
     unsafe {

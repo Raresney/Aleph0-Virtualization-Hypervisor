@@ -32,6 +32,7 @@
 //! that once a current VMCS exists, VMfailValid also stores a numeric reason
 //! readable via [`vm_instruction_error`].
 
+use crate::vmx::ept::Eptp;
 use crate::vmx::instruction::{VmxFail, check_rflags, vmx_asm};
 use crate::vmx::msr::{self, UnsupportedControl, VmcsControlMsrs};
 use crate::vmx::region::VmxRegion;
@@ -468,16 +469,16 @@ pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
     unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
 }
 
-/// Writes the EPT pointer (see `vmx::ept::eptp`) and reads it back. VM entry
-/// checks it only when the "enable EPT" secondary control is set.
+/// Writes the EPT pointer and reads it back. VM entry checks it only when
+/// the "enable EPT" secondary control is set.
 ///
 /// # Safety
 ///
 /// VMX operation with a current VMCS. The tables `eptp` names must stay
 /// allocated for as long as the VMCS may be used.
-pub unsafe fn set_ept_pointer(eptp: u64) -> Result<(), VmcsError> {
+pub unsafe fn set_ept_pointer(eptp: Eptp) -> Result<(), VmcsError> {
     // SAFETY: the caller guarantees VMX operation with a current VMCS.
-    unsafe { write_verified(EPT_POINTER, eptp) }
+    unsafe { write_verified(EPT_POINTER, eptp.raw()) }
 }
 
 /// The numeric reason the last VMX instruction failed.

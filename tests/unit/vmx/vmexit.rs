@@ -5,6 +5,7 @@
 //! private items.
 
 use super::*;
+use crate::vmx::exit_decision::{EPT_ACCESS_FETCH, EPT_ACCESS_READ, EPT_ACCESS_WRITE};
 
 #[test]
 fn exit_reason_splits_basic_and_entry_failure() {
@@ -34,12 +35,12 @@ fn exit_reason_ignores_other_high_bits() {
 fn exception_vector_is_bits_7_to_0_of_valid_info() {
     // Valid (bit 31), error code (bit 11), hardware exception (type 3),
     // vector 14: a page fault.
-    assert_eq!(exception_vector(0x8000_0B0E), Some(14));
+    assert_eq!(InterruptionInfo(0x8000_0B0E).vector(), Some(14));
 }
 
 #[test]
 fn exception_vector_needs_the_valid_bit() {
-    assert_eq!(exception_vector(0x0000_0B0E), None);
+    assert_eq!(InterruptionInfo(0x0000_0B0E).vector(), None);
 }
 
 const RESUME: ExitAction = ExitAction::Resume {
@@ -87,17 +88,20 @@ fn ept_exits_have_names() {
 
 #[test]
 fn ept_access_name_prefers_write() {
-    assert_eq!(ept_access_name(0x18A), "write");
+    assert_eq!(EptQualification(0x18A).access_name(), "write");
     // Hardware may report a read along with the write of a read-modify-write.
-    assert_eq!(ept_access_name(EPT_ACCESS_READ | EPT_ACCESS_WRITE), "write");
-    assert_eq!(ept_access_name(EPT_ACCESS_FETCH), "instruction fetch");
-    assert_eq!(ept_access_name(EPT_ACCESS_READ), "read");
-    assert_eq!(ept_access_name(0), "no access bit set");
+    assert_eq!(
+        EptQualification(EPT_ACCESS_READ | EPT_ACCESS_WRITE).access_name(),
+        "write"
+    );
+    assert_eq!(EptQualification(EPT_ACCESS_FETCH).access_name(), "instruction fetch");
+    assert_eq!(EptQualification(EPT_ACCESS_READ).access_name(), "read");
+    assert_eq!(EptQualification(0).access_name(), "no access bit set");
 }
 
 #[test]
 fn ept_page_permissions_come_from_bits_5_to_3() {
     // The guest's data page: readable only.
-    assert_eq!(ept_page_permissions(0x18A), (1, 0, 0));
-    assert_eq!(ept_page_permissions(0x38), (1, 1, 1));
+    assert_eq!(EptQualification(0x18A).permissions(), (1, 0, 0));
+    assert_eq!(EptQualification(0x38).permissions(), (1, 1, 1));
 }

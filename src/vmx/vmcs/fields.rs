@@ -81,7 +81,7 @@ pub const SECONDARY_VM_EXEC_CONTROL: u32 = 0x401E;
 // ── Control fields (64-bit) ──────────────────────────────────────────────
 
 /// EPT pointer (EPTP): the physical address of the EPT PML4 table, with the
-/// memory type and page-walk length in its low bits (see `vmx::ept::eptp`).
+/// memory type and page-walk length in its low bits (see `vmx::ept::Eptp`).
 pub const EPT_POINTER: u32 = 0x201A;
 
 // ── Bits inside the control fields ───────────────────────────────────────

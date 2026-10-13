@@ -56,6 +56,9 @@ const TYPE_ACCESSED: u32 = 1 << 0;
 const CODE_OR_DATA: u32 = 1 << 4;
 /// Access-rights bit 13 (L): 64-bit code segment.
 const LONG_MODE: u32 = 1 << 13;
+/// Access-rights bits 4:0: S and the 4-bit type, which together say what
+/// kind of descriptor it is.
+const KIND_MASK: u32 = 0x1F;
 /// Access-rights bits 4:0 of a busy 64-bit TSS: S = 0, type 0xB. LTR marks
 /// the TSS busy, and VM entry into a 64-bit guest requires that type.
 const BUSY_TSS_64: u32 = 0xB;
@@ -332,7 +335,7 @@ fn check_segments(cs: &GuestSegment, tr: &GuestSegment) -> Result<(), GuestState
             access_rights: cs.access_rights,
         });
     }
-    if !tr.is_usable() || tr.access_rights & 0x1F != BUSY_TSS_64 {
+    if !tr.is_usable() || tr.access_rights & KIND_MASK != BUSY_TSS_64 {
         return Err(GuestStateError::TrNotBusyTss {
             access_rights: tr.access_rights,
         });

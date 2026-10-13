@@ -9,7 +9,7 @@ use super::*;
 const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;
 /// VM_EXIT_INTERRUPTION_INFO of an NMI exit.
-const NMI_INFO: u32 = 0x8000_0202;
+const NMI_INFO: InterruptionInfo = InterruptionInfo(0x8000_0202);
 
 /// Before the first exit.
 const START: ExitState = ExitState {
@@ -37,6 +37,8 @@ const PROTECTED_PAGE: u64 = 0x7eb1_d000;
 /// guest's linear address (bits 7 and 8). Hyper-V and bare metal may set
 /// other bits; only these matter.
 const PROTECTED_WRITE: u64 = 0x18A;
+/// A page fault: hardware exception (type 3), error code valid, vector 14.
+const PAGE_FAULT_INFO: u32 = 0x8000_0B0E;
 
 fn exit(basic: u16) -> ExitInfo {
     ExitInfo {
@@ -44,11 +46,11 @@ fn exit(basic: u16) -> ExitInfo {
             basic,
             entry_failure: false,
         },
-        interruption_info: 0,
+        interruption_info: InterruptionInfo(0),
         guest_rax: 0,
         interruptibility: 0,
         idt_vectoring_valid: false,
-        exit_qualification: 0,
+        exit_qualification: EptQualification(0),
         guest_physical: 0,
         protected_page: PROTECTED_PAGE,
     }
@@ -58,7 +60,7 @@ fn exit(basic: u16) -> ExitInfo {
 fn ept_violation(gpa: u64, qualification: u64) -> ExitInfo {
     ExitInfo {
         guest_physical: gpa,
-        exit_qualification: qualification,
+        exit_qualification: EptQualification(qualification),
         ..exit(EXIT_REASON_EPT_VIOLATION)
     }
 }
@@ -85,26 +87,43 @@ fn nmi(interruptibility: u32) -> ExitInfo {
 
 #[test]
 fn injected_nmi_is_valid_type_2_vector_2() {
-    assert_eq!(INJECT_NMI, 0x8000_0202);
+    assert_eq!(InterruptionInfo::NMI, InterruptionInfo(0x8000_0202));
 }
 
 #[test]
 fn nmi_info_is_recognised() {
-    assert!(is_nmi(0x8000_0202));
+    assert!(InterruptionInfo(0x8000_0202).is_nmi());
     // Bit 12 (NMI unblocking due to IRET) does not change what it is.
-    assert!(is_nmi(0x8000_1202));
+    assert!(InterruptionInfo(0x8000_1202).is_nmi());
 }
 
 #[test]
 fn exceptions_and_invalid_info_are_not_nmis() {
-    // Page fault: hardware exception (type 3), error code valid, vector 14.
-    assert!(!is_nmi(0x8000_0B0E));
+    assert!(!InterruptionInfo(PAGE_FAULT_INFO).is_nmi());
     // NMI bits without the valid bit.
-    assert!(!is_nmi(0x0000_0202));
+    assert!(!InterruptionInfo(0x0000_0202).is_nmi());
     // Right vector, wrong type: hardware exception (type 3), vector 2.
-    assert!(!is_nmi(0x8000_0302));
+    assert!(!InterruptionInfo(0x8000_0302).is_nmi());
     // Right type, wrong vector: NMI type, vector 3.
-    assert!(!is_nmi(0x8000_0203));
+    assert!(!InterruptionInfo(0x8000_0203).is_nmi());
+}
+
+#[test]
+fn interruption_info_validity_is_bit_31() {
+    assert!(InterruptionInfo(PAGE_FAULT_INFO).is_valid());
+    assert!(!InterruptionInfo(PAGE_FAULT_INFO & !InterruptionInfo::VALID).is_valid());
+}
+
+#[test]
+fn ept_qualification_flags_decode() {
+    let write = EptQualification(PROTECTED_WRITE);
+    assert!(write.is_write());
+    assert!(write.linear_valid());
+    assert!(write.is_protected_write());
+    let read = EptQualification(EPT_ACCESS_READ | EPT_PAGE_READABLE);
+    assert!(!read.is_write());
+    assert!(!read.linear_valid());
+    assert!(!read.is_protected_write());
 }
 
 #[test]
@@ -419,7 +438,7 @@ fn entry_failure_is_unexpected() {
 #[test]
 fn exception_exit_is_unexpected() {
     let page_fault = ExitInfo {
-        interruption_info: 0x8000_0B0E,
+        interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
     assert_eq!(decide(WAITING, page_fault), (ExitEvent::Unexpected, WAITING));

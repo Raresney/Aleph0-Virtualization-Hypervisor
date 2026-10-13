@@ -310,7 +310,7 @@ fn prepare_vmcs(
     unsafe { vmx::vmcs::set_ept_pointer(ept.eptp()) }.map_err(vmcs_step("EPT pointer setup"))?;
     log!(
         "VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.",
-        ept.eptp()
+        ept.eptp().raw()
     );
 
     unsafe { vmx::vmcs::configure_host_state() }.map_err(vmcs_step("host-state setup"))?;

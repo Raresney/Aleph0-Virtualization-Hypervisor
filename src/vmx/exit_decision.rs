@@ -61,28 +61,102 @@ pub const EPT_TRANSLATED_ACCESS: u64 = 1 << 8;
 /// does not do, so such a violation is never handled.
 pub const EPT_NMI_UNBLOCKING_IRET: u64 = 1 << 12;
 
-/// The EPT violation Aleph0 handles: a write to a page EPT maps readable but
-/// not writable, through the linear address the guest used.
-fn is_protected_write(qualification: u64) -> bool {
-    let required = EPT_ACCESS_WRITE | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
-    let refused = EPT_PAGE_WRITABLE | EPT_NMI_UNBLOCKING_IRET;
-    qualification & required == required && qualification & refused == 0
+/// An EPT violation's exit qualification (EXIT_QUALIFICATION), decoded with
+/// the bits above. Other exits carry other layouts in the same field; only
+/// EPT exits are read through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EptQualification(pub u64);
+
+impl EptQualification {
+    /// Whether the access was a write.
+    pub fn is_write(self) -> bool {
+        self.0 & EPT_ACCESS_WRITE != 0
+    }
+
+    /// The kind of access, for the report. Only one is named; a write wins,
+    /// since that is the access Aleph0 handles.
+    pub fn access_name(self) -> &'static str {
+        if self.is_write() {
+            "write"
+        } else if self.0 & EPT_ACCESS_FETCH != 0 {
+            "instruction fetch"
+        } else if self.0 & EPT_ACCESS_READ != 0 {
+            "read"
+        } else {
+            "no access bit set"
+        }
+    }
+
+    /// What the EPT entries allowed for the page, from bits 5:3, as
+    /// `(R, W, X)` with 1 for allowed.
+    pub fn permissions(self) -> (u8, u8, u8) {
+        (
+            u8::from(self.0 & EPT_PAGE_READABLE != 0),
+            u8::from(self.0 & EPT_PAGE_WRITABLE != 0),
+            u8::from(self.0 & EPT_PAGE_EXECUTABLE != 0),
+        )
+    }
+
+    /// Whether GUEST_LINEAR_ADDRESS is valid (bit 7).
+    pub fn linear_valid(self) -> bool {
+        self.0 & EPT_LINEAR_VALID != 0
+    }
+
+    /// The EPT violation Aleph0 handles: a write to a page EPT maps readable
+    /// but not writable, through the linear address the guest used.
+    pub fn is_protected_write(self) -> bool {
+        let required = EPT_ACCESS_WRITE | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
+        let refused = EPT_PAGE_WRITABLE | EPT_NMI_UNBLOCKING_IRET;
+        self.0 & required == required && self.0 & refused == 0
+    }
 }
 
 /// How many main VMCALLs the guest makes; the last one ends the run.
 pub const PLANNED_MAIN_VMCALLS: u32 = 2;
 
-/// Interruption-information bit 31: the field is valid.
-const INTERRUPTION_VALID: u32 = 1 << 31;
-/// Interruption type 2 (bits 10:8): NMI.
-const INTERRUPTION_TYPE_NMI: u32 = 2;
 /// IDT vector of NMI.
-const NMI_VECTOR: u32 = 2;
+pub const NMI_VECTOR: u8 = 2;
 
-/// VM_ENTRY_INTERRUPTION_INFO value that injects an NMI at the next VM
-/// entry: valid, type NMI, vector 2. The CPU clears the field after each
-/// successful entry, so it injects once.
-pub const INJECT_NMI: u32 = INTERRUPTION_VALID | (INTERRUPTION_TYPE_NMI << 8) | NMI_VECTOR;
+/// An interruption-information value: VM_EXIT_INTERRUPTION_INFO,
+/// IDT_VECTORING_INFO and VM_ENTRY_INTERRUPTION_INFO share the layout.
+///
+/// ```text
+///  31    30  13  12           11          10   8  7      0
+/// ┌─────┬──────┬────────────┬────────────┬───────┬────────┐
+/// │valid│ res. │NMI unblock.│ error code │ type  │ vector │
+/// │     │      │ (exit only)│   valid    │       │        │
+/// └─────┴──────┴────────────┴────────────┴───────┴────────┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptionInfo(pub u32);
+
+impl InterruptionInfo {
+    /// Bit 31: the field is valid.
+    pub const VALID: u32 = 1 << 31;
+    /// Interruption type 2 (bits 10:8): NMI.
+    const TYPE_NMI: u32 = 2;
+
+    /// The VM_ENTRY_INTERRUPTION_INFO value that injects an NMI at the next
+    /// VM entry: valid, type NMI, vector 2. The CPU clears the field after
+    /// each successful entry, so it injects once.
+    pub const NMI: Self = Self(Self::VALID | (Self::TYPE_NMI << 8) | NMI_VECTOR as u32);
+
+    /// Whether the field describes an event at all (bit 31).
+    pub fn is_valid(self) -> bool {
+        self.0 & Self::VALID != 0
+    }
+
+    /// Whether this describes an NMI: valid, type 2, vector 2. Bit 12 (NMI
+    /// unblocking due to IRET) is ignored.
+    pub fn is_nmi(self) -> bool {
+        self.is_valid() && (self.0 >> 8) & 0b111 == Self::TYPE_NMI && self.vector() == Some(NMI_VECTOR)
+    }
+
+    /// The vector (bits 7:0), if the field is valid.
+    pub fn vector(self) -> Option<u8> {
+        self.is_valid().then_some(self.0 as u8)
+    }
+}
 
 /// Guest interruptibility bit 0: blocking by STI. The Intel SDM (Vol. 3C,
 /// checks on guest non-register state) says: "A processor may require bit 0
@@ -101,26 +175,20 @@ const BLOCKING_BY_NMI: u32 = 1 << 3;
 /// instead of injecting blindly.
 const NMI_INJECTION_BLOCKED: u32 = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
 
-/// Whether `info`, a VM_EXIT_INTERRUPTION_INFO value, describes an NMI:
-/// valid, type 2, vector 2. Bit 12 (NMI unblocking due to IRET) is ignored.
-pub fn is_nmi(info: u32) -> bool {
-    info & INTERRUPTION_VALID != 0 && (info >> 8) & 0b111 == INTERRUPTION_TYPE_NMI && info & 0xFF == NMI_VECTOR
-}
-
 /// What the handler read about the current exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitInfo {
     pub reason: ExitReason,
     /// VM_EXIT_INTERRUPTION_INFO.
-    pub interruption_info: u32,
+    pub interruption_info: InterruptionInfo,
     pub guest_rax: u64,
     /// GUEST_INTERRUPTIBILITY_STATE.
     pub interruptibility: u32,
     /// IDT_VECTORING_INFO bit 31: the exit interrupted an event's delivery
     /// through the guest IDT.
     pub idt_vectoring_valid: bool,
-    /// EXIT_QUALIFICATION.
-    pub exit_qualification: u64,
+    /// EXIT_QUALIFICATION, which [`decide`] reads for EPT violations only.
+    pub exit_qualification: EptQualification,
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only; 0 otherwise.
     pub guest_physical: u64,
     /// GPA of the page EPT maps read-only (`ept::protected_page`), 0 if none.
@@ -177,7 +245,7 @@ pub enum ExitAction {
     /// Return to the guest.
     ///
     /// `advance_rip`: move GUEST_RIP past the exiting instruction (a
-    /// VMCALL). `inject_nmi`: write [`INJECT_NMI`] to
+    /// VMCALL). `inject_nmi`: write [`InterruptionInfo::NMI`] to
     /// VM_ENTRY_INTERRUPTION_INFO. `nmi_window`: turn NMI-window exiting on
     /// (`Some(true)`) or off (`Some(false)`), or leave it (`None`).
     /// `grant_write`: make the protected page writable in EPT
@@ -252,7 +320,7 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         ..state
     };
     match exit.reason.basic {
-        EXIT_REASON_EXCEPTION_OR_NMI if is_nmi(exit.interruption_info) => {
+        EXIT_REASON_EXCEPTION_OR_NMI if exit.interruption_info.is_nmi() => {
             if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
                 (ExitEvent::NmiInjected, injected)
             } else {
@@ -276,7 +344,7 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         EXIT_REASON_EPT_VIOLATION
             if exit.protected_page != 0
                 && exit.guest_physical & !0xFFF == exit.protected_page
-                && is_protected_write(exit.exit_qualification)
+                && exit.exit_qualification.is_protected_write()
                 && state.ept_writes_granted == 0 =>
         {
             (
