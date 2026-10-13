@@ -59,6 +59,7 @@ fn only_vm_fail_valid_has_an_instruction_error_to_read() {
         VmcsError::ResumeReturned,
         VmcsError::AllocationFailed,
     ] {
+        // SAFETY: none of these is VmFailValid, so no VMREAD runs.
         assert_eq!(unsafe { instruction_error_for(error) }, None);
     }
 }

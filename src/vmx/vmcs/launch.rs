@@ -182,14 +182,20 @@ fn decode(value: u64) -> GuestStop {
 /// guest state are fully written. HOST_RSP and HOST_RIP must point at a live
 /// exit stack and handler, and the guest's pages must stay allocated.
 pub unsafe fn launch() -> GuestStop {
+    // SAFETY: the caller guarantees VMX root operation with a fully written
+    // current VMCS, HOST_RSP/HOST_RIP at a live exit stack and handler, and
+    // guest pages that stay allocated.
     let value = unsafe { vmx_launch() };
     match decode(value) {
         GuestStop::LaunchFailed { error, .. } => GuestStop::LaunchFailed {
             error,
+            // SAFETY: still in VMX operation with the VMCS current; teardown
+            // has not run yet.
             instruction_error: unsafe { instruction_error_for(error) },
         },
         GuestStop::ResumeFailed { error, .. } => GuestStop::ResumeFailed {
             error,
+            // SAFETY: as above.
             instruction_error: unsafe { instruction_error_for(error) },
         },
         stop => stop,

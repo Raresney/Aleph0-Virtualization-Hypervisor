@@ -138,7 +138,9 @@ unsafe extern "C" {
 fn guest_code() -> &'static [u8] {
     let start = &raw const guest_code_start;
     let end = &raw const guest_code_end;
-    // Both labels come from the one asm block above, start before end.
+    // SAFETY: both labels come from the one asm block above, start before
+    // end, so the range is the assembled code: initialised, in the image for
+    // as long as it runs, and never written.
     unsafe { core::slice::from_raw_parts(start, end.offset_from(start) as usize) }
 }
 
@@ -147,7 +149,8 @@ fn guest_code() -> &'static [u8] {
 fn nmi_handler_offset() -> usize {
     let start = &raw const guest_code_start;
     let handler = &raw const guest_nmi_handler;
-    // Both labels come from the one asm block above, start before handler.
+    // SAFETY: both labels come from the one asm block above, so they point
+    // into the same object, start before handler.
     unsafe { handler.offset_from(start) as usize }
 }
 
@@ -320,12 +323,18 @@ impl GuestMemory {
         let stack = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::StackAllocationFailed)?;
         let idt = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::IdtAllocationFailed)?;
 
+        // SAFETY: `code` is a fresh two-page allocation, and the code is at
+        // most one page (checked above).
         unsafe { core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code.as_ptr(), code_bytes.len()) };
         let memory = Self { code, stack, idt };
-        // The data page is 4 KiB-aligned, so a u32 at its start is aligned.
+        // SAFETY: the data page is the second page of the fresh `code`
+        // allocation, 4 KiB-aligned, so a u32 at its start is in bounds and
+        // aligned.
         unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
         let gate = interrupt_gate(memory.nmi_handler(), segment::read_cs());
+        // SAFETY: `idt` is a fresh page, and the gate ends within the IDT
+        // limit (asserted at compile time), far inside it.
         unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_GATE_OFFSET), GATE_SIZE) };
         Ok(memory)
     }
@@ -355,6 +364,8 @@ impl GuestMemory {
 
     /// Top of the downward-growing guest stack, for GUEST_RSP.
     pub fn stack_top(&self) -> u64 {
+        // SAFETY: the stack is one page, so this is one past its end, which
+        // `add` allows.
         let top = unsafe { self.stack.as_ptr().add(PAGE_SIZE) } as usize;
         assert_eq!(top % 16, 0);
         top as u64
@@ -390,10 +401,13 @@ impl GuestMemory {
     /// Boot services must still be active; see [`paging::walk_current`].
     pub unsafe fn check_mappings(&self) -> Result<GuestMappings, GuestMemoryError> {
         let stack_base = self.stack.as_ptr() as u64;
-        let code = unsafe { paging::walk_current(self.code_base()) }.map_err(GuestMemoryError::CodeNotMapped)?;
-        let stack = unsafe { paging::walk_current(stack_base) }.map_err(GuestMemoryError::StackNotMapped)?;
-        let idt = unsafe { paging::walk_current(self.idt().base) }.map_err(GuestMemoryError::IdtNotMapped)?;
-        let data = unsafe { paging::walk_current(self.data_page()) }.map_err(GuestMemoryError::DataNotMapped)?;
+        // SAFETY: the caller guarantees boot services are active, which is
+        // what `walk_current` needs.
+        let walk = |address| unsafe { paging::walk_current(address) };
+        let code = walk(self.code_base()).map_err(GuestMemoryError::CodeNotMapped)?;
+        let stack = walk(stack_base).map_err(GuestMemoryError::StackNotMapped)?;
+        let idt = walk(self.idt().base).map_err(GuestMemoryError::IdtNotMapped)?;
+        let data = walk(self.data_page()).map_err(GuestMemoryError::DataNotMapped)?;
         for (virtual_address, mapping) in [
             (self.code_base(), &code),
             (stack_base, &stack),

@@ -39,5 +39,6 @@ fn tss_descriptor_round_trips_through_gdt_decoder() {
         limit: gdt.len() as u16 - 1,
     };
 
+    // SAFETY: `table` describes `gdt`, a live local array.
     assert_eq!(unsafe { segment_base_from_gdt(&table, 0x10) }, BASE);
 }

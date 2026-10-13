@@ -64,6 +64,8 @@ impl TssRegion {
     pub fn allocate() -> Result<Self, TssError> {
         let page = allocate_zeroed_page(TssError::AllocationFailed)?;
         let tss = page.cast::<Tss>().as_ptr();
+        // SAFETY: `page` is a fresh, zeroed page, larger than a `Tss`. The
+        // write is unaligned because `Tss` is packed.
         unsafe {
             ptr::addr_of_mut!((*tss).iomap_base).write_unaligned(core::mem::size_of::<Tss>() as u16);
         }
@@ -136,6 +138,10 @@ impl GdtRegion {
     /// and that table must remain stable while it is copied.
     pub unsafe fn copy_active() -> Result<Self, GdtError> {
         let page = allocate_zeroed_page(GdtError::AllocationFailed)?;
+        // SAFETY: `page` was just allocated and nothing refers to it, so it
+        // may be freed; the copy reads the active GDT, which the caller
+        // guarantees is readable through its limit, into the page, which it
+        // fits (checked first).
         unsafe {
             let descriptor_table = read_gdtr();
             let original_length = descriptor_table.limit as usize + 1;
@@ -187,6 +193,8 @@ impl GdtRegion {
 
         let descriptor = tss_descriptor(tss_region.base(), (core::mem::size_of::<Tss>() - 1) as u32);
 
+        // SAFETY: the 16 bytes at `offset` lie within the GDT page (checked
+        // above), which this region owns; the CPU does not use the copy yet.
         unsafe {
             copy_nonoverlapping(descriptor.as_ptr(), self.page.as_ptr().add(offset), descriptor.len());
         }
@@ -274,11 +282,12 @@ impl GdtRegion {
 
         let loaded_gdtr = read_gdtr();
         let loaded_tr = read_tr();
-        // SAFETY: `loaded_gdtr` is the copied GDT, which this region owns.
-        if loaded_gdtr != gdtr
-            || loaded_tr != selector
-            || unsafe { segment_base_from_gdt(&loaded_gdtr, loaded_tr) } != tss_region.base()
-        {
+        if loaded_gdtr != gdtr || loaded_tr != selector {
+            return Err(GdtError::ActivationVerificationFailed);
+        }
+        // SAFETY: `loaded_gdtr` is the copied GDT (checked above), which this
+        // region owns.
+        if unsafe { segment_base_from_gdt(&loaded_gdtr, loaded_tr) } != tss_region.base() {
             return Err(GdtError::ActivationVerificationFailed);
         }
 

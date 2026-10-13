@@ -158,14 +158,21 @@ impl GuestState {
     /// current VMCS (they decide whether PAT and EFER are needed). The host
     /// GDT must be live and stable.
     pub unsafe fn from_current(rip: u64, rsp: u64, idtr: DescriptorTable) -> Result<Self, GuestStateError> {
+        // SAFETY: the caller guarantees a live, stable host GDT, and UEFI
+        // runs in long mode.
         let host = unsafe { segment::read_all() };
         let gdt = &host.gdtr;
+        // SAFETY: the caller guarantees VMX operation with a current VMCS.
         let entry_controls =
             unsafe { vmcs::vmread(fields::VM_ENTRY_CONTROLS) }.map_err(|error| GuestStateError::Vmcs {
                 field: fields::VM_ENTRY_CONTROLS,
                 error,
             })?;
 
+        // SAFETY: `gdt` is the live host GDT (the caller's obligation). The
+        // SYSENTER MSRs exist on every x86_64 CPU; PAT and EFER are read only
+        // when the entry controls load them, which the CPU allows only if it
+        // has them.
         let state = unsafe {
             Self {
                 rip,
@@ -286,6 +293,7 @@ impl GuestState {
             (GUEST_PENDING_DEBUG_EXCEPTIONS, 0),
         ];
 
+        // SAFETY: the caller guarantees VMX operation with a current VMCS.
         unsafe {
             for (segment, selector, base, limit, access_rights) in segments {
                 write_field(selector, segment.selector.into())?;
@@ -311,6 +319,10 @@ impl GuestState {
 ///
 /// `base` overrides the descriptor's base: FS and GS keep theirs in MSRs,
 /// and TR's is 64 bits wide in a 16-byte descriptor.
+///
+/// # Safety
+///
+/// `gdt` must describe a live, readable GDT through its limit.
 unsafe fn segment_from_gdt(
     gdt: &DescriptorTable,
     selector: u16,
@@ -320,6 +332,7 @@ unsafe fn segment_from_gdt(
     if selector & !segment::SELECTOR_RPL == 0 {
         return Ok(GuestSegment::unusable(selector, base.unwrap_or(0)));
     }
+    // SAFETY: the caller guarantees `gdt` is live and readable.
     let descriptor =
         unsafe { segment::read_descriptor(gdt, selector) }.ok_or(GuestStateError::BadSelector { selector })?;
     let base = base.unwrap_or_else(|| descriptor.base());
@@ -344,7 +357,12 @@ fn check_segments(cs: &GuestSegment, tr: &GuestSegment) -> Result<(), GuestState
 }
 
 /// Writes one field and verifies it by reading it back.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
 unsafe fn write_field(field: u32, value: u64) -> Result<(), GuestStateError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     unsafe { vmcs::write_verified(field, value) }.map_err(|error| GuestStateError::Vmcs { field, error })
 }
 

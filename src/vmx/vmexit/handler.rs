@@ -282,6 +282,8 @@ fn prepare_resume(
             crate::serial_println!("{tag} VM exit #{number}: instruction length unreadable; not resuming.");
             return None;
         };
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current.
         if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, rip + length) } {
             crate::serial_println!("{tag} VM exit #{number}: could not advance guest RIP ({error:?}); not resuming.");
             return None;
@@ -295,6 +297,8 @@ fn prepare_resume(
     };
 
     if inject_nmi
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current.
         && let Err(error) = unsafe { vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, InterruptionInfo::NMI.0.into()) }
     {
         crate::serial_println!(
@@ -303,6 +307,9 @@ fn prepare_resume(
         return None;
     }
     if let Some(on) = nmi_window
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current. `configure_controls` checked that the CPU allows
+        // NMI-window exiting.
         && let Err(error) = unsafe { vmcs::set_nmi_window_exiting(on) }
     {
         crate::serial_println!(
@@ -316,6 +323,9 @@ fn prepare_resume(
             crate::serial_println!("{tag} VM exit #{number}: no protected page to make writable; not resuming.");
             return None;
         };
+        // SAFETY: exit context: VMX root operation, guest stopped. `page`
+        // came from `ept::protected_page`, so `Ept::build` made the tables,
+        // which are never freed.
         match unsafe { page.grant_write() } {
             Ok(invept) => Some(invept),
             Err(error) => {
@@ -341,7 +351,8 @@ fn prepare_resume(
 extern "efiapi" fn vmresume_failed(rflags: u64) -> u64 {
     let tag = crate::TAG;
     match vmcs::resume_failure(rflags) {
-        // VmFailValid implies a current VMCS, so the error number is readable.
+        // SAFETY: a VmFailValid implies VMX operation with a current VMCS,
+        // so the error number is readable.
         VmcsError::VmFailValid => match unsafe { vmcs::vm_instruction_error() } {
             Ok(code) => crate::serial_println!(
                 "{tag} VMRESUME failed: {} ({code})",

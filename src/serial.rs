@@ -164,6 +164,8 @@ pub const fn divisor(baud: u32) -> u16 {
 /// Port writes reach hardware directly; the port must belong to a device
 /// this code owns.
 unsafe fn outb(port: u16, value: u8) {
+    // SAFETY: OUT touches only the I/O port, which the caller guarantees
+    // belongs to a device this code owns.
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
     }
@@ -182,6 +184,8 @@ unsafe fn outb(port: u16, value: u8) {
 /// this code owns.
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
+    // SAFETY: IN touches only the I/O port, which the caller guarantees
+    // belongs to a device this code owns.
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
     }
@@ -204,6 +208,8 @@ pub enum SerialError {
 pub fn init() -> Result<(), SerialError> {
     let [divisor_low, divisor_high] = divisor(115_200).to_le_bytes();
 
+    // SAFETY: every port below is a COM1 register, the UART this driver
+    // owns.
     unsafe {
         // Step 2a: no UART interrupts. This driver polls the status
         // register instead, and no interrupt handler exists.
@@ -269,6 +275,8 @@ pub fn write_byte(byte: u8) {
         return;
     }
 
+    // SAFETY: COM1's status and data registers, the UART this driver
+    // owns; `init` found it there.
     unsafe {
         // Wait for "can take a byte", but never forever: a missing or
         // stuck UART must not hang the hypervisor.

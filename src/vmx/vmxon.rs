@@ -71,6 +71,10 @@ impl VmxOperation {
     /// region is never reused. No VMX instruction may run after this
     /// succeeds.
     pub unsafe fn leave(self) -> Result<(), VmxFail> {
+        // SAFETY: this value exists only after VMXON succeeded, so the CPU
+        // is in VMX root operation; the caller guarantees no VMX instruction
+        // follows. CR0/CR4 get back the values the code ran with before
+        // VMXON, legal again once VMX operation has ended.
         unsafe {
             vmxoff()?;
             cr::write_cr0(self.original_cr0);
@@ -81,7 +85,16 @@ impl VmxOperation {
 }
 
 /// Forces CR0 and CR4 into the ranges the CPU requires for VMX operation.
+///
+/// # Safety
+///
+/// The CPU must support VMX (the FIXED MSRs exist only then), and the
+/// running code must keep working with the bits VMX operation forces (in
+/// practice CR0.PE, CR0.PG, CR0.NE and CR4.VMXE, which UEFI already has, or
+/// does not mind).
 pub unsafe fn apply_fixed_bits() {
+    // SAFETY: the caller guarantees VMX support, so the FIXED MSRs exist,
+    // and that the running code can go on with the bits they force.
     unsafe {
         let cr0 = (cr::read_cr0() | msr::rdmsr(msr::IA32_VMX_CR0_FIXED0)) & msr::rdmsr(msr::IA32_VMX_CR0_FIXED1);
         let cr4 = (cr::read_cr4() | msr::rdmsr(msr::IA32_VMX_CR4_FIXED0)) & msr::rdmsr(msr::IA32_VMX_CR4_FIXED1);
@@ -119,7 +132,16 @@ unsafe fn vmxoff() -> Result<(), VmxFail> {
 ///
 /// If VMXON fails, CR0 and CR4 are restored, so CR4.VMXE is not left set
 /// outside VMX operation.
+///
+/// # Safety
+///
+/// The CPU must support VMX with IA32_FEATURE_CONTROL allowing it outside
+/// SMX ([`super::detect`]), and must not be in VMX operation already.
 pub unsafe fn enter_vmx_root_operation() -> Result<VmxOperation, VmxOnError> {
+    // SAFETY: the caller guarantees VMX support and that this CPU is not
+    // in VMX operation yet. CR0/CR4 change only to what VMXON needs, and
+    // go back if it fails; the region outlives VMX operation, since
+    // `VmxOperation` owns it.
     unsafe {
         let region_size = (msr::rdmsr(msr::IA32_VMX_BASIC) >> 32) & 0x1fff;
         if region_size == 0 || region_size > PAGE_SIZE as u64 {

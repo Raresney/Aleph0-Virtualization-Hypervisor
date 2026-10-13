@@ -32,7 +32,15 @@ pub const EFER_NXE: u64 = 1 << 11;
 pub const IA32_FS_BASE: u32 = 0xC000_0100;
 pub const IA32_GS_BASE: u32 = 0xC000_0101;
 
+/// Reads IA32_FEATURE_CONTROL.
+///
+/// # Safety
+///
+/// The CPU must support VMX or SMX (CPUID), or the MSR may not exist and the
+/// read raises #GP.
 pub unsafe fn read_feature_control() -> u64 {
+    // SAFETY: the caller guarantees VMX or SMX support, so the MSR exists;
+    // reading it has no side effects.
     unsafe { rdmsr(IA32_FEATURE_CONTROL) }
 }
 
@@ -40,7 +48,12 @@ pub unsafe fn read_feature_control() -> u64 {
 ///
 /// The IA32_FEATURE_CONTROL MSR must be locked and the
 /// VMX-outside-SMX bit (bit 2) must be set.
+///
+/// # Safety
+///
+/// As for [`read_feature_control`]: the CPU must support VMX or SMX.
 pub unsafe fn feature_control_vmx_enabled() -> bool {
+    // SAFETY: the caller's obligation, as for `read_feature_control`.
     let value = unsafe { read_feature_control() };
 
     let locked = value & LOCK_BIT != 0;
@@ -202,9 +215,16 @@ pub const IA32_VMX_CR4_FIXED0: u32 = 0x488;
 pub const IA32_VMX_CR4_FIXED1: u32 = 0x489;
 
 /// Reads an arbitrary MSR.
+///
+/// # Safety
+///
+/// `msr` must exist on this CPU, or RDMSR raises #GP. A few MSRs change
+/// state when read; reading one of those must be what the caller wants.
 pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
 
+    // SAFETY: RDMSR only reads the MSR; the caller guarantees it exists
+    // and that reading it is harmless.
     unsafe {
         asm!(
             "rdmsr",

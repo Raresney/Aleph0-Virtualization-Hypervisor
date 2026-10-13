@@ -303,6 +303,8 @@ pub unsafe fn walk_current(virtual_address: u64) -> Result<Mapping, WalkError> {
         return Err(WalkError::FiveLevelPaging);
     }
     let cr3 = read_cr3();
+    // SAFETY: the caller guarantees boot services are active, so the tables
+    // are identity-mapped and each entry is readable at its physical address.
     walk(cr3, virtual_address, |physical| unsafe {
         (physical as *const u64).read_volatile()
     })

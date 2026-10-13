@@ -83,8 +83,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 #[cfg(not(test))]
 pub fn halt_forever() -> ! {
     loop {
-        // `nomem`/`nostack`: no memory or stack access. `preserves_flags` is
-        // deliberately absent, because CLI changes RFLAGS.
+        // SAFETY: CLI and HLT only stop this CPU, which is what this
+        // function is for; they touch no memory (`nomem`) and no stack
+        // (`nostack`). `preserves_flags` is deliberately absent, because CLI
+        // changes RFLAGS.
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
     }
 }

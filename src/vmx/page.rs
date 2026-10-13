@@ -31,6 +31,8 @@ pub fn allocate_zeroed_pages_of_type<E>(
         0,
         "UEFI returned an unaligned page"
     );
+    // SAFETY: `allocate_pages` returned `count` pages at `pages`, which
+    // nothing else uses yet.
     unsafe { pages.write_bytes(0, count * PAGE_SIZE) };
     Ok(pages)
 }

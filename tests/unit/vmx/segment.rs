@@ -20,12 +20,14 @@ fn null_and_ldt_selectors_return_zero() {
     let gdt = table(&gdt);
     for selector in [0x0, 0x1, 0x3] {
         assert_eq!(
+            // SAFETY: `gdt` describes a live local array.
             unsafe { segment_base_from_gdt(&gdt, selector) },
             0,
             "selector {selector:#x}"
         );
     }
     // TI=1 names the LDT, which this decoder does not read.
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { segment_base_from_gdt(&gdt, 0x0C) }, 0);
 }
 
@@ -34,6 +36,7 @@ fn selector_past_limit_returns_zero() {
     // The 16-byte TSS descriptor at 0x10 needs 16 bytes; only 8 are inside
     // the limit.
     let gdt = [0xFFu8; 24];
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { segment_base_from_gdt(&table(&gdt), 0x10) }, 0);
 }
 
@@ -45,7 +48,9 @@ fn rpl_bits_are_ignored() {
     gdt[0x10 + 4] = 0x34;
     gdt[0x10 + 7] = 0x12;
     let gdt = table(&gdt);
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { segment_base_from_gdt(&gdt, 0x10) }, 0x1234_5678);
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { segment_base_from_gdt(&gdt, 0x13) }, 0x1234_5678);
 }
 
@@ -85,9 +90,13 @@ fn scattered_base_and_byte_limit_decode() {
 fn read_descriptor_rejects_null_ldt_and_out_of_range() {
     let gdt = [0xFFu8; 24];
     let gdt = table(&gdt);
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { read_descriptor(&gdt, 0x00) }, None);
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { read_descriptor(&gdt, 0x03) }, None, "null with RPL 3");
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { read_descriptor(&gdt, 0x0C) }, None, "TI=1 names the LDT");
+    // SAFETY: `gdt` describes a live local array.
     assert_eq!(unsafe { read_descriptor(&gdt, 0x18) }, None, "past the limit");
 }
 
@@ -97,10 +106,12 @@ fn read_descriptor_ignores_rpl() {
     gdt[0x10..0x18].copy_from_slice(&FLAT_DATA.to_le_bytes());
     let gdt = table(&gdt);
     assert_eq!(
+        // SAFETY: `gdt` describes a live local array.
         unsafe { read_descriptor(&gdt, 0x10) },
         Some(SegmentDescriptor(FLAT_DATA))
     );
     assert_eq!(
+        // SAFETY: `gdt` describes a live local array.
         unsafe { read_descriptor(&gdt, 0x13) },
         Some(SegmentDescriptor(FLAT_DATA))
     );

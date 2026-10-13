@@ -132,12 +132,16 @@ pub fn run() -> Result<GuestRun, BringUpError> {
     } = entry;
 
     // From here on every path goes through teardown before returning.
-    // Only legal now: the VMCS instructions raise #UD outside VMX operation.
+    // SAFETY: VMXON succeeded in `enter_vmx`, so this CPU is in VMX root
+    // operation; outside it the VMCS instructions would raise #UD.
     let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
     let result = match &vmcs {
         Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &ept, &host_tables),
         Err(error) => Err(*error),
     };
+    // SAFETY: `vmx_operation` is this CPU's and `vmcs` its only VMCS; the
+    // guest is not running (launch returned, or never happened); `firmware`
+    // was read from the live tables before activation.
     let left = unsafe { teardown::teardown(vmx_operation, vmcs.as_ref().ok(), &firmware) };
 
     // A failure before teardown explains more than one during it; a
@@ -183,12 +187,14 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
         guest.idt().limit,
         guest.nmi_handler(),
     );
+    // SAFETY: boot services are still active.
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
 
     let (controls, invept) = check_vmx_support()?;
 
-    // The identity mapping makes the data page's address its GPA.
+    // SAFETY: boot services are still active, and UEFI identity-maps
+    // memory, which also makes the data page's address its GPA.
     let ept = unsafe { Ept::build(guest.data_page(), invept) }?;
     report::ept(&ept, guest.data_page());
 
@@ -199,6 +205,8 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
         idtr: host_tables.idtr,
         interrupts_enabled: teardown::interrupts_enabled(),
     };
+    // SAFETY: `check_vmx_support` confirmed VMX support and enablement, and
+    // nothing has entered VMX operation yet.
     let vmx_operation = unsafe { vmx::vmxon::enter_vmx_root_operation() }?;
     log!("Entered VMX root operation.");
 
@@ -222,6 +230,8 @@ fn activate_host_tables() -> Result<HostTables, BringUpError> {
     let tss = TssRegion::allocate()?;
     log!("Host TSS allocated at {:#018x}; TR not loaded yet.", tss.base());
 
+    // SAFETY: the active GDTR is the firmware's, live and readable through
+    // its limit, and nothing changes it while it is copied.
     let mut gdt = unsafe { GdtRegion::copy_active() }?;
     log!("Host GDT copied at {:#018x}.", gdt.base());
 
@@ -239,6 +249,10 @@ fn activate_host_tables() -> Result<HostTables, BringUpError> {
         prepared.limit,
     );
 
+    // SAFETY: `HostTables` keeps the GDT and TSS pages, which are never
+    // freed; the copy keeps the firmware's descriptors, so the active
+    // selectors stay usable; the firmware IDT is live; and this is the only
+    // activation.
     unsafe { gdt.activate(&tss) }?;
     log!("Host GDT and TSS activated and verified.");
 
@@ -257,7 +271,7 @@ fn activate_host_tables() -> Result<HostTables, BringUpError> {
 /// and checks that the CPU supports the EPT Aleph0 builds. Returns the MSRs
 /// and the INVEPT type to use.
 fn check_vmx_support() -> Result<(VmcsControlMsrs, InveptType), BringUpError> {
-    match unsafe { vmx::detect() } {
+    match vmx::detect() {
         VmxCapabilities::Supported => {
             log!("VMX supported and enabled by firmware.");
         }
@@ -265,6 +279,7 @@ fn check_vmx_support() -> Result<(VmcsControlMsrs, InveptType), BringUpError> {
         VmxCapabilities::DisabledByFirmware => return Err(BringUpError::VmxDisabledByFirmware),
     }
 
+    // SAFETY: `detect` just confirmed VMX support.
     let controls = unsafe { vmx::msr::read_vmcs_control_msrs() };
     report::vmx_capabilities(&controls);
 
@@ -289,6 +304,9 @@ fn launch_guest(
     check_host_tables_preserved(host_tables)?;
 
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
+    // SAFETY: `prepare_vmcs` wrote the controls, the host state
+    // (HOST_RSP/HOST_RIP at the live exit stack and handler) and the guest
+    // state; the exit stack, guest pages and EPT tables are never freed.
     guest_result(unsafe { vmx::vmcs::launch() })
 }
 
@@ -300,20 +318,30 @@ fn prepare_vmcs(
     guest: &GuestMemory,
     ept: &Ept,
 ) -> Result<(), BringUpError> {
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current.
     unsafe { vmx::vmcs::self_test() }.map_err(vmcs_step("self-test"))?;
     log!("VMCS self-test passed: VMREAD returned what VMWRITE stored.");
 
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current.
     unsafe { vmx::vmcs::configure_controls(controls, DesiredControls::minimal_64_bit_guest()) }
         .map_err(vmcs_step("control setup"))?;
     log!("VMCS controls written and read back successfully.");
 
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current. The EPT tables are never freed.
     unsafe { vmx::vmcs::set_ept_pointer(ept.eptp()) }.map_err(vmcs_step("EPT pointer setup"))?;
     log!(
         "VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.",
         ept.eptp().raw()
     );
 
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current. The host GDT and TSS were activated first and are never freed.
     unsafe { vmx::vmcs::configure_host_state() }.map_err(vmcs_step("host-state setup"))?;
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current.
     let exit_controls = unsafe { vmx::vmcs::vmread(vmx::vmcs::fields::VM_EXIT_CONTROLS) }
         .map_err(vmcs_step("exit-control readback"))?;
     log!(
@@ -322,13 +350,20 @@ fn prepare_vmcs(
         exit_controls & vmx::vmcs::fields::VM_EXIT_LOAD_IA32_EFER != 0,
     );
 
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current. The exit stack and the handler stay in place for as long as
+    // the guest can exit.
     unsafe { vmx::vmcs::configure_host_entry(vmexit_stack.top(), vmx::vmexit::entry_address()) }
         .map_err(vmcs_step("host entry address setup"))?;
     log!("VMCS HOST_RSP/HOST_RIP written and read back; VM entry not attempted.");
 
     // After the controls: they decide whether guest PAT/EFER fields exist.
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current. The controls are written, and the host GDT is live and stable.
     let guest_state = unsafe { GuestState::from_current(guest.code_base(), guest.stack_top(), guest.idt()) }
         .map_err(guest_state_error)?;
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current.
     unsafe { guest_state.write() }.map_err(guest_state_error)?;
     report::guest_state(&guest_state);
 
@@ -368,9 +403,11 @@ fn check_host_tables_preserved(expected: &HostTables) -> Result<(), BringUpError
     let idtr = vmx::segment::read_idtr();
     let same_gdtr = gdtr == expected.gdtr;
     let same_idtr = idtr == expected.idtr;
-    let same_tss_base = same_gdtr
-        && tr == expected.tr
-        && unsafe { vmx::segment::segment_base_from_gdt(&gdtr, tr) } == expected.tss_base;
+    let same_tss_base = same_gdtr && tr == expected.tr && {
+        // SAFETY: `gdtr` is Aleph0's own GDT (`same_gdtr`), live and never
+        // freed.
+        unsafe { vmx::segment::segment_base_from_gdt(&gdtr, tr) == expected.tss_base }
+    };
 
     if same_gdtr && same_idtr && same_tss_base {
         log!("Host GDTR, TR, TSS base and IDTR preserved after VMX/UEFI calls.");

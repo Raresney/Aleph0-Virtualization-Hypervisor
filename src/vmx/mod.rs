@@ -46,19 +46,16 @@ pub enum VmxCapabilities {
 ///
 /// Checks CPUID first; the MSR check only runs if CPUID confirms VMX
 /// support, since IA32_FEATURE_CONTROL isn't guaranteed to exist otherwise.
-pub unsafe fn detect() -> VmxCapabilities {
+/// That order is what makes this safe to call on any CPU.
+pub fn detect() -> VmxCapabilities {
     if !cpuid::is_vmx_supported() {
         return VmxCapabilities::NotSupportedByCpu;
     }
 
-    let result: VmxCapabilities;
-    unsafe {
-        if msr::feature_control_vmx_enabled() {
-            result = VmxCapabilities::Supported;
-        } else {
-            result = VmxCapabilities::DisabledByFirmware;
-        }
+    // SAFETY: CPUID reports VMX, so IA32_FEATURE_CONTROL exists.
+    if unsafe { msr::feature_control_vmx_enabled() } {
+        VmxCapabilities::Supported
+    } else {
+        VmxCapabilities::DisabledByFirmware
     }
-
-    result
 }

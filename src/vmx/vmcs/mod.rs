@@ -200,10 +200,17 @@ impl VmcsRegion {
 ///
 /// Operand order is the opposite of [`vmwrite`]: `VMREAD dest, field`, so the
 /// destination register comes first and the encoding second.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU; outside VMX
+/// operation VMREAD raises #UD.
 pub unsafe fn vmread(field_encoding: u32) -> Result<u64, VmcsError> {
     let value: u64;
     let rflags: u64;
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS;
+    // VMREAD writes only `value` and RFLAGS.
     unsafe {
         asm!(
             "vmread {value}, {field:r}",
@@ -227,9 +234,17 @@ pub unsafe fn vmread(field_encoding: u32) -> Result<u64, VmcsError> {
 ///
 /// Operand order is `VMWRITE field, value` — the encoding comes first, which
 /// reads backwards compared to a normal `mov`.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU. The value
+/// takes effect at the next VM entry or exit, so it must be one the rest of
+/// Aleph0 expects in that field.
 pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> {
     let rflags: u64;
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS,
+    // and that the value suits the field; VMWRITE changes only the VMCS.
     unsafe {
         asm!(
             "vmwrite {field:r}, {value}",
@@ -362,13 +377,21 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
 /// VMX operation must be active, a VMCS must be current on this CPU, and the
 /// host GDT and TSS must already be active and remain valid on VM exit.
 pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees the host GDT is active and live, and UEFI
+    // runs in long mode.
     let segments = unsafe { segment::read_all() };
     let cr0 = cr::read_cr0();
     let cr3 = cr::read_cr3();
     let cr4 = cr::read_cr4();
-    let sysenter_cs = u64::from(unsafe { msr::rdmsr(msr::IA32_SYSENTER_CS) } as u32);
-    let sysenter_esp = unsafe { msr::rdmsr(msr::IA32_SYSENTER_ESP) };
-    let sysenter_eip = unsafe { msr::rdmsr(msr::IA32_SYSENTER_EIP) };
+    // SAFETY: the SYSENTER MSRs exist on every x86_64 CPU, and reading
+    // them has no side effects.
+    let (sysenter_cs, sysenter_esp, sysenter_eip) = unsafe {
+        (
+            u64::from(msr::rdmsr(msr::IA32_SYSENTER_CS) as u32),
+            msr::rdmsr(msr::IA32_SYSENTER_ESP),
+            msr::rdmsr(msr::IA32_SYSENTER_EIP),
+        )
+    };
 
     // VM entry requires every host selector to have RPL and TI clear, and
     // CS and TR to be non-null.
@@ -394,8 +417,12 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     if segments.cs == 0 || segments.tr == 0 {
         return Err(VmcsError::HostStateValidation);
     }
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     let exit_controls = unsafe { vmread(VM_EXIT_CONTROLS)? };
 
+    // SAFETY: the caller guarantees VMX operation with a current VMCS. PAT
+    // and EFER are read only when the exit controls load them, which the CPU
+    // allows only if it has them.
     // Host PAT and EFER are written only when the exit controls load them.
     // HOST_RSP and HOST_RIP come later, from `configure_host_entry`.
     unsafe {
@@ -466,7 +493,10 @@ fn with_nmi_window_exiting(primary: u64, on: bool) -> u64 {
 /// VMX operation with a current VMCS. `configure_controls` has checked that
 /// the CPU allows the bit.
 pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     let primary = unsafe { vmread(PRIMARY_VM_EXEC_CONTROL)? };
+    // SAFETY: the caller guarantees VMX operation with a current VMCS. Only
+    // the NMI-window bit changes, which the caller checked the CPU allows.
     unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
 }
 
@@ -492,8 +522,13 @@ pub unsafe fn set_ept_pointer(eptp: Eptp) -> Result<(), VmcsError> {
 ///
 /// Never call this to diagnose a failed [`vmread`]: this *is* a `vmread`, so
 /// it would fail the same way and recurse.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
 pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
     // VM_INSTRUCTION_ERROR is a 32-bit field; VMREAD zero-extends it.
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
     Ok(unsafe { vmread(VM_INSTRUCTION_ERROR)? } as u32)
 }
 
@@ -512,6 +547,9 @@ pub unsafe fn vm_instruction_error() -> Result<u32, VmcsError> {
 /// either.
 pub unsafe fn instruction_error_for(error: VmcsError) -> Option<u32> {
     if error == VmcsError::VmFailValid {
+        // SAFETY: a VmFailValid comes from a VMX instruction run in VMX
+        // operation with a current VMCS, which the caller guarantees is still
+        // current.
         unsafe { vm_instruction_error() }.ok()
     } else {
         None
@@ -543,8 +581,12 @@ pub fn vm_instruction_error_name(error: u32) -> &'static str {
 /// Proves the access path to the current VMCS works: write a field, read
 /// it back.
 ///
-/// Requires VMX operation and a current VMCS ([`VmcsRegion::create_current`]).
 /// Leaves the test pattern in GUEST_RIP; guest-state setup overwrites it.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU
+/// ([`VmcsRegion::create_current`]).
 pub unsafe fn self_test() -> Result<(), VmcsError> {
     // Bits set in both halves, so a write that only lands in the low 32 bits
     // is caught. Canonical (bits 63:47 clear), which GUEST_RIP will need once

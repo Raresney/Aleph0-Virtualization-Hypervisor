@@ -16,6 +16,8 @@ use crate::vmx::vmcs::{self, VmcsError};
 
 /// Reads one VMCS field for the diagnostic, printing instead of failing.
 pub(super) fn read_or_report(name: &str, field: u32) -> Option<u64> {
+    // SAFETY: exit context: VMX root operation, with the guest's VMCS
+    // current.
     match unsafe { vmcs::vmread(field) } {
         Ok(value) => Some(value),
         Err(error) => {

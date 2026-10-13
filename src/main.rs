@@ -2,6 +2,9 @@
 // the test harness; the UEFI build is no_std with a firmware entry point.
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
+// Every `unsafe` block says why it is sound here (`// SAFETY:`), and every
+// `unsafe fn` lists its callers' obligations (`# Safety`).
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use core::time::Duration;
 

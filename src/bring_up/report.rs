@@ -12,6 +12,8 @@ use crate::vmx::msr::VmcsControlMsrs;
 ///
 /// TR is the one to watch: VM entry rejects a host TR selector of 0.
 pub(super) fn segment_state() {
+    // SAFETY: the host GDT is live (activated by bring-up, never freed), and
+    // UEFI runs in long mode.
     let state = unsafe { vmx::segment::read_all() };
 
     log!(
@@ -108,6 +110,8 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
 
     // The guest shares these tables, so a guest EFER.NXE that differs from
     // the host's would turn any XD bit in them into a reserved-bit fault.
+    // SAFETY: IA32_EFER exists on every x86_64 CPU, and reading it has no
+    // side effects.
     let nxe = unsafe { vmx::msr::rdmsr(vmx::msr::IA32_EFER) } & vmx::msr::EFER_NXE != 0;
     let cr4 = vmx::cr::read_cr4();
     log!(
