@@ -16,19 +16,29 @@ pub(super) fn segment_state() {
 
     log!(
         "segments: cs={:#06x} ss={:#06x} ds={:#06x} es={:#06x} fs={:#06x} gs={:#06x} tr={:#06x}",
-        state.cs, state.ss, state.ds, state.es, state.fs, state.gs, state.tr,
+        state.cs,
+        state.ss,
+        state.ds,
+        state.es,
+        state.fs,
+        state.gs,
+        state.tr,
     );
     log!(
         "bases:    fs={:#018x} gs={:#018x} tr={:#018x}",
-        state.fs_base, state.gs_base, state.tr_base,
+        state.fs_base,
+        state.gs_base,
+        state.tr_base,
     );
     log!(
         "gdtr:     base={:#018x} limit={:#06x}",
-        state.gdtr.base, state.gdtr.limit,
+        state.gdtr.base,
+        state.gdtr.limit,
     );
     log!(
         "idtr:     base={:#018x} limit={:#06x}",
-        state.idtr.base, state.idtr.limit,
+        state.idtr.base,
+        state.idtr.limit,
     );
 
     if state.tr == 0 {
@@ -42,7 +52,8 @@ pub(super) fn segment_state() {
 pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     log!(
         "VMX BASIC={:#018x}; true controls={}",
-        controls.basic, controls.basic & (1u64 << 55) != 0,
+        controls.basic,
+        controls.basic & (1u64 << 55) != 0,
     );
     for (name, value) in [
         ("pin", controls.pinbased),
@@ -52,12 +63,15 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     ] {
         log!(
             "VMX {name}: required={:#010x} allowed={:#010x}",
-            value as u32, (value >> 32) as u32,
+            value as u32,
+            (value >> 32) as u32,
         );
     }
     log!(
         "VMX secondary: required={:#010x} allowed={:#010x}; EPT/VPID capabilities={:#018x}",
-        controls.secondary as u32, (controls.secondary >> 32) as u32, controls.ept_vpid_cap,
+        controls.secondary as u32,
+        (controls.secondary >> 32) as u32,
+        controls.ept_vpid_cap,
     );
 }
 
@@ -65,7 +79,9 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
 pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
     log!(
         "EPT built: identity 0x0..{:#x} ({} GiB) with 2 MiB pages, {} table pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
-        ept.end(), ept.end() >> 30, ept.table_pages(),
+        ept.end(),
+        ept.end() >> 30,
+        ept.table_pages(),
     );
 }
 
@@ -81,8 +97,12 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     ] {
         log!(
             "Guest {name} page: virt={virtual_address:#018x} phys={:#018x} identity={} size={:?} writable={} user={} xd={}",
-            mapping.physical, mapping.physical == virtual_address, mapping.size,
-            mapping.writable, mapping.user, mapping.execute_disable,
+            mapping.physical,
+            mapping.physical == virtual_address,
+            mapping.size,
+            mapping.writable,
+            mapping.user,
+            mapping.execute_disable,
         );
     }
 
@@ -92,7 +112,8 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     let cr4 = unsafe { vmx::cr::read_cr4() };
     log!(
         "Guest code page executable, stack and data pages writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
-        cr4 & vmx::cr::CR4_SMEP != 0, cr4 & vmx::cr::CR4_SMAP != 0,
+        cr4 & vmx::cr::CR4_SMEP != 0,
+        cr4 & vmx::cr::CR4_SMAP != 0,
     );
 }
 
@@ -102,21 +123,39 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
 pub(super) fn guest_state(state: &GuestState) {
     log!(
         "Guest rip={:#018x} rsp={:#018x} rflags={:#x} cr0={:#x} cr3={:#x} cr4={:#x}",
-        state.rip, state.rsp, state.rflags, state.cr0, state.cr3, state.cr4,
+        state.rip,
+        state.rsp,
+        state.rflags,
+        state.cr0,
+        state.cr3,
+        state.cr4,
     );
     for (name, segment) in [
-        ("cs", state.cs), ("ss", state.ss), ("ds", state.ds), ("es", state.es),
-        ("fs", state.fs), ("gs", state.gs), ("tr", state.tr), ("ldtr", state.ldtr),
+        ("cs", state.cs),
+        ("ss", state.ss),
+        ("ds", state.ds),
+        ("es", state.es),
+        ("fs", state.fs),
+        ("gs", state.gs),
+        ("tr", state.tr),
+        ("ldtr", state.ldtr),
     ] {
         log!(
             "Guest {name:<4} selector={:#06x} base={:#018x} limit={:#010x} access={:#07x}",
-            segment.selector, segment.base, segment.limit, segment.access_rights,
+            segment.selector,
+            segment.base,
+            segment.limit,
+            segment.access_rights,
         );
     }
     log!(
         "Guest gdtr={:#018x}/{:#06x} idtr={:#018x}/{:#06x}; PAT load={} EFER load={}",
-        state.gdtr.base, state.gdtr.limit, state.idtr.base, state.idtr.limit,
-        state.pat.is_some(), state.efer.is_some(),
+        state.gdtr.base,
+        state.gdtr.limit,
+        state.idtr.base,
+        state.idtr.limit,
+        state.pat.is_some(),
+        state.efer.is_some(),
     );
     log!("VMCS guest fields written and read back; VM entry not attempted.");
 }

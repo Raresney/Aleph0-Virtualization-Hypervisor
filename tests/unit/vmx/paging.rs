@@ -30,7 +30,9 @@ impl Tables {
         self
     }
     fn walk(&self, cr3: u64, virtual_address: u64) -> Result<Mapping, WalkError> {
-        walk(cr3, virtual_address, |address| self.0.get(&address).copied().unwrap_or(0))
+        walk(cr3, virtual_address, |address| {
+            self.0.get(&address).copied().unwrap_or(0)
+        })
     }
 }
 
@@ -126,5 +128,8 @@ fn one_gib_page_keeps_offset() {
 fn missing_entry_reports_its_level() {
     let mut tables = four_level_tables();
     tables.set(PD, 3, 0);
-    assert_eq!(tables.walk(PML4, va(1, 2, 3, 4, 0)), Err(WalkError::NotPresent { level: 2 }));
+    assert_eq!(
+        tables.walk(PML4, va(1, 2, 3, 4, 0)),
+        Err(WalkError::NotPresent { level: 2 })
+    );
 }

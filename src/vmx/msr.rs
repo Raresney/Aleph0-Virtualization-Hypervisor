@@ -31,9 +31,7 @@ pub const IA32_FS_BASE: u32 = 0xC000_0100;
 pub const IA32_GS_BASE: u32 = 0xC000_0101;
 
 pub unsafe fn read_feature_control() -> u64 {
-    unsafe {
-        rdmsr(IA32_FEATURE_CONTROL)
-    }
+    unsafe { rdmsr(IA32_FEATURE_CONTROL) }
 }
 
 /// Returns whether VMX is enabled for operation outside SMX.
@@ -48,7 +46,6 @@ pub unsafe fn feature_control_vmx_enabled() -> bool {
 
     locked && vmx_enabled
 }
-
 
 /// IA32_VMX_BASIC. Bits 0..=30: VMCS revision identifier (bit 31 is always 0).
 /// Bit 55: when set, the `IA32_VMX_TRUE_*_CTLS` MSRs exist and should be
@@ -113,11 +110,19 @@ pub unsafe fn read_vmcs_control_msrs() -> VmcsControlMsrs {
         let basic = rdmsr(IA32_VMX_BASIC);
         let use_true_controls = basic & (1u64 << 55) != 0;
         let (pin_id, primary_id, exit_id, entry_id) = if use_true_controls {
-            (IA32_VMX_TRUE_PINBASED_CTLS, IA32_VMX_TRUE_PROCBASED_CTLS,
-            IA32_VMX_TRUE_EXIT_CTLS, IA32_VMX_TRUE_ENTRY_CTLS)
+            (
+                IA32_VMX_TRUE_PINBASED_CTLS,
+                IA32_VMX_TRUE_PROCBASED_CTLS,
+                IA32_VMX_TRUE_EXIT_CTLS,
+                IA32_VMX_TRUE_ENTRY_CTLS,
+            )
         } else {
-            (IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
-            IA32_VMX_EXIT_CTLS, IA32_VMX_ENTRY_CTLS)
+            (
+                IA32_VMX_PINBASED_CTLS,
+                IA32_VMX_PROCBASED_CTLS,
+                IA32_VMX_EXIT_CTLS,
+                IA32_VMX_ENTRY_CTLS,
+            )
         };
         let pinbased = rdmsr(pin_id);
         let primary = rdmsr(primary_id);

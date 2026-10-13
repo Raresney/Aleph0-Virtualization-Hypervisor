@@ -16,9 +16,9 @@
 //! Host unit tests link `std`, which brings its own panic handler; two would
 //! not link, so the handler and its state are compiled out under `cfg(test)`.
 
-use core::sync::atomic::{AtomicU8, Ordering};
 #[cfg(not(test))]
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Set by the first panic. A second panic, raised while the first is still
 /// printing (for example from a `Display` impl or the console driver), sees

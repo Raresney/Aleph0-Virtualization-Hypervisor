@@ -43,8 +43,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use uefi::boot::{self, MemoryType};
 use uefi::mem::memory_map::MemoryMap;
 
-use super::instruction::{check_rflags, VmxFail};
-use super::page::{allocate_zeroed_pages, PAGE_SIZE};
+use super::instruction::{VmxFail, check_rflags};
+use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 
 /// Entry bit 0: reads allowed.
 pub const EPT_READ: u64 = 1 << 0;
@@ -334,7 +334,11 @@ impl Ept {
             protected_page,
         );
 
-        let ept = Self { eptp: eptp(pml4), end, table_pages: gibs + 3 };
+        let ept = Self {
+            eptp: eptp(pml4),
+            end,
+            table_pages: gibs + 3,
+        };
         PROTECTED_PAGE.store(protected_page, Ordering::Relaxed);
         PROTECTED_ENTRY.store(pt + protected as u64 * 8, Ordering::Relaxed);
         PUBLISHED_EPTP.store(ept.eptp, Ordering::Relaxed);

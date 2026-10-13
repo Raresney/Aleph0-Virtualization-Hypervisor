@@ -24,11 +24,11 @@
 //! hypervisor is meant to survive `ExitBootServices`, this must become
 //! `RUNTIME_SERVICES_DATA` (or a reserved type) so the OS never reclaims it.
 
-use core::arch::asm;
 use super::cr;
-use super::instruction::{check_rflags, VmxFail};
+use super::instruction::{VmxFail, check_rflags};
 use super::msr;
-use super::page::{allocate_zeroed_page, PAGE_SIZE};
+use super::page::{PAGE_SIZE, allocate_zeroed_page};
+use core::arch::asm;
 
 /// VMXON region size. Architecturally at most 4 KiB; one page is the norm.
 pub const VMXON_REGION_SIZE: usize = 4096;
@@ -105,12 +105,10 @@ impl VmxOnRegion {
     pub fn allocate() -> Result<Self, VmxOnError> {
         let ptr = allocate_zeroed_page(VmxOnError::AllocationFailed)?;
 
-        Ok(
-            Self {
-                phys_addr: ptr.as_ptr() as u64
-            }
-        )
-    } 
+        Ok(Self {
+            phys_addr: ptr.as_ptr() as u64,
+        })
+    }
 
     /// Physical address to hand to VMXON.
     pub fn phys_addr_ref(&self) -> &u64 {
@@ -131,19 +129,17 @@ impl VmxOnRegion {
 
 /// VMCS revision identifier from `IA32_VMX_BASIC` bits 0..=30.
 pub unsafe fn vmcs_revision_id() -> u32 {
-    unsafe {
-        (msr::rdmsr(msr::IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32
-    }
+    unsafe { (msr::rdmsr(msr::IA32_VMX_BASIC) & 0x7FFF_FFFF) as u32 }
 }
 
 /// Forces CR0 and CR4 into the ranges the CPU requires for VMX operation.
 pub unsafe fn apply_fixed_bits() {
     unsafe {
-      let cr0 = (cr::read_cr0() | msr::rdmsr(msr::IA32_VMX_CR0_FIXED0)) & msr::rdmsr(msr::IA32_VMX_CR0_FIXED1);
-      let cr4 = (cr::read_cr4() | msr::rdmsr(msr::IA32_VMX_CR4_FIXED0)) & msr::rdmsr(msr::IA32_VMX_CR4_FIXED1);
+        let cr0 = (cr::read_cr0() | msr::rdmsr(msr::IA32_VMX_CR0_FIXED0)) & msr::rdmsr(msr::IA32_VMX_CR0_FIXED1);
+        let cr4 = (cr::read_cr4() | msr::rdmsr(msr::IA32_VMX_CR4_FIXED0)) & msr::rdmsr(msr::IA32_VMX_CR4_FIXED1);
 
-      cr::write_cr0(cr0);
-      cr::write_cr4(cr4);  
+        cr::write_cr0(cr0);
+        cr::write_cr4(cr4);
     }
 }
 
@@ -203,6 +199,10 @@ pub unsafe fn enter_vmx_root_operation() -> Result<VmxOperation, VmxOnError> {
             cr::write_cr4(original_cr4);
             return Err(error);
         }
-        Ok(VmxOperation { _region: vmxon_region, original_cr0, original_cr4 })
+        Ok(VmxOperation {
+            _region: vmxon_region,
+            original_cr0,
+            original_cr4,
+        })
     }
 }

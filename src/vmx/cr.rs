@@ -32,7 +32,7 @@ pub unsafe fn read_cr0() -> u64 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    
+
     value
 }
 
@@ -58,7 +58,7 @@ pub unsafe fn read_cr3() -> u64 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    
+
     value
 }
 
@@ -84,7 +84,7 @@ pub unsafe fn read_cr4() -> u64 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    
+
     value
 }
 

@@ -213,9 +213,9 @@ pub fn init() -> Result<(), SerialError> {
         // the chip produces it as 115200 / divisor. The divisor is 16 bits,
         // split across offsets 0 (low) and 1 (high), which only hold it
         // while DLAB (line control bit 7) is set, like holding Shift.
-        outb(COM1 + LINE_CONTROL, LINE_DLAB);           // 0b1000_0000: DLAB on
-        outb(COM1 + DATA, divisor_low);                 // offset 0 = divisor low
-        outb(COM1 + INTERRUPT_ENABLE, divisor_high);    // offset 1 = divisor high
+        outb(COM1 + LINE_CONTROL, LINE_DLAB); // 0b1000_0000: DLAB on
+        outb(COM1 + DATA, divisor_low); // offset 0 = divisor low
+        outb(COM1 + INTERRUPT_ENABLE, divisor_high); // offset 1 = divisor high
 
         // Step 2c: frame format 8N1 (8 data bits, no parity, 1 stop bit).
         // Writing 0b0000_0011 also clears bit 7, turning DLAB off, so

@@ -25,7 +25,7 @@
 
 use core::sync::atomic::AtomicU64;
 
-use super::{instruction_error_for, launch_failure, resume_failure, VmcsError};
+use super::{VmcsError, instruction_error_for, launch_failure, resume_failure};
 use crate::vmx::vmexit::ExitReason;
 
 /// RSP inside `vmx_launch`, saved after it pushed the caller's registers;
@@ -100,9 +100,15 @@ pub enum GuestStop {
     /// Exit `number` was not one the handler resumes.
     Unexpected { number: u64, reason: ExitReason },
     /// VMLAUNCH fell through; the guest never ran.
-    LaunchFailed { error: VmcsError, instruction_error: Option<u32> },
+    LaunchFailed {
+        error: VmcsError,
+        instruction_error: Option<u32>,
+    },
     /// VMRESUME fell through after an exit the handler resumed.
-    ResumeFailed { error: VmcsError, instruction_error: Option<u32> },
+    ResumeFailed {
+        error: VmcsError,
+        instruction_error: Option<u32>,
+    },
 }
 
 const KIND_SHIFT: u32 = 62;

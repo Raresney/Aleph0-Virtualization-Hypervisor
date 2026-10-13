@@ -104,9 +104,7 @@ const NMI_INJECTION_BLOCKED: u32 = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKI
 /// Whether `info`, a VM_EXIT_INTERRUPTION_INFO value, describes an NMI:
 /// valid, type 2, vector 2. Bit 12 (NMI unblocking due to IRET) is ignored.
 pub fn is_nmi(info: u32) -> bool {
-    info & INTERRUPTION_VALID != 0
-        && (info >> 8) & 0b111 == INTERRUPTION_TYPE_NMI
-        && info & 0xFF == NMI_VECTOR
+    info & INTERRUPTION_VALID != 0 && (info >> 8) & 0b111 == INTERRUPTION_TYPE_NMI && info & 0xFF == NMI_VECTOR
 }
 
 /// What the handler read about the current exit.
@@ -184,7 +182,12 @@ pub enum ExitAction {
     /// (`Some(true)`) or off (`Some(false)`), or leave it (`None`).
     /// `grant_write`: make the protected page writable in EPT
     /// (`ept::grant_write`).
-    Resume { advance_rip: bool, inject_nmi: bool, nmi_window: Option<bool>, grant_write: bool },
+    Resume {
+        advance_rip: bool,
+        inject_nmi: bool,
+        nmi_window: Option<bool>,
+        grant_write: bool,
+    },
     /// The last planned exit arrived as expected; stop.
     Finished,
     /// Not an exit this hypervisor handles; stop without resuming.
@@ -198,17 +201,23 @@ impl ExitEvent {
     /// for an earlier NMI the new one replaces, and turning it off when it
     /// was already off is harmless.
     pub fn action(self) -> ExitAction {
-        let resume = |advance_rip, inject_nmi, nmi_window| {
-            ExitAction::Resume { advance_rip, inject_nmi, nmi_window, grant_write: false }
+        let resume = |advance_rip, inject_nmi, nmi_window| ExitAction::Resume {
+            advance_rip,
+            inject_nmi,
+            nmi_window,
+            grant_write: false,
         };
         match self {
             Self::MainVmcall | Self::GuestNmiHandler => resume(true, false, None),
             Self::NmiInjected | Self::NmiWindowInjected => resume(false, true, Some(false)),
             Self::NmiDeferred => resume(false, false, Some(true)),
             // RIP stays on the faulting write, so it runs again.
-            Self::EptWriteGranted => {
-                ExitAction::Resume { advance_rip: false, inject_nmi: false, nmi_window: None, grant_write: true }
-            }
+            Self::EptWriteGranted => ExitAction::Resume {
+                advance_rip: false,
+                inject_nmi: false,
+                nmi_window: None,
+                grant_write: true,
+            },
             Self::LastMainVmcall => ExitAction::Finished,
             Self::InterruptedDelivery | Self::EptWriteMissing | Self::Unexpected => ExitAction::Unexpected,
         }
@@ -237,13 +246,23 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         return (ExitEvent::InterruptedDelivery, state);
     }
 
-    let injected = ExitState { nmi_pending: false, nmis_injected: state.nmis_injected + 1, ..state };
+    let injected = ExitState {
+        nmi_pending: false,
+        nmis_injected: state.nmis_injected + 1,
+        ..state
+    };
     match exit.reason.basic {
         EXIT_REASON_EXCEPTION_OR_NMI if is_nmi(exit.interruption_info) => {
             if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
                 (ExitEvent::NmiInjected, injected)
             } else {
-                (ExitEvent::NmiDeferred, ExitState { nmi_pending: true, ..state })
+                (
+                    ExitEvent::NmiDeferred,
+                    ExitState {
+                        nmi_pending: true,
+                        ..state
+                    },
+                )
             }
         }
         // Per the SDM, NMI-window exits never occur under MOV SS blocking, but
@@ -260,16 +279,29 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
                 && is_protected_write(exit.exit_qualification)
                 && state.ept_writes_granted == 0 =>
         {
-            (ExitEvent::EptWriteGranted, ExitState { ept_writes_granted: 1, ..state })
+            (
+                ExitEvent::EptWriteGranted,
+                ExitState {
+                    ept_writes_granted: 1,
+                    ..state
+                },
+            )
         }
-        EXIT_REASON_VMCALL if exit.guest_rax == u64::from(GUEST_NMI_MARKER) => {
-            (ExitEvent::GuestNmiHandler, ExitState { nmis_handled: state.nmis_handled + 1, ..state })
-        }
+        EXIT_REASON_VMCALL if exit.guest_rax == u64::from(GUEST_NMI_MARKER) => (
+            ExitEvent::GuestNmiHandler,
+            ExitState {
+                nmis_handled: state.nmis_handled + 1,
+                ..state
+            },
+        ),
         EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) && state.ept_writes_granted == 0 => {
             (ExitEvent::EptWriteMissing, state)
         }
         EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) => {
-            let state = ExitState { main_vmcalls: state.main_vmcalls + 1, ..state };
+            let state = ExitState {
+                main_vmcalls: state.main_vmcalls + 1,
+                ..state
+            };
             if state.main_vmcalls < PLANNED_MAIN_VMCALLS {
                 (ExitEvent::MainVmcall, state)
             } else {

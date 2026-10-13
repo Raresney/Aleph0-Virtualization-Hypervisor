@@ -175,7 +175,7 @@
 //! `0x7ea00000 | (0x7eb19000 & 0x1FFFFF)` = the same `0x7eb19000`. The PT
 //! index bits simply become part of the offset.
 
-use super::cr::{read_cr3, read_cr4, CR4_LA57};
+use super::cr::{CR4_LA57, read_cr3, read_cr4};
 
 // Entry bits used by the walk; the full layout is in the module docs.
 
@@ -303,7 +303,9 @@ pub unsafe fn walk_current(virtual_address: u64) -> Result<Mapping, WalkError> {
         return Err(WalkError::FiveLevelPaging);
     }
     let cr3 = unsafe { read_cr3() };
-    walk(cr3, virtual_address, |physical| unsafe { (physical as *const u64).read_volatile() })
+    walk(cr3, virtual_address, |physical| unsafe {
+        (physical as *const u64).read_volatile()
+    })
 }
 
 /// The tests build small fake page tables in a `HashMap` (physical address

@@ -8,16 +8,15 @@ use super::*;
 
 /// The EPT/VPID capabilities Aleph0 needs: 4-level walk, WB, 2 MiB pages,
 /// INVEPT with both types.
-const FULL_CAP: u64 = CAP_WALK_LENGTH_4
-    | CAP_WRITE_BACK
-    | CAP_2M_PAGES
-    | CAP_INVEPT
-    | CAP_INVEPT_SINGLE_CONTEXT
-    | CAP_INVEPT_ALL_CONTEXT;
+const FULL_CAP: u64 =
+    CAP_WALK_LENGTH_4 | CAP_WRITE_BACK | CAP_2M_PAGES | CAP_INVEPT | CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT;
 
 #[test]
 fn full_support_picks_single_context() {
-    assert_eq!(check_support(SECONDARY_ALLOWS_EPT, FULL_CAP), Ok(InveptType::SingleContext));
+    assert_eq!(
+        check_support(SECONDARY_ALLOWS_EPT, FULL_CAP),
+        Ok(InveptType::SingleContext)
+    );
 }
 
 #[test]
@@ -34,7 +33,10 @@ fn each_missing_capability_has_its_error() {
         (CAP_WRITE_BACK, EptError::WriteBackUnsupported),
         (CAP_2M_PAGES, EptError::LargePagesUnsupported),
         (CAP_INVEPT, EptError::InveptUnsupported),
-        (CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT, EptError::InveptUnsupported),
+        (
+            CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT,
+            EptError::InveptUnsupported,
+        ),
     ] {
         assert_eq!(check_support(SECONDARY_ALLOWS_EPT, FULL_CAP & !missing), Err(error));
     }
@@ -97,8 +99,12 @@ fn empty_memory_map_is_refused() {
 /// Fills a 2 GiB identity map with made-up table addresses and returns the
 /// tables and the protected PT index.
 fn filled(protected_page: u64) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, usize) {
-    let (mut pml4, mut pdpt, mut pds, mut pt) =
-        (vec![0; ENTRIES], vec![0; ENTRIES], vec![0; 2 * ENTRIES], vec![0; ENTRIES]);
+    let (mut pml4, mut pdpt, mut pds, mut pt) = (
+        vec![0; ENTRIES],
+        vec![0; ENTRIES],
+        vec![0; 2 * ENTRIES],
+        vec![0; ENTRIES],
+    );
     let protected = fill_identity_map(
         Tables {
             pml4: &mut pml4,

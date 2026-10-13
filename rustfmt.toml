@@ -1,0 +1,3 @@
+# Lines up to 120 characters: the codebase's existing style, which keeps
+# log format strings and register dumps on one line.
+max_width = 120

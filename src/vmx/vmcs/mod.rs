@@ -32,18 +32,18 @@
 //! that once a current VMCS exists, VMfailValid also stores a numeric reason
 //! readable via [`vm_instruction_error`].
 
-use core::arch::asm;
+use crate::vmx::instruction::{VmxFail, check_rflags};
 use crate::vmx::msr::{self, VmcsControlMsrs};
 use crate::vmx::{cr, segment};
-use crate::vmx::instruction::{check_rflags, VmxFail};
+use core::arch::asm;
 
-use super::page::{allocate_zeroed_page, PAGE_SIZE};
+use super::page::{PAGE_SIZE, allocate_zeroed_page};
 use super::vmxon::vmcs_revision_id;
 
 pub mod fields;
 mod launch;
 
-pub use launch::{encode_finished, encode_resume_failed, encode_unexpected, launch, GuestStop};
+pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpected, launch};
 
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
@@ -149,11 +149,9 @@ impl VmcsRegion {
     pub fn allocate() -> Result<Self, VmcsError> {
         let ptr = allocate_zeroed_page(VmcsError::AllocationFailed)?;
 
-        Ok(
-            Self {
-                phys_addr: ptr.as_ptr() as u64
-            }
-        )
+        Ok(Self {
+            phys_addr: ptr.as_ptr() as u64,
+        })
     }
 
     /// Address of the field holding the physical address, for the memory
@@ -190,7 +188,6 @@ impl VmcsRegion {
         }
 
         Ok(check_rflags(rflags)?)
-
     }
 
     /// Allocates a VMCS, initialises it, and makes it the current VMCS.
@@ -408,10 +405,14 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     let sysenter_eip = unsafe { msr::rdmsr(msr::IA32_SYSENTER_EIP) };
 
     {
-
         let selectors = [
-            segments.es, segments.cs, segments.ss, segments.ds,
-            segments.fs, segments.gs, segments.tr,
+            segments.es,
+            segments.cs,
+            segments.ss,
+            segments.ds,
+            segments.fs,
+            segments.gs,
+            segments.tr,
         ];
 
         if selectors.iter().any(|selector| selector & 0b111 != 0) {
@@ -423,7 +424,7 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
         return Err(VmcsError::HostStateValidation);
     }
     let exit_controls = unsafe { vmread(VM_EXIT_CONTROLS)? };
-    
+
     unsafe {
         write_host_state(HOST_ES_SELECTOR, segments.es as u64)?;
         write_host_state(HOST_CS_SELECTOR, segments.cs as u64)?;

@@ -99,7 +99,11 @@ fn secondary_controls_activate_primary_bit_31() {
 
 #[test]
 fn no_secondary_controls_leave_the_primary_request_alone() {
-    let desired = DesiredControls { primary: 0x10, secondary: 0, ..DesiredControls::minimal_64_bit_guest() };
+    let desired = DesiredControls {
+        primary: 0x10,
+        secondary: 0,
+        ..DesiredControls::minimal_64_bit_guest()
+    };
     assert_eq!(primary_request(desired), 0x10);
 }
 

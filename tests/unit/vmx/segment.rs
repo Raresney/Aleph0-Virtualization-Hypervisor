@@ -8,7 +8,10 @@ use super::*;
 
 /// Describe `gdt` the way GDTR would.
 fn table(gdt: &[u8]) -> DescriptorTable {
-    DescriptorTable { base: gdt.as_ptr() as u64, limit: gdt.len() as u16 - 1 }
+    DescriptorTable {
+        base: gdt.as_ptr() as u64,
+        limit: gdt.len() as u16 - 1,
+    }
 }
 
 #[test]
@@ -16,7 +19,11 @@ fn null_and_ldt_selectors_return_zero() {
     let gdt = [0xFFu8; 32];
     let gdt = table(&gdt);
     for selector in [0x0, 0x1, 0x3] {
-        assert_eq!(unsafe { segment_base_from_gdt(&gdt, selector) }, 0, "selector {selector:#x}");
+        assert_eq!(
+            unsafe { segment_base_from_gdt(&gdt, selector) },
+            0,
+            "selector {selector:#x}"
+        );
     }
     // TI=1 names the LDT, which this decoder does not read.
     assert_eq!(unsafe { segment_base_from_gdt(&gdt, 0x0C) }, 0);
@@ -94,7 +101,10 @@ fn read_descriptor_ignores_rpl() {
 
 #[test]
 fn descriptor_table_operand_is_limit_then_base() {
-    let table = DescriptorTable { base: 0x1122_3344_5566_7788, limit: 0xABCD };
+    let table = DescriptorTable {
+        base: 0x1122_3344_5566_7788,
+        limit: 0xABCD,
+    };
     assert_eq!(
         descriptor_table_operand(&table),
         [0xCD, 0xAB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],

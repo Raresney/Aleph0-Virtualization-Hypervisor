@@ -8,10 +8,19 @@ use super::*;
 
 #[test]
 fn exit_reason_splits_basic_and_entry_failure() {
-    assert_eq!(ExitReason::from_raw(18), ExitReason { basic: 18, entry_failure: false });
+    assert_eq!(
+        ExitReason::from_raw(18),
+        ExitReason {
+            basic: 18,
+            entry_failure: false
+        }
+    );
     assert_eq!(
         ExitReason::from_raw(0x8000_0021),
-        ExitReason { basic: 33, entry_failure: true },
+        ExitReason {
+            basic: 33,
+            entry_failure: true
+        },
     );
 }
 
@@ -33,8 +42,12 @@ fn exception_vector_needs_the_valid_bit() {
     assert_eq!(exception_vector(0x0000_0B0E), None);
 }
 
-const RESUME: ExitAction =
-    ExitAction::Resume { advance_rip: true, inject_nmi: false, nmi_window: None, grant_write: false };
+const RESUME: ExitAction = ExitAction::Resume {
+    advance_rip: true,
+    inject_nmi: false,
+    nmi_window: None,
+    grant_write: false,
+};
 
 #[test]
 fn resume_tells_the_stub_to_resume() {
@@ -50,7 +63,10 @@ fn finished_stops_with_the_exit_count() {
 
 #[test]
 fn unexpected_stops_with_the_exit_and_its_reason() {
-    assert_eq!(stub_return(ExitAction::Unexpected, 1, 10), vmcs::encode_unexpected(1, 10));
+    assert_eq!(
+        stub_return(ExitAction::Unexpected, 1, 10),
+        vmcs::encode_unexpected(1, 10)
+    );
 }
 
 #[test]

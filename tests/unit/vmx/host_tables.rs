@@ -15,7 +15,9 @@ fn tss_descriptor_layout() {
     let descriptor = tss_descriptor(BASE, 0x67);
     assert_eq!(
         descriptor,
-        [0x67, 0x00, 0x88, 0x77, 0x66, 0x89, 0x00, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0],
+        [
+            0x67, 0x00, 0x88, 0x77, 0x66, 0x89, 0x00, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0
+        ],
     );
 }
 
@@ -32,7 +34,10 @@ fn tss_descriptor_round_trips_through_gdt_decoder() {
     let mut gdt = [0u8; 32];
     gdt[8..16].copy_from_slice(&0x00AF_9B00_0000_FFFFu64.to_le_bytes());
     gdt[16..32].copy_from_slice(&tss_descriptor(BASE, 0x67));
-    let table = DescriptorTable { base: gdt.as_ptr() as u64, limit: gdt.len() as u16 - 1 };
+    let table = DescriptorTable {
+        base: gdt.as_ptr() as u64,
+        limit: gdt.len() as u16 - 1,
+    };
 
     assert_eq!(unsafe { segment_base_from_gdt(&table, 0x10) }, BASE);
 }

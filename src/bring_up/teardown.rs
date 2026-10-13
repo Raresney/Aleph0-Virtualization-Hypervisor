@@ -127,8 +127,8 @@ pub(super) unsafe fn teardown(
 /// console too: the phase is boot services again.
 fn report(firmware: &FirmwareState) {
     let vmxe = unsafe { cr::read_cr4() } & CR4_VMXE != 0;
-    let tables_restored = unsafe { segment::read_gdtr() } == firmware.gdtr
-        && unsafe { segment::read_idtr() } == firmware.idtr;
+    let tables_restored =
+        unsafe { segment::read_gdtr() } == firmware.gdtr && unsafe { segment::read_idtr() } == firmware.idtr;
     log!(
         "Teardown: CR4.VMXE={} firmware GDTR/IDTR restored={tables_restored} IF={}.",
         u8::from(vmxe),

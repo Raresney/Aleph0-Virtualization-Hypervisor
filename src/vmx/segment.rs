@@ -23,8 +23,8 @@
 //! Nothing here needs VMX, so [`read_all`] can be called and printed under
 //! plain QEMU/TCG to sanity-check the values before any VMCS work.
 
-use core::{arch::asm, ptr::read_volatile};
 use super::msr;
+use core::{arch::asm, ptr::read_volatile};
 
 /// Contents of GDTR or IDTR: where a descriptor table starts and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,10 +51,9 @@ pub unsafe fn read_gdtr() -> DescriptorTable {
 
     DescriptorTable {
         base: u64::from_le_bytes([
-            buffer[2], buffer[3], buffer[4], buffer[5],
-            buffer[6], buffer[7], buffer[8], buffer[9]]
-        ),
-        limit: u16::from_le_bytes([buffer[0], buffer[1]])
+            buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9],
+        ]),
+        limit: u16::from_le_bytes([buffer[0], buffer[1]]),
     }
 }
 
@@ -74,10 +73,9 @@ pub unsafe fn read_idtr() -> DescriptorTable {
 
     DescriptorTable {
         base: u64::from_le_bytes([
-            buffer[2], buffer[3], buffer[4], buffer[5],
-            buffer[6], buffer[7], buffer[8], buffer[9]]
-        ),
-        limit: u16::from_le_bytes([buffer[0], buffer[1]])
+            buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9],
+        ]),
+        limit: u16::from_le_bytes([buffer[0], buffer[1]]),
     }
 }
 
@@ -256,10 +254,7 @@ pub unsafe fn read_gs_base() -> u64 {
 ///
 /// `gdt` must describe a live, readable GDT through its reported limit.
 /// A selector outside that limit, or one referring to the LDT, returns zero.
-pub unsafe fn segment_base_from_gdt(
-    gdt: &DescriptorTable,
-    selector: u16,
-) -> u64 {
+pub unsafe fn segment_base_from_gdt(gdt: &DescriptorTable, selector: u16) -> u64 {
     // The low 3 bits are RPL and TI, so 0x01..0x03 also name the null
     // descriptor. Shift them off before testing.
     let index = (selector >> 3) as u64;
@@ -277,10 +272,7 @@ pub unsafe fn segment_base_from_gdt(
     let descriptor = (gdt.base + offset as u64) as *const u8;
 
     unsafe {
-        let low = u16::from_le_bytes([
-            read_volatile(descriptor.add(2)),
-            read_volatile(descriptor.add(3)),
-        ]) as u64;
+        let low = u16::from_le_bytes([read_volatile(descriptor.add(2)), read_volatile(descriptor.add(3))]) as u64;
         let mid = read_volatile(descriptor.add(4)) as u64;
         let high = read_volatile(descriptor.add(7)) as u64;
         let upper = u32::from_le_bytes([

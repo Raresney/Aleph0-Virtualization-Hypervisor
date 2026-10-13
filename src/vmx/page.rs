@@ -24,10 +24,13 @@ pub fn allocate_zeroed_pages_of_type<E>(
     memory_type: MemoryType,
     allocation_error: E,
 ) -> Result<NonNull<u8>, E> {
-    let pages = boot::allocate_pages(AllocateType::AnyPages, memory_type, count)
-        .map_err(|_| allocation_error)?;
+    let pages = boot::allocate_pages(AllocateType::AnyPages, memory_type, count).map_err(|_| allocation_error)?;
 
-    assert_eq!(pages.as_ptr() as usize % PAGE_SIZE, 0, "UEFI returned an unaligned page");
+    assert_eq!(
+        pages.as_ptr() as usize % PAGE_SIZE,
+        0,
+        "UEFI returned an unaligned page"
+    );
     unsafe { pages.write_bytes(0, count * PAGE_SIZE) };
     Ok(pages)
 }

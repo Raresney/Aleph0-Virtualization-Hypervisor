@@ -22,18 +22,17 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::ept::{self, InveptType};
 use super::exit_decision::{
-    self, decide, expected_main_rax, ExitAction, ExitEvent, ExitInfo, ExitState,
-    EPT_ACCESS_FETCH, EPT_ACCESS_READ, EPT_ACCESS_WRITE, EPT_LINEAR_VALID, EPT_PAGE_EXECUTABLE,
+    self, EPT_ACCESS_FETCH, EPT_ACCESS_READ, EPT_ACCESS_WRITE, EPT_LINEAR_VALID, EPT_PAGE_EXECUTABLE,
     EPT_PAGE_READABLE, EPT_PAGE_WRITABLE, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION,
-    EXIT_REASON_EXCEPTION_OR_NMI, INJECT_NMI, PLANNED_MAIN_VMCALLS,
+    EXIT_REASON_EXCEPTION_OR_NMI, ExitAction, ExitEvent, ExitInfo, ExitState, INJECT_NMI, PLANNED_MAIN_VMCALLS, decide,
+    expected_main_rax,
 };
-use super::page::{allocate_zeroed_pages, PAGE_SIZE};
-use super::vmcs::{self, encode_finished, encode_resume_failed, encode_unexpected, VmcsError};
+use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS,
-    GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN,
-    VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS, GUEST_RIP,
+    IDT_VECTORING_INFO, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
+use super::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
 pub const VM_EXIT_STACK_PAGES: usize = 4;
 pub const VM_EXIT_STACK_SIZE: usize = VM_EXIT_STACK_PAGES * PAGE_SIZE;
@@ -75,8 +74,8 @@ struct RegisterFrame {
     rsi: u64,
     rdi: u64,
     rbp: u64,
-    r8:  u64,
-    r9:  u64,
+    r8: u64,
+    r9: u64,
     r10: u64,
     r11: u64,
     r12: u64,
@@ -338,7 +337,11 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
             "{tag} VM exit #{number}: reason={} ({}){}",
             reason.basic,
             exit_reason_name(reason.basic),
-            if reason.entry_failure { " [VM entry failed; guest did not run]" } else { "" },
+            if reason.entry_failure {
+                " [VM entry failed; guest did not run]"
+            } else {
+                ""
+            },
         );
         if reason.basic == EXIT_REASON_EXCEPTION_OR_NMI && !reason.entry_failure {
             report_exception(number);
@@ -372,13 +375,23 @@ extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
     let frame = unsafe { &*frame };
     crate::serial_println!(
         "{tag} VM exit #{number}: guest rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}",
-        frame.rax, frame.rbx, frame.rcx, frame.rdx,
+        frame.rax,
+        frame.rbx,
+        frame.rcx,
+        frame.rdx,
     );
 
     let interruption_info = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO);
     let interruptibility = read_or_report("GUEST_INTERRUPTIBILITY_STATE", GUEST_INTERRUPTIBILITY_STATE);
     let idt_vectoring = read_or_report("IDT_VECTORING_INFO", IDT_VECTORING_INFO);
-    let exit = match (reason, interruption_info, interruptibility, idt_vectoring, qualification, guest_physical) {
+    let exit = match (
+        reason,
+        interruption_info,
+        interruptibility,
+        idt_vectoring,
+        qualification,
+        guest_physical,
+    ) {
         (Some(reason), Some(info), Some(blocking), Some(vectoring), Some(qualification), Some(guest_physical)) => {
             Some(ExitInfo {
                 reason,
@@ -439,7 +452,13 @@ struct Resumed {
 /// writable. Returns how the guest resumes, or `None` after printing why it
 /// cannot.
 fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: ExitAction) -> Option<Resumed> {
-    let ExitAction::Resume { advance_rip, inject_nmi, nmi_window, grant_write } = action else {
+    let ExitAction::Resume {
+        advance_rip,
+        inject_nmi,
+        nmi_window,
+        grant_write,
+    } = action
+    else {
         return None;
     };
     let tag = crate::TAG;
@@ -454,9 +473,7 @@ fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: Ex
             return None;
         };
         if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, rip + length) } {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: could not advance guest RIP ({error:?}); not resuming."
-            );
+            crate::serial_println!("{tag} VM exit #{number}: could not advance guest RIP ({error:?}); not resuming.");
             return None;
         }
         rip + length
@@ -497,7 +514,10 @@ fn prepare_resume(number: u64, rip: Option<u64>, length: Option<u64>, action: Ex
     } else {
         None
     };
-    Some(Resumed { rip: resume_rip, invept })
+    Some(Resumed {
+        rip: resume_rip,
+        invept,
+    })
 }
 
 /// Prints an EPT exit's addresses and what the EPT entries allowed, and
@@ -539,7 +559,9 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
     match event {
         ExitEvent::EptWriteGranted => crate::serial_println!(
             "{tag} VM exit #{number}: write to the protected data page: write granted (W=1), INVEPT {}; retrying the write at rip={rip:#018x}.",
-            resumed.and_then(|resumed| resumed.invept).map_or("not run", InveptType::name),
+            resumed
+                .and_then(|resumed| resumed.invept)
+                .map_or("not run", InveptType::name),
         ),
         ExitEvent::EptWriteMissing => crate::serial_println!(
             "{tag} VM exit #{number}: main VMCALL (rax={rax:#x}) before any EPT violation: the guest's write to its data page was not caught, so EPT did not protect it."
@@ -561,15 +583,21 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::NmiWindowInjected => crate::serial_println!(
             "{tag} VM exit #{number}: NMI window open; reinjecting the pending NMI at rip={rip:#018x}."
         ),
-        ExitEvent::LastMainVmcall if state.nmis_injected == 0 && state.nmis_handled == 0 && !state.nmi_pending => crate::serial_println!(
-            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; no NMI arrived."
-        ),
+        ExitEvent::LastMainVmcall if state.nmis_injected == 0 && state.nmis_handled == 0 && !state.nmi_pending => {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; no NMI arrived."
+            )
+        }
         ExitEvent::LastMainVmcall => crate::serial_println!(
             "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; NMIs: {} reinjected, {} handled by the guest{}.",
             state.nmis_injected,
             state.nmis_handled,
             // An NMI deferred but never injected before the last VMCALL.
-            if state.nmi_pending { ", 1 still pending (dropped)" } else { "" },
+            if state.nmi_pending {
+                ", 1 still pending (dropped)"
+            } else {
+                ""
+            },
         ),
         ExitEvent::InterruptedDelivery => crate::serial_println!(
             "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
@@ -601,9 +629,7 @@ fn report_exception(number: u64) {
             Some(vector) => crate::serial_println!(
                 "{tag} VM exit #{number}: guest exception vector={vector} (interruption info={info:#010x})"
             ),
-            None => crate::serial_println!(
-                "{tag} VM exit #{number}: interruption info not valid ({info:#010x})"
-            ),
+            None => crate::serial_println!("{tag} VM exit #{number}: interruption info not valid ({info:#010x})"),
         }
     }
 }
@@ -621,9 +647,7 @@ extern "efiapi" fn vmresume_failed(rflags: u64) -> u64 {
                 "{tag} VMRESUME failed: {} ({code})",
                 vmcs::vm_instruction_error_name(code),
             ),
-            Err(error) => crate::serial_println!(
-                "{tag} VMRESUME failed: VmFailValid, error unreadable ({error:?})"
-            ),
+            Err(error) => crate::serial_println!("{tag} VMRESUME failed: VmFailValid, error unreadable ({error:?})"),
         },
         error => crate::serial_println!("{tag} VMRESUME failed: {error:?}"),
     }

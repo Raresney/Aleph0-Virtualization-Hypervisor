@@ -37,7 +37,7 @@ mod error;
 mod report;
 mod teardown;
 
-pub use error::{report_error, BringUpError};
+pub use error::{BringUpError, report_error};
 
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
@@ -48,7 +48,7 @@ use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::segment::DescriptorTable;
 use crate::vmx::vmcs::{DesiredControls, GuestStop, VmcsRegion};
-use crate::vmx::vmexit::{VmExitStack, VM_EXIT_STACK_SIZE};
+use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
 use crate::vmx::vmxon::VmxOperation;
 
 use error::{guest_state_error, vmcs_step};
@@ -122,7 +122,14 @@ pub fn run() -> Result<GuestRun, BringUpError> {
             return Err(error);
         }
     };
-    let VmxEntry { vmexit_stack, guest, ept, controls, firmware, vmx_operation } = entry;
+    let VmxEntry {
+        vmexit_stack,
+        guest,
+        ept,
+        controls,
+        firmware,
+        vmx_operation,
+    } = entry;
 
     // From here on every path goes through teardown before returning.
     // Only legal now: the VMCS instructions raise #UD outside VMX operation.
@@ -158,16 +165,23 @@ struct VmxEntry {
 /// `run` only has to put the firmware's GDTR back.
 fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmexit_stack = VmExitStack::allocate()?;
-    log!("VM-exit stack allocated: top={:#018x} size={VM_EXIT_STACK_SIZE}.", vmexit_stack.top());
+    log!(
+        "VM-exit stack allocated: top={:#018x} size={VM_EXIT_STACK_SIZE}.",
+        vmexit_stack.top()
+    );
 
     let guest = GuestMemory::allocate()?;
     log!(
         "Guest memory allocated: code={:#018x} ({} bytes copied) stack top={:#018x}.",
-        guest.code_base(), guest.code_len(), guest.stack_top(),
+        guest.code_base(),
+        guest.code_len(),
+        guest.stack_top(),
     );
     log!(
         "Guest IDT at {:#018x} (limit {:#06x}): vector 2 -> NMI handler at {:#018x}.",
-        guest.idt().base, guest.idt().limit, guest.nmi_handler(),
+        guest.idt().base,
+        guest.idt().limit,
+        guest.nmi_handler(),
     );
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
@@ -188,7 +202,14 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmx_operation = unsafe { vmx::vmxon::enter_vmx_root_operation() }?;
     log!("Entered VMX root operation.");
 
-    Ok(VmxEntry { vmexit_stack, guest, ept, controls, firmware, vmx_operation })
+    Ok(VmxEntry {
+        vmexit_stack,
+        guest,
+        ept,
+        controls,
+        firmware,
+        vmx_operation,
+    })
 }
 
 /// Builds a GDT that adds a TSS descriptor to a copy of the firmware's GDT,
@@ -214,7 +235,8 @@ fn activate_host_tables() -> Result<HostTables, BringUpError> {
         .ok_or(GdtError::GdtrPreparationFailed)?;
     log!(
         "Host GDT prepared: base={:#018x} limit={:#06x} tr_selector={selector:#06x}.",
-        prepared.base, prepared.limit,
+        prepared.base,
+        prepared.limit,
     );
 
     unsafe { gdt.activate(&tss) }?;
@@ -247,7 +269,10 @@ fn check_vmx_support() -> Result<(VmcsControlMsrs, InveptType), BringUpError> {
     report::vmx_capabilities(&controls);
 
     let invept = ept::check_support(controls.secondary, controls.ept_vpid_cap)?;
-    log!("EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT {}.", invept.name());
+    log!(
+        "EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT {}.",
+        invept.name()
+    );
     Ok((controls, invept))
 }
 
@@ -283,7 +308,10 @@ fn prepare_vmcs(
     log!("VMCS controls written and read back successfully.");
 
     unsafe { vmx::vmcs::set_ept_pointer(ept.eptp()) }.map_err(vmcs_step("EPT pointer setup"))?;
-    log!("VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.", ept.eptp());
+    log!(
+        "VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.",
+        ept.eptp()
+    );
 
     unsafe { vmx::vmcs::configure_host_state() }.map_err(vmcs_step("host-state setup"))?;
     let exit_controls = unsafe { vmx::vmcs::vmread(vmx::vmcs::fields::VM_EXIT_CONTROLS) }
@@ -311,15 +339,22 @@ fn prepare_vmcs(
 fn guest_result(stop: GuestStop) -> Result<GuestRun, BringUpError> {
     match stop {
         GuestStop::Finished { exits } => Ok(GuestRun { exits }),
-        GuestStop::Unexpected { number, reason } => {
-            Err(BringUpError::UnexpectedExit { number, reason })
-        }
-        GuestStop::LaunchFailed { error, instruction_error } => {
-            Err(BringUpError::Vmcs { operation: "launch", error, instruction_error })
-        }
-        GuestStop::ResumeFailed { error, instruction_error } => {
-            Err(BringUpError::ResumeFailed { error, instruction_error })
-        }
+        GuestStop::Unexpected { number, reason } => Err(BringUpError::UnexpectedExit { number, reason }),
+        GuestStop::LaunchFailed {
+            error,
+            instruction_error,
+        } => Err(BringUpError::Vmcs {
+            operation: "launch",
+            error,
+            instruction_error,
+        }),
+        GuestStop::ResumeFailed {
+            error,
+            instruction_error,
+        } => Err(BringUpError::ResumeFailed {
+            error,
+            instruction_error,
+        }),
     }
 }
 
@@ -333,7 +368,8 @@ fn check_host_tables_preserved(expected: &HostTables) -> Result<(), BringUpError
     let idtr = unsafe { vmx::segment::read_idtr() };
     let same_gdtr = gdtr.base == expected.gdtr.base && gdtr.limit == expected.gdtr.limit;
     let same_idtr = idtr.base == expected.idtr.base && idtr.limit == expected.idtr.limit;
-    let same_tss_base = same_gdtr && tr == expected.tr
+    let same_tss_base = same_gdtr
+        && tr == expected.tr
         && unsafe { vmx::segment::segment_base_from_gdt(&gdtr, tr) } == expected.tss_base;
 
     if same_gdtr && same_idtr && same_tss_base {
@@ -343,7 +379,10 @@ fn check_host_tables_preserved(expected: &HostTables) -> Result<(), BringUpError
         log!("WARNING: Host descriptor state changed after VMX/UEFI calls.");
         log!(
             "Expected GDTR={:?} TR={:#06x} TSS={:#018x} IDTR={:?}",
-            expected.gdtr, expected.tr, expected.tss_base, expected.idtr,
+            expected.gdtr,
+            expected.tr,
+            expected.tss_base,
+            expected.idtr,
         );
         log!("Actual GDTR={gdtr:?} TR={tr:#06x} IDTR={idtr:?} TSS base matches={same_tss_base}");
         Err(BringUpError::HostTablesChanged)

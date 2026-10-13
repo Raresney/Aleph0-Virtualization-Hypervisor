@@ -4,11 +4,14 @@
 //! - Provide RSP0/IST stacks if the host IDT or privilege transitions will
 //!   use them; the TSS currently has zeroed stack fields.
 
-use core::{arch::asm, ptr::{self, NonNull, copy_nonoverlapping}};
 use crate::vmx::segment::{DescriptorTable, read_cs, read_gdtr, read_idtr, read_ss, read_tr, segment_base_from_gdt};
+use core::{
+    arch::asm,
+    ptr::{self, NonNull, copy_nonoverlapping},
+};
 use uefi::boot;
 
-use super::page::{allocate_zeroed_page, PAGE_SIZE};
+use super::page::{PAGE_SIZE, allocate_zeroed_page};
 #[repr(C, packed)]
 struct Tss {
     reserved1: u32,
@@ -128,11 +131,7 @@ impl GdtRegion {
                 return Err(GdtError::InvalidSource);
             }
 
-            copy_nonoverlapping(
-                descriptor_table.base as *const u8,
-                page.as_ptr(),
-                original_length,
-            );
+            copy_nonoverlapping(descriptor_table.base as *const u8, page.as_ptr(), original_length);
 
             Ok(Self {
                 page,
@@ -190,8 +189,7 @@ impl GdtRegion {
         }
 
         let descriptor = unsafe { core::slice::from_raw_parts(self.page.as_ptr().add(offset), 16) };
-        let limit = u16::from_le_bytes([descriptor[0], descriptor[1]]) as u32
-            | (((descriptor[6] & 0x0f) as u32) << 16);
+        let limit = u16::from_le_bytes([descriptor[0], descriptor[1]]) as u32 | (((descriptor[6] & 0x0f) as u32) << 16);
         let base = u16::from_le_bytes([descriptor[2], descriptor[3]]) as u64
             | ((descriptor[4] as u64) << 16)
             | ((descriptor[7] as u64) << 24)
@@ -220,13 +218,12 @@ impl GdtRegion {
         }
         let gdtr = self.prepared_gdtr().ok_or(GdtError::GdtrPreparationFailed)?;
 
-        let (cs, ss) = unsafe { 
-            (read_cs(), read_ss()) 
-        };
+        let (cs, ss) = unsafe { (read_cs(), read_ss()) };
 
         let cs_offset = (cs & !7) as usize;
         let ss_offset = (ss & !7) as usize;
-        if cs & 0x4 != 0 || ss & 0x4 != 0
+        if cs & 0x4 != 0
+            || ss & 0x4 != 0
             || cs_offset == 0
             || cs_offset + 8 > self.original_length
             || (ss_offset != 0 && ss_offset + 8 > self.original_length)
@@ -241,9 +238,8 @@ impl GdtRegion {
         }
         let idt = idtr.base as *const u8;
         for offset in (0..idt_length).step_by(16) {
-            let (ist, attributes) = unsafe {
-                (idt.add(offset + 4).read_volatile(), idt.add(offset + 5).read_volatile())
-            };
+            let (ist, attributes) =
+                unsafe { (idt.add(offset + 4).read_volatile(), idt.add(offset + 5).read_volatile()) };
             if attributes & 0x80 != 0 && ist & 0x07 != 0 {
                 return Err(GdtError::IdtRequiresIst);
             }
@@ -266,7 +262,8 @@ impl GdtRegion {
 
         let loaded_gdtr = unsafe { read_gdtr() };
         let loaded_tr = unsafe { read_tr() };
-        if loaded_gdtr.base != gdtr.base || loaded_gdtr.limit != gdtr.limit
+        if loaded_gdtr.base != gdtr.base
+            || loaded_gdtr.limit != gdtr.limit
             || loaded_tr != selector
             || unsafe { segment_base_from_gdt(&loaded_gdtr, loaded_tr) } != tss_region.base()
         {

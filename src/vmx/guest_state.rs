@@ -38,7 +38,7 @@
 use super::cr;
 use super::msr;
 use super::segment::{self, ACCESS_RIGHTS_UNUSABLE, DescriptorTable};
-use super::vmcs::{self, fields, VmcsError};
+use super::vmcs::{self, VmcsError, fields};
 
 /// RFLAGS bit 1 is reserved and must be 1; every other bit is 0.
 const INITIAL_RFLAGS: u64 = 0x2;
@@ -75,7 +75,12 @@ impl GuestSegment {
     /// A register holding a null selector: unusable, so VM entry ignores
     /// its limit and access rights. FS and GS still pass their MSR base.
     fn unusable(selector: u16, base: u64) -> Self {
-        Self { selector, base, limit: 0, access_rights: ACCESS_RIGHTS_UNUSABLE }
+        Self {
+            selector,
+            base,
+            limit: 0,
+            access_rights: ACCESS_RIGHTS_UNUSABLE,
+        }
     }
 
     /// A usable register loaded from its 8-byte descriptor, with `base`
@@ -85,7 +90,12 @@ impl GuestSegment {
         if access_rights & CODE_OR_DATA != 0 {
             access_rights |= TYPE_ACCESSED;
         }
-        Self { selector, base, limit: segment::descriptor_limit(descriptor), access_rights }
+        Self {
+            selector,
+            base,
+            limit: segment::descriptor_limit(descriptor),
+            access_rights,
+        }
     }
 
     fn is_usable(&self) -> bool {
@@ -148,8 +158,11 @@ impl GuestState {
     pub unsafe fn from_current(rip: u64, rsp: u64, idtr: DescriptorTable) -> Result<Self, GuestStateError> {
         let host = unsafe { segment::read_all() };
         let gdt = &host.gdtr;
-        let entry_controls = unsafe { vmcs::vmread(fields::VM_ENTRY_CONTROLS) }
-            .map_err(|error| GuestStateError::Vmcs { field: fields::VM_ENTRY_CONTROLS, error })?;
+        let entry_controls =
+            unsafe { vmcs::vmread(fields::VM_ENTRY_CONTROLS) }.map_err(|error| GuestStateError::Vmcs {
+                field: fields::VM_ENTRY_CONTROLS,
+                error,
+            })?;
 
         let state = unsafe {
             Self {
@@ -172,10 +185,8 @@ impl GuestState {
                 sysenter_cs: u64::from(msr::rdmsr(msr::IA32_SYSENTER_CS) as u32),
                 sysenter_esp: msr::rdmsr(msr::IA32_SYSENTER_ESP),
                 sysenter_eip: msr::rdmsr(msr::IA32_SYSENTER_EIP),
-                pat: (entry_controls & fields::VM_ENTRY_LOAD_IA32_PAT != 0)
-                    .then(|| msr::rdmsr(msr::IA32_PAT)),
-                efer: (entry_controls & fields::VM_ENTRY_LOAD_IA32_EFER != 0)
-                    .then(|| msr::rdmsr(msr::IA32_EFER)),
+                pat: (entry_controls & fields::VM_ENTRY_LOAD_IA32_PAT != 0).then(|| msr::rdmsr(msr::IA32_PAT)),
+                efer: (entry_controls & fields::VM_ENTRY_LOAD_IA32_EFER != 0).then(|| msr::rdmsr(msr::IA32_EFER)),
             }
         };
 
@@ -193,14 +204,62 @@ impl GuestState {
         use fields::*;
 
         let segments = [
-            (self.es, GUEST_ES_SELECTOR, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_ACCESS_RIGHTS),
-            (self.cs, GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_ACCESS_RIGHTS),
-            (self.ss, GUEST_SS_SELECTOR, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_ACCESS_RIGHTS),
-            (self.ds, GUEST_DS_SELECTOR, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_ACCESS_RIGHTS),
-            (self.fs, GUEST_FS_SELECTOR, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_ACCESS_RIGHTS),
-            (self.gs, GUEST_GS_SELECTOR, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_ACCESS_RIGHTS),
-            (self.ldtr, GUEST_LDTR_SELECTOR, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_ACCESS_RIGHTS),
-            (self.tr, GUEST_TR_SELECTOR, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_ACCESS_RIGHTS),
+            (
+                self.es,
+                GUEST_ES_SELECTOR,
+                GUEST_ES_BASE,
+                GUEST_ES_LIMIT,
+                GUEST_ES_ACCESS_RIGHTS,
+            ),
+            (
+                self.cs,
+                GUEST_CS_SELECTOR,
+                GUEST_CS_BASE,
+                GUEST_CS_LIMIT,
+                GUEST_CS_ACCESS_RIGHTS,
+            ),
+            (
+                self.ss,
+                GUEST_SS_SELECTOR,
+                GUEST_SS_BASE,
+                GUEST_SS_LIMIT,
+                GUEST_SS_ACCESS_RIGHTS,
+            ),
+            (
+                self.ds,
+                GUEST_DS_SELECTOR,
+                GUEST_DS_BASE,
+                GUEST_DS_LIMIT,
+                GUEST_DS_ACCESS_RIGHTS,
+            ),
+            (
+                self.fs,
+                GUEST_FS_SELECTOR,
+                GUEST_FS_BASE,
+                GUEST_FS_LIMIT,
+                GUEST_FS_ACCESS_RIGHTS,
+            ),
+            (
+                self.gs,
+                GUEST_GS_SELECTOR,
+                GUEST_GS_BASE,
+                GUEST_GS_LIMIT,
+                GUEST_GS_ACCESS_RIGHTS,
+            ),
+            (
+                self.ldtr,
+                GUEST_LDTR_SELECTOR,
+                GUEST_LDTR_BASE,
+                GUEST_LDTR_LIMIT,
+                GUEST_LDTR_ACCESS_RIGHTS,
+            ),
+            (
+                self.tr,
+                GUEST_TR_SELECTOR,
+                GUEST_TR_BASE,
+                GUEST_TR_LIMIT,
+                GUEST_TR_ACCESS_RIGHTS,
+            ),
         ];
 
         let other_fields = [
@@ -259,8 +318,8 @@ unsafe fn segment_from_gdt(
     if selector & !0b11 == 0 {
         return Ok(GuestSegment::unusable(selector, base.unwrap_or(0)));
     }
-    let descriptor = unsafe { segment::read_descriptor(gdt, selector) }
-        .ok_or(GuestStateError::BadSelector { selector })?;
+    let descriptor =
+        unsafe { segment::read_descriptor(gdt, selector) }.ok_or(GuestStateError::BadSelector { selector })?;
     let base = base.unwrap_or_else(|| segment::descriptor_base(descriptor));
     Ok(GuestSegment::from_descriptor(selector, descriptor, base))
 }
@@ -270,10 +329,14 @@ unsafe fn segment_from_gdt(
 /// busy 64-bit TSS.
 fn check_segments(cs: &GuestSegment, tr: &GuestSegment) -> Result<(), GuestStateError> {
     if !cs.is_usable() || cs.access_rights & LONG_MODE == 0 {
-        return Err(GuestStateError::CsNot64Bit { access_rights: cs.access_rights });
+        return Err(GuestStateError::CsNot64Bit {
+            access_rights: cs.access_rights,
+        });
     }
     if !tr.is_usable() || tr.access_rights & 0x1F != BUSY_TSS_64 {
-        return Err(GuestStateError::TrNotBusyTss { access_rights: tr.access_rights });
+        return Err(GuestStateError::TrNotBusyTss {
+            access_rights: tr.access_rights,
+        });
     }
     Ok(())
 }
@@ -284,7 +347,11 @@ unsafe fn write_field(field: u32, value: u64) -> Result<(), GuestStateError> {
     unsafe { vmcs::vmwrite(field, value) }.map_err(vmcs_error)?;
     let read = unsafe { vmcs::vmread(field) }.map_err(vmcs_error)?;
     if read != value {
-        return Err(GuestStateError::ReadbackMismatch { field, written: value, read });
+        return Err(GuestStateError::ReadbackMismatch {
+            field,
+            written: value,
+            read,
+        });
     }
     Ok(())
 }

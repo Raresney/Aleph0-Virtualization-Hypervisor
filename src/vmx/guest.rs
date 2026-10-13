@@ -32,7 +32,7 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
-use super::page::{allocate_zeroed_pages_of_type, PAGE_SIZE};
+use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable};
 
@@ -299,21 +299,9 @@ impl GuestMemory {
             return Err(GuestMemoryError::CodeTooLarge);
         }
 
-        let code = allocate_zeroed_pages_of_type(
-            2,
-            MemoryType::LOADER_CODE,
-            GuestMemoryError::CodeAllocationFailed,
-        )?;
-        let stack = allocate_zeroed_pages_of_type(
-            1,
-            MemoryType::LOADER_DATA,
-            GuestMemoryError::StackAllocationFailed,
-        )?;
-        let idt = allocate_zeroed_pages_of_type(
-            1,
-            MemoryType::LOADER_DATA,
-            GuestMemoryError::IdtAllocationFailed,
-        )?;
+        let code = allocate_zeroed_pages_of_type(2, MemoryType::LOADER_CODE, GuestMemoryError::CodeAllocationFailed)?;
+        let stack = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::StackAllocationFailed)?;
+        let idt = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::IdtAllocationFailed)?;
 
         unsafe { core::ptr::copy_nonoverlapping(code_bytes.as_ptr(), code.as_ptr(), code_bytes.len()) };
         let memory = Self { code, stack, idt };
@@ -321,9 +309,7 @@ impl GuestMemory {
         unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
         let gate = interrupt_gate(memory.nmi_handler(), unsafe { segment::read_cs() });
-        unsafe {
-            core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_VECTOR * GATE_SIZE), GATE_SIZE)
-        };
+        unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_VECTOR * GATE_SIZE), GATE_SIZE) };
         Ok(memory)
     }
 
@@ -360,7 +346,10 @@ impl GuestMemory {
     /// The guest's own IDT, for GUEST_IDTR: vectors 0 to 2, only vector 2
     /// (NMI) present.
     pub fn idt(&self) -> DescriptorTable {
-        DescriptorTable { base: self.idt.as_ptr() as u64, limit: GUEST_IDT_LIMIT }
+        DescriptorTable {
+            base: self.idt.as_ptr() as u64,
+            limit: GUEST_IDT_LIMIT,
+        }
     }
 
     /// Walks the current page tables for the four pages and checks that
@@ -382,14 +371,11 @@ impl GuestMemory {
     ///
     /// Boot services must still be active; see [`paging::walk_current`].
     pub unsafe fn check_mappings(&self) -> Result<GuestMappings, GuestMemoryError> {
-        let code = unsafe { paging::walk_current(self.code_base()) }
-            .map_err(GuestMemoryError::CodeNotMapped)?;
-        let stack = unsafe { paging::walk_current(self.stack.as_ptr() as u64) }
-            .map_err(GuestMemoryError::StackNotMapped)?;
-        let idt = unsafe { paging::walk_current(self.idt().base) }
-            .map_err(GuestMemoryError::IdtNotMapped)?;
-        let data = unsafe { paging::walk_current(self.data_page()) }
-            .map_err(GuestMemoryError::DataNotMapped)?;
+        let code = unsafe { paging::walk_current(self.code_base()) }.map_err(GuestMemoryError::CodeNotMapped)?;
+        let stack =
+            unsafe { paging::walk_current(self.stack.as_ptr() as u64) }.map_err(GuestMemoryError::StackNotMapped)?;
+        let idt = unsafe { paging::walk_current(self.idt().base) }.map_err(GuestMemoryError::IdtNotMapped)?;
+        let data = unsafe { paging::walk_current(self.data_page()) }.map_err(GuestMemoryError::DataNotMapped)?;
 
         let cr4 = unsafe { read_cr4() };
         check_permissions(&code, &stack, cr4)?;

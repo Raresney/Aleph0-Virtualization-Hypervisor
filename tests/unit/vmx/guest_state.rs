@@ -46,7 +46,10 @@ fn compatibility_mode_cs_is_refused() {
     // Same code descriptor with L = 0, D/B = 1: 32-bit code.
     let cs = GuestSegment::from_descriptor(0x38, 0x00CF_9B00_0000_FFFF, 0);
     let tr = GuestSegment::from_descriptor(0x50, BUSY_TSS, 0x1000);
-    assert_eq!(check_segments(&cs, &tr), Err(GuestStateError::CsNot64Bit { access_rights: 0xC09B }));
+    assert_eq!(
+        check_segments(&cs, &tr),
+        Err(GuestStateError::CsNot64Bit { access_rights: 0xC09B })
+    );
 }
 
 #[test]
@@ -54,12 +57,18 @@ fn available_tss_is_refused() {
     // Type 0x9: a TSS that LTR has not marked busy.
     let cs = GuestSegment::from_descriptor(0x38, FLAT_CODE_64, 0);
     let tr = GuestSegment::from_descriptor(0x50, 0x0000_8900_0000_0067, 0x1000);
-    assert_eq!(check_segments(&cs, &tr), Err(GuestStateError::TrNotBusyTss { access_rights: 0x0089 }));
+    assert_eq!(
+        check_segments(&cs, &tr),
+        Err(GuestStateError::TrNotBusyTss { access_rights: 0x0089 })
+    );
 }
 
 #[test]
 fn unusable_tr_is_refused() {
     let cs = GuestSegment::from_descriptor(0x38, FLAT_CODE_64, 0);
     let tr = GuestSegment::unusable(0, 0);
-    assert!(matches!(check_segments(&cs, &tr), Err(GuestStateError::TrNotBusyTss { .. })));
+    assert!(matches!(
+        check_segments(&cs, &tr),
+        Err(GuestStateError::TrNotBusyTss { .. })
+    ));
 }

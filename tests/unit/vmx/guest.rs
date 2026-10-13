@@ -11,32 +11,30 @@ fn guest_code_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls() {
     assert_eq!(
         guest_code(),
         [
-            0x31, 0xDB,                   // xor ebx, ebx
-            0x48, 0x8D, 0x3D,             // lea rdi, [rip + guest_code_start]:
-            0xF7, 0xFF, 0xFF, 0xFF,       //   -9, back to byte 0
-            0x48, 0x81, 0xC7,             // add rdi, 0x1000
-            0x00, 0x10, 0x00, 0x00,
-            0x8B, 0x0F,                   // mov ecx, [rdi]
-            0xC7, 0x07,                   // mov dword ptr [rdi], GUEST_EPT_VALUE
-            0x54, 0x50, 0x45, 0x00,
-            0x8B, 0x17,                   // mov edx, [rdi]
+            0x31, 0xDB, // xor ebx, ebx
+            0x48, 0x8D, 0x3D, // lea rdi, [rip + guest_code_start]:
+            0xF7, 0xFF, 0xFF, 0xFF, //   -9, back to byte 0
+            0x48, 0x81, 0xC7, // add rdi, 0x1000
+            0x00, 0x10, 0x00, 0x00, 0x8B, 0x0F, // mov ecx, [rdi]
+            0xC7, 0x07, // mov dword ptr [rdi], GUEST_EPT_VALUE
+            0x54, 0x50, 0x45, 0x00, 0x8B, 0x17, // mov edx, [rdi]
             0xB8, 0xE0, 0xA1, 0x00, 0x00, // mov eax, GUEST_MARKER
-            0x0F, 0x01, 0xC1,             // vmcall (main VMCALL #1)
+            0x0F, 0x01, 0xC1, // vmcall (main VMCALL #1)
             0xB9, 0x00, 0x00, 0x00, 0x20, // mov ecx, GUEST_WAIT_ITERATIONS
-            0x85, 0xDB,                   // wait: test ebx, ebx
-            0x75, 0x06,                   // jnz done (+6)
-            0xF3, 0x90,                   // pause
-            0xFF, 0xC9,                   // dec ecx
-            0x75, 0xF6,                   // jnz wait (-10)
-            0xFF, 0xC0,                   // done: inc eax
-            0x0F, 0x01, 0xC1,             // vmcall (main VMCALL #2)
-            0x0F, 0x0B,                   // ud2
-            0x50,                         // nmi handler: push rax
+            0x85, 0xDB, // wait: test ebx, ebx
+            0x75, 0x06, // jnz done (+6)
+            0xF3, 0x90, // pause
+            0xFF, 0xC9, // dec ecx
+            0x75, 0xF6, // jnz wait (-10)
+            0xFF, 0xC0, // done: inc eax
+            0x0F, 0x01, 0xC1, // vmcall (main VMCALL #2)
+            0x0F, 0x0B, // ud2
+            0x50, // nmi handler: push rax
             0xB8, 0x49, 0x4D, 0x4E, 0x00, // mov eax, GUEST_NMI_MARKER
-            0x0F, 0x01, 0xC1,             // vmcall
-            0x58,                         // pop rax
+            0x0F, 0x01, 0xC1, // vmcall
+            0x58, // pop rax
             0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1
-            0x48, 0xCF,                   // iretq
+            0x48, 0xCF, // iretq
         ],
     );
 }
@@ -69,7 +67,9 @@ fn interrupt_gate_splits_a_low_handler_address() {
 fn interrupt_gate_keeps_the_high_handler_bits() {
     assert_eq!(
         interrupt_gate(0xFFFF_8000_1234_5678, 0x28),
-        [0x78, 0x56, 0x28, 0x00, 0x00, 0x8E, 0x34, 0x12, 0x00, 0x80, 0xFF, 0xFF, 0, 0, 0, 0],
+        [
+            0x78, 0x56, 0x28, 0x00, 0x00, 0x8E, 0x34, 0x12, 0x00, 0x80, 0xFF, 0xFF, 0, 0, 0, 0
+        ],
     );
 }
 
@@ -93,13 +93,22 @@ fn kernel_pages_pass_even_with_smep_and_smap() {
 
 #[test]
 fn code_with_xd_is_refused() {
-    let code = Mapping { execute_disable: true, ..kernel_page() };
-    assert_eq!(check_permissions(&code, &kernel_page(), 0), Err(GuestMemoryError::CodeNotExecutable));
+    let code = Mapping {
+        execute_disable: true,
+        ..kernel_page()
+    };
+    assert_eq!(
+        check_permissions(&code, &kernel_page(), 0),
+        Err(GuestMemoryError::CodeNotExecutable)
+    );
 }
 
 #[test]
 fn user_code_is_refused_only_under_smep() {
-    let code = Mapping { user: true, ..kernel_page() };
+    let code = Mapping {
+        user: true,
+        ..kernel_page()
+    };
     assert_eq!(check_permissions(&code, &kernel_page(), 0), Ok(()));
     assert_eq!(
         check_permissions(&code, &kernel_page(), cr::CR4_SMEP),
@@ -109,13 +118,22 @@ fn user_code_is_refused_only_under_smep() {
 
 #[test]
 fn read_only_stack_is_refused() {
-    let stack = Mapping { writable: false, ..kernel_page() };
-    assert_eq!(check_permissions(&kernel_page(), &stack, 0), Err(GuestMemoryError::StackNotWritable));
+    let stack = Mapping {
+        writable: false,
+        ..kernel_page()
+    };
+    assert_eq!(
+        check_permissions(&kernel_page(), &stack, 0),
+        Err(GuestMemoryError::StackNotWritable)
+    );
 }
 
 #[test]
 fn user_stack_is_refused_only_under_smap() {
-    let stack = Mapping { user: true, ..kernel_page() };
+    let stack = Mapping {
+        user: true,
+        ..kernel_page()
+    };
     assert_eq!(check_permissions(&kernel_page(), &stack, 0), Ok(()));
     assert_eq!(
         check_permissions(&kernel_page(), &stack, cr::CR4_SMAP),
@@ -135,20 +153,35 @@ fn writable_kernel_data_page_passes_under_smap() {
 
 #[test]
 fn read_only_data_page_is_refused() {
-    let data = Mapping { writable: false, ..kernel_page() };
+    let data = Mapping {
+        writable: false,
+        ..kernel_page()
+    };
     assert_eq!(check_data_permissions(&data, 0), Err(GuestMemoryError::DataNotWritable));
 }
 
 #[test]
 fn user_data_page_is_refused_only_under_smap() {
-    let data = Mapping { user: true, ..kernel_page() };
+    let data = Mapping {
+        user: true,
+        ..kernel_page()
+    };
     assert_eq!(check_data_permissions(&data, 0), Ok(()));
-    assert_eq!(check_data_permissions(&data, cr::CR4_SMAP), Err(GuestMemoryError::DataBlockedBySmap));
+    assert_eq!(
+        check_data_permissions(&data, cr::CR4_SMAP),
+        Err(GuestMemoryError::DataBlockedBySmap)
+    );
 }
 
 #[test]
 fn user_idt_is_refused_only_under_smap() {
-    let idt = Mapping { user: true, ..kernel_page() };
+    let idt = Mapping {
+        user: true,
+        ..kernel_page()
+    };
     assert_eq!(check_idt_permissions(&idt, 0), Ok(()));
-    assert_eq!(check_idt_permissions(&idt, cr::CR4_SMAP), Err(GuestMemoryError::IdtBlockedBySmap));
+    assert_eq!(
+        check_idt_permissions(&idt, cr::CR4_SMAP),
+        Err(GuestMemoryError::IdtBlockedBySmap)
+    );
 }
