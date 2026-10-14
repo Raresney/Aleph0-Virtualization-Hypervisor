@@ -38,6 +38,8 @@
 //! arrives. The
 //! longer walkthrough is in `docs/EPT.md`.
 
+use core::fmt;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use uefi::boot::{self, MemoryType};
@@ -47,6 +49,8 @@ use super::instruction::{VmxFail, vmx_asm};
 use super::msr::ControlCapability;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::fields::SECONDARY_ENABLE_EPT;
+
+use self::level::{Level, Pd, Pdpt, Pml4, Pt, TableLevel};
 
 /// Entry bit 0: reads allowed.
 pub const EPT_READ: u64 = 1 << 0;
@@ -167,34 +171,164 @@ pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<
     }
 }
 
-/// One EPT entry, laid out as in the module docs. `repr(transparent)`, so
-/// a table page is 512 of these back to back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-pub struct EptEntry(u64);
+/// The four EPT table levels, as types. [`EptEntry`] takes one as its
+/// parameter, so each constructor exists only for the level it is valid at:
+/// a PML4 entry cannot map a page, and a PT entry cannot point to a table.
+pub mod level {
+    mod sealed {
+        pub trait Sealed {}
+    }
 
-impl EptEntry {
-    /// A non-leaf entry pointing to the next table at `address`, allowing
+    /// One EPT table level. Sealed: the four below are all there are.
+    pub trait Level: sealed::Sealed {
+        /// The level's name, for debug output.
+        const NAME: &'static str;
+        /// Position of the 9 address bits that index this level's table.
+        const SHIFT: u32;
+
+        /// Index into this level's table for `address`.
+        fn index(address: u64) -> usize {
+            ((address >> Self::SHIFT) & 0x1FF) as usize
+        }
+    }
+
+    /// A level whose entries may point to a table of the level below.
+    pub trait TableLevel: Level {
+        /// The level of the table such an entry points to.
+        type Next: Level;
+    }
+
+    /// Page Map Level 4: the root, one entry per 512 GiB. Index bits 47:39.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pml4 {}
+    /// Page Directory Pointer Table: one entry per GiB. Index bits 38:30.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pdpt {}
+    /// Page Directory: one entry per 2 MiB, a PD table or a 2 MiB page.
+    /// Index bits 29:21.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pd {}
+    /// Page Table: one entry per 4 KiB page. Index bits 20:12.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pt {}
+
+    impl sealed::Sealed for Pml4 {}
+    impl sealed::Sealed for Pdpt {}
+    impl sealed::Sealed for Pd {}
+    impl sealed::Sealed for Pt {}
+
+    impl Level for Pml4 {
+        const NAME: &'static str = "PML4";
+        const SHIFT: u32 = 39;
+    }
+    impl Level for Pdpt {
+        const NAME: &'static str = "PDPT";
+        const SHIFT: u32 = 30;
+    }
+    impl Level for Pd {
+        const NAME: &'static str = "PD";
+        const SHIFT: u32 = 21;
+    }
+    impl Level for Pt {
+        const NAME: &'static str = "PT";
+        const SHIFT: u32 = 12;
+    }
+
+    impl TableLevel for Pml4 {
+        type Next = Pdpt;
+    }
+    impl TableLevel for Pdpt {
+        type Next = Pd;
+    }
+    impl TableLevel for Pd {
+        type Next = Pt;
+    }
+}
+
+/// One entry of a level-`L` table, laid out as in the module docs.
+/// `repr(transparent)`, so a table page is 512 of these back to back.
+///
+/// What an entry can be depends on its level:
+///
+/// | Level | Constructors |
+/// |---|---|
+/// | [`Pml4`], [`Pdpt`] | [`table`](Self::table) |
+/// | [`Pd`] | [`table`](Self::table), [`large_page`](Self::large_page) |
+/// | [`Pt`] | [`page`](Self::page), [`with_access`](Self::with_access) |
+#[repr(transparent)]
+pub struct EptEntry<L: Level> {
+    raw: u64,
+    level: PhantomData<L>,
+}
+
+impl<L: Level> EptEntry<L> {
+    /// Not present: R = W = X = 0.
+    pub const EMPTY: Self = Self::from_raw(0);
+
+    const fn from_raw(raw: u64) -> Self {
+        Self {
+            raw,
+            level: PhantomData,
+        }
+    }
+}
+
+impl<L: TableLevel> EptEntry<L> {
+    /// An entry pointing to the level-`L::Next` table at `address`, allowing
     /// every access. A non-leaf entry only limits what lies below it, so the
     /// leaf entries decide the permissions.
     pub fn table(address: u64) -> Self {
-        Self((address & ADDRESS_MASK) | EPT_RWX)
+        Self::from_raw((address & ADDRESS_MASK) | EPT_RWX)
     }
+}
 
-    /// A PD entry mapping the 2 MiB page at `address`: RWX, write-back.
+impl EptEntry<Pd> {
+    /// An entry mapping the 2 MiB page at `address`: RWX, write-back.
     pub fn large_page(address: u64) -> Self {
-        Self((address & ADDRESS_MASK) | EPT_RWX | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT) | LARGE_PAGE)
+        Self::from_raw((address & ADDRESS_MASK) | EPT_RWX | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT) | LARGE_PAGE)
     }
+}
 
-    /// A PT entry mapping the 4 KiB page at `address` with `access` (a mix
-    /// of [`EPT_READ`], [`EPT_WRITE`], [`EPT_EXECUTE`]), write-back.
+impl EptEntry<Pt> {
+    /// An entry mapping the 4 KiB page at `address` with `access` (a mix of
+    /// [`EPT_READ`], [`EPT_WRITE`], [`EPT_EXECUTE`]), write-back.
     pub fn page(address: u64, access: u64) -> Self {
-        Self((address & ADDRESS_MASK) | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT)).with_access(access)
+        Self::from_raw((address & ADDRESS_MASK) | (MEMORY_TYPE_WB << MEMORY_TYPE_SHIFT)).with_access(access)
     }
 
     /// The same entry with its R, W and X bits replaced by `access`.
     pub fn with_access(self, access: u64) -> Self {
-        Self((self.0 & !EPT_RWX) | (access & EPT_RWX))
+        Self::from_raw((self.raw & !EPT_RWX) | (access & EPT_RWX))
+    }
+}
+
+// Written by hand rather than derived: a derive would require `L` itself to
+// implement each trait, and the level types are never instantiated.
+impl<L: Level> Clone for EptEntry<L> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<L: Level> Copy for EptEntry<L> {}
+
+impl<L: Level> PartialEq for EptEntry<L> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<L: Level> Eq for EptEntry<L> {}
+
+impl<L: Level> Default for EptEntry<L> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl<L: Level> fmt::Debug for EptEntry<L> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EptEntry<{}>({:#x})", L::NAME, self.raw)
     }
 }
 
@@ -214,24 +348,6 @@ impl Eptp {
     pub fn raw(self) -> u64 {
         self.0
     }
-}
-
-// No PML4 index helper: the map ends at 512 GiB at most, so every address
-// in it uses PML4 entry 0.
-
-/// Index into the PDPT: bits 38:30.
-pub fn pdpt_index(address: u64) -> usize {
-    ((address >> 30) & 0x1FF) as usize
-}
-
-/// Index into the PD: bits 29:21.
-pub fn pd_index(address: u64) -> usize {
-    ((address >> 21) & 0x1FF) as usize
-}
-
-/// Index into the PT: bits 20:12.
-pub fn pt_index(address: u64) -> usize {
-    ((address >> 12) & 0x1FF) as usize
 }
 
 /// End of the identity map for memory-map regions `(start, pages)`: the
@@ -266,11 +382,11 @@ pub fn identity_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64
 /// one has. Under UEFI's identity mapping a table's physical address is its
 /// virtual one; on the host tests these are made-up numbers.
 struct Tables<'a> {
-    pml4: &'a mut [EptEntry],
-    pdpt: &'a mut [EptEntry],
+    pml4: &'a mut [EptEntry<Pml4>],
+    pdpt: &'a mut [EptEntry<Pdpt>],
     /// One PD per GiB of the map, back to back.
-    pds: &'a mut [EptEntry],
-    pt: &'a mut [EptEntry],
+    pds: &'a mut [EptEntry<Pd>],
+    pt: &'a mut [EptEntry<Pt>],
     pdpt_address: u64,
     pds_address: u64,
     pt_address: u64,
@@ -296,14 +412,16 @@ fn fill_identity_map(tables: Tables<'_>, gibs: usize, protected_page: u64) -> us
     }
     // The PDs are back to back, one per PDPT entry, so the PD entry for an
     // address is its PDPT index times 512 plus its PD index.
-    let split = pdpt_index(protected_page) * ENTRIES + pd_index(protected_page);
+    // No PML4 index: the map ends at 512 GiB at most, so every address in
+    // it uses PML4 entry 0.
+    let split = Pdpt::index(protected_page) * ENTRIES + Pd::index(protected_page);
     tables.pds[split] = EptEntry::table(tables.pt_address);
 
     let region = protected_page & !(SIZE_2M - 1);
     for (i, entry) in tables.pt.iter_mut().enumerate() {
         *entry = EptEntry::page(region + (i * PAGE_SIZE) as u64, EPT_RWX);
     }
-    let protected = pt_index(protected_page);
+    let protected = Pt::index(protected_page);
     tables.pt[protected] = EptEntry::page(protected_page, EPT_READ);
     protected
 }
@@ -340,12 +458,20 @@ impl Ept {
         let pds = allocate_zeroed_pages(gibs, EptError::AllocationFailed)?.as_ptr() as u64;
         let pt = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
 
+        /// The `pages` table pages at `address` as one slice of entries.
+        ///
+        /// # Safety
+        ///
+        /// `address` is a page-aligned allocation of `pages` zeroed pages,
+        /// and nothing else refers to it for the returned lifetime.
+        unsafe fn table<'a, L: Level>(address: u64, pages: usize) -> &'a mut [EptEntry<L>] {
+            // SAFETY: the caller guarantees the memory is ours and as long as
+            // the slice; an all-zero `EptEntry` is a valid (empty) entry.
+            unsafe { core::slice::from_raw_parts_mut(address as *mut EptEntry<L>, pages * ENTRIES) }
+        }
         // SAFETY: each allocation above is page-aligned, zeroed and as long
         // as its slice, and nothing else refers to it yet.
-        let table = |address: u64, pages: usize| unsafe {
-            core::slice::from_raw_parts_mut(address as *mut EptEntry, pages * ENTRIES)
-        };
-        let protected = fill_identity_map(
+        let tables = unsafe {
             Tables {
                 pml4: table(pml4, 1),
                 pdpt: table(pdpt, 1),
@@ -354,10 +480,9 @@ impl Ept {
                 pdpt_address: pdpt,
                 pds_address: pds,
                 pt_address: pt,
-            },
-            gibs,
-            protected_page,
-        );
+            }
+        };
+        let protected = fill_identity_map(tables, gibs, protected_page);
 
         let ept = Self {
             eptp: Eptp::new(pml4),
@@ -366,7 +491,7 @@ impl Ept {
         };
         publish(ProtectedPage {
             gpa: protected_page,
-            entry: (pt as *mut EptEntry).wrapping_add(protected),
+            entry: (pt as *mut EptEntry<Pt>).wrapping_add(protected),
             eptp: ept.eptp,
             invept,
         })?;
@@ -396,7 +521,7 @@ pub struct ProtectedPage {
     /// Guest-physical address of the page.
     pub gpa: u64,
     /// Its entry in the PT [`Ept::build`] filled.
-    entry: *mut EptEntry,
+    entry: *mut EptEntry<Pt>,
     eptp: Eptp,
     invept: InveptType,
 }
@@ -433,7 +558,7 @@ impl ProtectedPage {
 // `static mut` or a lock: this `no_std` build has neither an allocator for
 // `Once`-style cells nor a `Mutex`.
 static PROTECTED_GPA: AtomicU64 = AtomicU64::new(0);
-static PROTECTED_ENTRY: AtomicPtr<EptEntry> = AtomicPtr::new(core::ptr::null_mut());
+static PROTECTED_ENTRY: AtomicPtr<EptEntry<Pt>> = AtomicPtr::new(core::ptr::null_mut());
 static PUBLISHED_EPTP: AtomicU64 = AtomicU64::new(0);
 /// The [`InveptType`] as its operand value, and the "published" flag: 0
 /// until [`publish`] has stored everything else. Written last (Release),

@@ -4,6 +4,7 @@
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
 //! private items.
 
+use super::level::{Pd, Pdpt, Pml4, Pt};
 use super::*;
 
 /// A secondary capability MSR that allows EPT and nothing else.
@@ -47,26 +48,29 @@ fn each_missing_capability_has_its_error() {
 
 #[test]
 fn table_entry_allows_everything() {
-    assert_eq!(EptEntry::table(0x7e00_1000), EptEntry(0x7e00_1007));
+    assert_eq!(EptEntry::<Pdpt>::table(0x7e00_1000), EptEntry::from_raw(0x7e00_1007));
 }
 
 #[test]
 fn large_page_entry_is_rwx_write_back_2m() {
     // 0x7 RWX | 6 << 3 = 0x30 WB | 0x80 large page.
-    assert_eq!(EptEntry::large_page(0x4020_0000), EptEntry(0x4020_00B7));
+    assert_eq!(EptEntry::large_page(0x4020_0000), EptEntry::from_raw(0x4020_00B7));
 }
 
 #[test]
 fn read_only_page_entry_has_only_r() {
-    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_READ), EptEntry(0x7eb1_d031));
-    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_RWX), EptEntry(0x7eb1_d037));
+    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_READ), EptEntry::from_raw(0x7eb1_d031));
+    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_RWX), EptEntry::from_raw(0x7eb1_d037));
 }
 
 #[test]
 fn with_access_replaces_only_the_permission_bits() {
     let read_only = EptEntry::page(0x7eb1_d000, EPT_READ);
-    assert_eq!(read_only.with_access(EPT_READ | EPT_WRITE), EptEntry(0x7eb1_d033));
-    assert_eq!(read_only.with_access(0), EptEntry(0x7eb1_d030));
+    assert_eq!(
+        read_only.with_access(EPT_READ | EPT_WRITE),
+        EptEntry::from_raw(0x7eb1_d033)
+    );
+    assert_eq!(read_only.with_access(0), EptEntry::from_raw(0x7eb1_d030));
 }
 
 #[test]
@@ -75,9 +79,35 @@ fn eptp_low_bits_are_write_back_and_4_levels() {
 }
 
 #[test]
-fn indices_split_the_address() {
+fn each_level_indexes_its_own_address_bits() {
     let address = (3 << 39) | (5 << 30) | (7 << 21) | (9 << 12) | 0x123;
-    assert_eq!((pdpt_index(address), pd_index(address), pt_index(address)), (5, 7, 9));
+    assert_eq!(
+        (
+            Pml4::index(address),
+            Pdpt::index(address),
+            Pd::index(address),
+            Pt::index(address)
+        ),
+        (3, 5, 7, 9)
+    );
+}
+
+#[test]
+fn every_level_can_point_to_the_next_table() {
+    assert_eq!(EptEntry::<Pml4>::table(0x1000).raw, 0x1007);
+    assert_eq!(EptEntry::<Pdpt>::table(0x1000).raw, 0x1007);
+    assert_eq!(EptEntry::<Pd>::table(0x1000).raw, 0x1007);
+}
+
+#[test]
+fn empty_entry_is_not_present_and_the_default() {
+    assert_eq!(EptEntry::<Pt>::EMPTY.raw, 0);
+    assert_eq!(EptEntry::<Pml4>::default(), EptEntry::EMPTY);
+}
+
+#[test]
+fn debug_names_the_level() {
+    assert_eq!(format!("{:?}", EptEntry::<Pd>::table(0x4000)), "EptEntry<PD>(0x4007)");
 }
 
 #[test]
@@ -106,15 +136,22 @@ fn empty_memory_map_is_refused() {
     assert_eq!(identity_map_end(core::iter::empty()), Err(EptError::EmptyMemoryMap));
 }
 
+/// The PML4, PDPT, PDs and PT of an identity map.
+type Tables4 = (
+    Vec<EptEntry<Pml4>>,
+    Vec<EptEntry<Pdpt>>,
+    Vec<EptEntry<Pd>>,
+    Vec<EptEntry<Pt>>,
+);
+
 /// Fills a 2 GiB identity map with made-up table addresses and returns the
 /// tables and the protected PT index.
-fn filled(protected_page: u64) -> (Vec<EptEntry>, Vec<EptEntry>, Vec<EptEntry>, Vec<EptEntry>, usize) {
-    let empty = EptEntry::default();
+fn filled(protected_page: u64) -> (Tables4, usize) {
     let (mut pml4, mut pdpt, mut pds, mut pt) = (
-        vec![empty; ENTRIES],
-        vec![empty; ENTRIES],
-        vec![empty; 2 * ENTRIES],
-        vec![empty; ENTRIES],
+        vec![EptEntry::EMPTY; ENTRIES],
+        vec![EptEntry::EMPTY; ENTRIES],
+        vec![EptEntry::EMPTY; 2 * ENTRIES],
+        vec![EptEntry::EMPTY; ENTRIES],
     );
     let protected = fill_identity_map(
         Tables {
@@ -129,22 +166,22 @@ fn filled(protected_page: u64) -> (Vec<EptEntry>, Vec<EptEntry>, Vec<EptEntry>, 
         2,
         protected_page,
     );
-    (pml4, pdpt, pds, pt, protected)
+    ((pml4, pdpt, pds, pt), protected)
 }
 
 #[test]
 fn identity_map_links_the_levels() {
-    let (pml4, pdpt, _, _, _) = filled(0x7eb1_d000);
+    let ((pml4, pdpt, _, _), _) = filled(0x7eb1_d000);
     assert_eq!(pml4[0], EptEntry::table(0x1000));
-    assert_eq!(pml4[1], EptEntry(0));
+    assert_eq!(pml4[1], EptEntry::EMPTY);
     assert_eq!(pdpt[0], EptEntry::table(0x2000));
     assert_eq!(pdpt[1], EptEntry::table(0x3000));
-    assert_eq!(pdpt[2], EptEntry(0));
+    assert_eq!(pdpt[2], EptEntry::EMPTY);
 }
 
 #[test]
 fn identity_map_uses_2m_pages_outside_the_split_region() {
-    let (_, _, pds, _, _) = filled(0x7eb1_d000);
+    let ((_, _, pds, _), _) = filled(0x7eb1_d000);
     assert_eq!(pds[0], EptEntry::large_page(0));
     assert_eq!(pds[1023], EptEntry::large_page(1023 * SIZE_2M));
     // 0x7eb1_d000 is in the 2 MiB region 0x7ea0_0000, entry 0x3F5.
@@ -154,7 +191,7 @@ fn identity_map_uses_2m_pages_outside_the_split_region() {
 
 #[test]
 fn identity_map_makes_only_the_protected_page_read_only() {
-    let (_, _, _, pt, protected) = filled(0x7eb1_d000);
+    let ((_, _, _, pt), protected) = filled(0x7eb1_d000);
     assert_eq!(protected, 0x11D);
     assert_eq!(pt[0x11D], EptEntry::page(0x7eb1_d000, EPT_READ));
     assert_eq!(pt[0x11C], EptEntry::page(0x7eb1_c000, EPT_RWX));

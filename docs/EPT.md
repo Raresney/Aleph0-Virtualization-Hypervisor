@@ -72,14 +72,17 @@ Some combinations are not just "forbidden" but invalid, for example W = 1
 with R = 0. The CPU reports those as **exit reason 49, EPT
 misconfiguration**, which Aleph0 never handles.
 
-The encodings Aleph0 uses (`ept.rs`, all host-tested):
+The encodings Aleph0 uses (`ept.rs`, all host-tested). `EptEntry<L>` is
+generic over its table level (`Pml4`, `Pdpt`, `Pd`, `Pt` in `ept::level`),
+so each constructor exists only where the entry is valid: calling
+`large_page` on a PT entry, or `table` on one, does not compile.
 
-| Function | Value | Example |
-|---|---|---|
-| `EptEntry::table(addr)` | `addr \| 0b111` | `0x7e00_1007` |
-| `EptEntry::large_page(addr)` | `addr \| RWX \| 6 << 3 \| 1 << 7` | `0x4020_00B7` |
-| `EptEntry::page(addr, R)` | `addr \| R \| 6 << 3` | `0x7eb1_d031` (read-only) |
-| `Eptp::new(pml4)` | `pml4 \| 6 \| 3 << 3` | low bits always `0x1E` |
+| Function | Levels | Value | Example |
+|---|---|---|---|
+| `EptEntry::table(addr)` | PML4, PDPT, PD | `addr \| 0b111` | `0x7e00_1007` |
+| `EptEntry::large_page(addr)` | PD | `addr \| RWX \| 6 << 3 \| 1 << 7` | `0x4020_00B7` |
+| `EptEntry::page(addr, R)` | PT | `addr \| R \| 6 << 3` | `0x7eb1_d031` (read-only) |
+| `Eptp::new(pml4)` | — | `pml4 \| 6 \| 3 << 3` | low bits always `0x1E` |
 
 The **EPT pointer** (EPTP, VMCS field `0x201A`) tells the CPU where the
 PML4 is:
