@@ -19,7 +19,7 @@
 //! main VMCALL #2 ──▶ finished, if every emulated exit came (EXPECTED_EMULATION)
 //! ```
 
-use super::{ExitEvent, ExitInfo, ExitState};
+use super::{EptQualification, ExitEvent, ExitInfo, ExitState};
 use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 
 /// How many main VMCALLs the guest makes; the last one ends the run.
@@ -107,7 +107,7 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     let protected_write = exit.protected_page != 0
         && exit.guest_physical & !0xFFF == exit.protected_page
-        && exit.exit_qualification.is_protected_write();
+        && EptQualification(exit.qualification).is_protected_write();
     if protected_write && state.ept_writes_granted == 0 {
         (
             ExitEvent::EptWriteGranted,

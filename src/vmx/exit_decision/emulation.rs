@@ -1,8 +1,8 @@
 //! Instructions Aleph0 executes for the guest: passthrough emulation.
 //!
 //! Some guest instructions always exit (CPUID). Others exit because the
-//! exit bitmaps ask for it (RDMSR/WRMSR, through the MSR bitmap in
-//! `vmx::exit_bitmaps`). A handler here decides
+//! exit bitmaps ask for it (RDMSR/WRMSR through the MSR bitmap, IN/OUT through
+//! the I/O bitmaps, both in `vmx::exit_bitmaps`). A handler here decides
 //! what to execute and counts it. `vmexit::handler` then runs the real
 //! instruction in root operation, writes the result into the guest's
 //! registers and moves RIP past the instruction, so the guest sees what the
@@ -25,6 +25,10 @@ pub enum Emulation {
     /// WRMSR of `value` (EDX:EAX) to `msr`, an intercepted MSR. `value` is
     /// canonical, so the real WRMSR cannot fault.
     Wrmsr { msr: u32, value: u64 },
+    /// IN of `size` from `port`.
+    In { port: u16, size: IoSize },
+    /// OUT of `value` (`size` wide) to `port`.
+    Out { port: u16, size: IoSize, value: u32 },
 }
 
 /// Emulated exits handled so far, per instruction.
@@ -33,11 +37,17 @@ pub struct EmulationCounts {
     pub cpuid: u32,
     pub rdmsr: u32,
     pub wrmsr: u32,
+    pub io_in: u32,
+    pub io_out: u32,
 }
 
 impl fmt::Display for EmulationCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cpuid={} rdmsr={} wrmsr={}", self.cpuid, self.rdmsr, self.wrmsr)
+        write!(
+            f,
+            "cpuid={} rdmsr={} wrmsr={} in={} out={}",
+            self.cpuid, self.rdmsr, self.wrmsr, self.io_in, self.io_out
+        )
     }
 }
 
@@ -144,6 +154,124 @@ pub(super) fn wrmsr(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
         ),
         MsrRoute::OutOfRange => (ExitEvent::GuestGeneralProtection, state),
         MsrRoute::NotIntercepted => (ExitEvent::Unexpected, state),
+    }
+}
+
+/// How many bytes an IN or OUT moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoSize {
+    Byte,
+    Word,
+    Dword,
+}
+
+impl IoSize {
+    /// Bytes moved: 1, 2 or 4.
+    pub fn bytes(self) -> u8 {
+        match self {
+            Self::Byte => 1,
+            Self::Word => 2,
+            Self::Dword => 4,
+        }
+    }
+
+    /// The bits of RAX the access uses: AL, AX or EAX.
+    fn mask(self) -> u64 {
+        match self {
+            Self::Byte => 0xFF,
+            Self::Word => 0xFFFF,
+            Self::Dword => 0xFFFF_FFFF,
+        }
+    }
+}
+
+/// An I/O instruction's exit qualification (Intel SDM Vol. 3C, "Exit
+/// Qualification for I/O Instructions"):
+///
+/// ```text
+/// bits 2:0   size − 1: 0 = 1 byte, 1 = 2 bytes, 3 = 4 bytes
+/// bit  3     direction: 1 = IN, 0 = OUT
+/// bit  4     string instruction (INS/OUTS)
+/// bit  5     REP prefix
+/// bit  6     operand: 1 = immediate port, 0 = DX
+/// bits 31:16 port
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoQualification(pub u64);
+
+impl IoQualification {
+    /// The access size, or `None` for the encodings the SDM leaves unused.
+    pub fn size(self) -> Option<IoSize> {
+        match self.0 & 0b111 {
+            0 => Some(IoSize::Byte),
+            1 => Some(IoSize::Word),
+            3 => Some(IoSize::Dword),
+            _ => None,
+        }
+    }
+
+    /// Whether it is IN (bit 3); OUT otherwise.
+    pub fn is_in(self) -> bool {
+        self.0 & (1 << 3) != 0
+    }
+
+    /// Whether it is INS or OUTS (bit 4).
+    pub fn is_string(self) -> bool {
+        self.0 & (1 << 4) != 0
+    }
+
+    /// Whether it has a REP prefix (bit 5).
+    pub fn is_rep(self) -> bool {
+        self.0 & (1 << 5) != 0
+    }
+
+    /// The port (bits 31:16).
+    pub fn port(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+}
+
+/// RAX after an IN of `size` that read `value`. A 1- or 2-byte IN writes
+/// only AL or AX and keeps the rest of RAX. A 4-byte IN writes EAX, which
+/// zero-extends into RAX like every 32-bit register write in 64-bit mode.
+pub fn merge_in(rax: u64, size: IoSize, value: u32) -> u64 {
+    match size {
+        IoSize::Dword => u64::from(value),
+        _ => (rax & !size.mask()) | (u64::from(value) & size.mask()),
+    }
+}
+
+/// The value an OUT of `size` sends: AL, AX or EAX.
+pub fn out_value(rax: u64, size: IoSize) -> u32 {
+    (rax & size.mask()) as u32
+}
+
+/// IN or OUT (exit reason 30), for a port the I/O bitmaps intercept: passed
+/// through with the port and size from the exit qualification. Not checked
+/// against INTERCEPTED_PORTS: an access to several ports exits if any of
+/// them is intercepted (`in ax, dx` at 0x3FE covers 0x3FF), and passing
+/// that access through is what the guest would have done anyway. String
+/// and REP forms, which read or write guest memory, stop the guest.
+pub(super) fn io(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+    let io = IoQualification(exit.qualification);
+    let Some(size) = io.size() else {
+        return (ExitEvent::Unexpected, state);
+    };
+    if io.is_string() || io.is_rep() {
+        return (ExitEvent::Unexpected, state);
+    }
+    let port = io.port();
+    if io.is_in() {
+        (
+            ExitEvent::Emulated(Emulation::In { port, size }),
+            counted(state, |counts| counts.io_in += 1),
+        )
+    } else {
+        let value = out_value(exit.guest_rax, size);
+        (
+            ExitEvent::Emulated(Emulation::Out { port, size, value }),
+            counted(state, |counts| counts.io_out += 1),
+        )
     }
 }
 

@@ -8,7 +8,8 @@
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
 use crate::vmx::guest::{
-    EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_NMI_MARKER,
+    EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE,
+    GUEST_NMI_MARKER, GUEST_SCRATCH_PORT,
 };
 
 const MARKER: u64 = GUEST_MARKER as u64;
@@ -60,7 +61,7 @@ fn exit(basic: u16) -> ExitInfo {
         guest_rdx: GUEST_EPT_VALUE.into(),
         interruptibility: 0,
         idt_vectoring_valid: false,
-        exit_qualification: EptQualification(0),
+        qualification: 0,
         guest_physical: 0,
         protected_page: PROTECTED_PAGE,
     }
@@ -70,7 +71,7 @@ fn exit(basic: u16) -> ExitInfo {
 fn ept_violation(gpa: u64, qualification: u64) -> ExitInfo {
     ExitInfo {
         guest_physical: gpa,
-        exit_qualification: EptQualification(qualification),
+        qualification,
         ..exit(EXIT_REASON_EPT_VIOLATION)
     }
 }
@@ -619,6 +620,11 @@ fn emulated_exits() -> Vec<ExitInfo> {
         guest_rdx: rdx,
         ..exit(basic)
     };
+    let io = |is_in: bool, rax: u64| ExitInfo {
+        qualification: (u64::from(GUEST_SCRATCH_PORT) << 16) | (u64::from(is_in) << 3),
+        guest_rax: rax,
+        ..exit(EXIT_REASON_IO_INSTRUCTION)
+    };
     vec![
         ExitInfo {
             guest_rax: 1,
@@ -629,6 +635,10 @@ fn emulated_exits() -> Vec<ExitInfo> {
         msr(EXIT_REASON_WRMSR, GUEST_MSR_VALUE & 0xFFFF_FFFF, GUEST_MSR_VALUE >> 32),
         msr(EXIT_REASON_RDMSR, 0, 0),
         msr(EXIT_REASON_WRMSR, 0, 0),
+        io(true, 0),
+        io(false, GUEST_IO_VALUE.into()),
+        io(true, 0),
+        io(false, 0),
     ]
 }
 
@@ -704,4 +714,19 @@ fn msr_exits_are_dispatched_to_emulation() {
         decide(START, msr(EXIT_REASON_WRMSR)).0,
         ExitEvent::Emulated(Emulation::Wrmsr { msr: 0xC000_0102, .. })
     ));
+}
+
+#[test]
+fn io_exit_is_dispatched_to_emulation() {
+    let byte_in = ExitInfo {
+        qualification: (0x3FF << 16) | (1 << 3),
+        ..exit(EXIT_REASON_IO_INSTRUCTION)
+    };
+    assert_eq!(
+        decide(START, byte_in).0,
+        ExitEvent::Emulated(Emulation::In {
+            port: 0x3FF,
+            size: IoSize::Byte
+        })
+    );
 }

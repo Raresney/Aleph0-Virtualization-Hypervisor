@@ -12,7 +12,7 @@
 //! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
 //! `match`, which the compiler checks and turns into the same jump table:
 //!
-//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR).
+//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR, IN, OUT).
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
 //!   NMI reinjection).
 //!
@@ -21,7 +21,7 @@
 mod emulation;
 mod scenario;
 
-pub use emulation::{Emulation, EmulationCounts, cpuid_policy};
+pub use emulation::{Emulation, EmulationCounts, IoSize, cpuid_policy, merge_in};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
@@ -83,6 +83,9 @@ pub const EXIT_REASON_NMI_WINDOW: u16 = 8;
 pub const EXIT_REASON_CPUID: u16 = 10;
 /// Basic exit reason of a VMCALL exit.
 pub const EXIT_REASON_VMCALL: u16 = 18;
+/// Basic exit reason of IN/OUT (and INS/OUTS) to a port the I/O bitmaps
+/// intercept.
+pub const EXIT_REASON_IO_INSTRUCTION: u16 = 30;
 /// Basic exit reason of RDMSR, which exits for MSRs the MSR bitmap
 /// intercepts or does not cover.
 pub const EXIT_REASON_RDMSR: u16 = 31;
@@ -120,8 +123,7 @@ pub const EPT_TRANSLATED_ACCESS: u64 = 1 << 8;
 pub const EPT_NMI_UNBLOCKING_IRET: u64 = 1 << 12;
 
 /// An EPT violation's exit qualification (EXIT_QUALIFICATION), decoded with
-/// the bits above. Other exits carry other layouts in the same field; only
-/// EPT exits are read through this type.
+/// the bits above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EptQualification(pub u64);
 
@@ -233,8 +235,9 @@ pub struct ExitInfo {
     pub interruption_info: InterruptionInfo,
     /// The guest's RAX, RCX and RDX. CPUID reads its leaf from EAX and its
     /// subleaf from ECX. RDMSR and WRMSR read the MSR from ECX, and WRMSR its
-    /// value from EDX:EAX. At main VMCALL #1, ECX and EDX hold what the guest
-    /// read from its data page before and after its write.
+    /// value from EDX:EAX. OUT reads its value from AL, AX or EAX. At main
+    /// VMCALL #1, ECX and EDX hold what the guest read from its data page
+    /// before and after its write.
     pub guest_rax: u64,
     pub guest_rcx: u64,
     pub guest_rdx: u64,
@@ -243,8 +246,11 @@ pub struct ExitInfo {
     /// IDT_VECTORING_INFO bit 31: the exit interrupted an event's delivery
     /// through the guest IDT.
     pub idt_vectoring_valid: bool,
-    /// EXIT_QUALIFICATION, which [`decide`] reads for EPT violations only.
-    pub exit_qualification: EptQualification,
+    /// EXIT_QUALIFICATION. Its layout depends on the reason; [`decide`]
+    /// reads it for EPT violations ([`EptQualification`]) and I/O
+    /// instructions (`emulation::IoQualification`) only, and it is 0
+    /// otherwise.
+    pub qualification: u64,
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only; 0 otherwise.
     pub guest_physical: u64,
     /// GPA of the page EPT maps read-only (`ept::protected_page`), 0 if none.
@@ -434,6 +440,7 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         EXIT_REASON_CPUID => emulation::cpuid(state, &exit),
         EXIT_REASON_RDMSR => emulation::rdmsr(state, &exit),
         EXIT_REASON_WRMSR => emulation::wrmsr(state, &exit),
+        EXIT_REASON_IO_INSTRUCTION => emulation::io(state, &exit),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
         EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),

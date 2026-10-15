@@ -171,6 +171,14 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
         Some(EmulationOutcome::Wrmsr { msr, value }) => crate::serial_println!(
             "{tag} VM exit #{number}: WRMSR {msr:#x} <- {value:#018x}; resuming at rip={rip:#018x}."
         ),
+        Some(EmulationOutcome::In { port, size, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: IN port {port:#x} size={} -> {value:#x}; resuming at rip={rip:#018x}.",
+            size.bytes(),
+        ),
+        Some(EmulationOutcome::Out { port, size, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: OUT port {port:#x} size={} value={value:#x}; resuming at rip={rip:#018x}.",
+            size.bytes(),
+        ),
         None => crate::serial_println!("{tag} VM exit #{number}: emulated instruction not executed."),
     }
 }

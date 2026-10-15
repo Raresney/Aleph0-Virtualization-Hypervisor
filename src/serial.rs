@@ -94,9 +94,10 @@
 //! Once several vCPUs exist, output needs a spinlock (not one that can
 //! deadlock if an exit handler interrupts its own holder).
 
-use core::arch::asm;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::port::{inb, outb};
 
 // Step 1: where the chip lives. COM1 claims the 8 ports 0x3F8..=0x3FF and
 // uses the low 3 bits of the port number to pick one of its registers.
@@ -141,56 +142,9 @@ pub const fn divisor(baud: u32) -> u16 {
     (115_200 / baud) as u16
 }
 
-// Step 0: the only two ways this driver touches hardware. Everything else in
-// the file is calls to these.
-//
-// The `asm!` options are promises to the compiler:
-// - `nostack`: the instruction does not push or pop;
-// - `preserves_flags`: `in`/`out` do not change RFLAGS;
-// - `nomem`: the instruction does not read or write memory, so the compiler
-//   may move ordinary memory accesses across it. True for the UART, which
-//   never touches RAM. Do NOT copy `nomem` into port I/O for a DMA device
-//   (one that reads a buffer in RAM after an `out` command): the compiler
-//   could then move the buffer writes after the command.
-
-/// Writes one byte to an I/O port: `out dx, al`.
-///
-/// `in("dx") port` loads the 16-bit port number into DX and `in("al") value`
-/// loads the byte into AL before the instruction runs; the CPU then sends an
-/// I/O write for that port to the chipset.
-///
-/// # Safety
-///
-/// Port writes reach hardware directly; the port must belong to a device
-/// this code owns.
-unsafe fn outb(port: u16, value: u8) {
-    // SAFETY: OUT touches only the I/O port, which the caller guarantees
-    // belongs to a device this code owns.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// Reads one byte from an I/O port: `in al, dx`.
-///
-/// `in("dx") port` loads the port number into DX; afterwards `out("al")`
-/// copies the byte the device returned from AL into `value`. A port no
-/// device claims reads as `0xFF`.
-///
-/// # Safety
-///
-/// Some device registers change state when read (reading the UART's data
-/// register removes the received byte); the port must belong to a device
-/// this code owns.
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    // SAFETY: IN touches only the I/O port, which the caller guarantees
-    // belongs to a device this code owns.
-    unsafe {
-        asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
+// Step 0: the only two ways this driver touches hardware are
+// `port::outb` and `port::inb` (`src/port.rs`). Everything else in the file
+// is calls to these.
 
 /// Why [`init`] did not enable serial output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

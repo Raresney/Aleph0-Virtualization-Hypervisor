@@ -27,6 +27,7 @@ macro_rules! log {
 
 mod bring_up;
 mod output;
+mod port;
 mod serial;
 mod vmx;
 

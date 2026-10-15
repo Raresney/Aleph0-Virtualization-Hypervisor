@@ -10,12 +10,12 @@
 //! `bring_up::run` enters the guest through `vmcs::launch`, so the guest's
 //! first VM exit lands here. The handler (`handler.rs`) prints each exit over
 //! serial, and `exit_decision::decide` says what it is: an instruction to
-//! execute for the guest (CPUID, RDMSR, WRMSR), or a #GP to inject for an MSR
-//! it cannot have, a write to the EPT-protected data page to allow and retry,
-//! a VMCALL to resume past, an NMI to reinject, an NMI window to inject in,
-//! the last planned VMCALL, or something unexpected. To resume, the handler
-//! updates the VMCS and returns 0, and the stub executes
-//! VMRESUME. To stop, it returns a stop value, and the stub jumps back into
+//! execute for the guest (CPUID, RDMSR, WRMSR, IN, OUT), or a #GP to inject
+//! for an MSR it cannot have, a write to the EPT-protected data page to allow
+//! and retry, a VMCALL to resume past, an NMI to reinject, an NMI window to
+//! inject in, the last planned VMCALL, or something unexpected. To resume, the
+//! handler updates the VMCS and returns 0, and the stub executes VMRESUME. To
+//! stop, it returns a stop value, and the stub jumps back into
 //! `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`). The
 //! lines that only print live in `report.rs`.
 

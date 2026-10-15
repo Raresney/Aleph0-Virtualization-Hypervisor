@@ -12,11 +12,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::RegisterFrame;
 use super::report::{read_or_report, report_ept_exit, report_event, report_exception};
+use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, Emulation, EmulationCounts,
-    EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, ResumePlan,
-    UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_IO_INSTRUCTION,
+    Emulation, EmulationCounts, EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
+    InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name, merge_in,
 };
 use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
@@ -40,6 +41,8 @@ static EPT_WRITES_GRANTED: AtomicU32 = AtomicU32::new(0);
 static EMULATED_CPUID: AtomicU32 = AtomicU32::new(0);
 static EMULATED_RDMSR: AtomicU32 = AtomicU32::new(0);
 static EMULATED_WRMSR: AtomicU32 = AtomicU32::new(0);
+static EMULATED_IN: AtomicU32 = AtomicU32::new(0);
+static EMULATED_OUT: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
@@ -52,6 +55,8 @@ fn load_state() -> ExitState {
             cpuid: EMULATED_CPUID.load(Ordering::Relaxed),
             rdmsr: EMULATED_RDMSR.load(Ordering::Relaxed),
             wrmsr: EMULATED_WRMSR.load(Ordering::Relaxed),
+            io_in: EMULATED_IN.load(Ordering::Relaxed),
+            io_out: EMULATED_OUT.load(Ordering::Relaxed),
         },
     }
 }
@@ -65,6 +70,8 @@ fn store_state(state: ExitState) {
     EMULATED_CPUID.store(state.emulated.cpuid, Ordering::Relaxed);
     EMULATED_RDMSR.store(state.emulated.rdmsr, Ordering::Relaxed);
     EMULATED_WRMSR.store(state.emulated.wrmsr, Ordering::Relaxed);
+    EMULATED_IN.store(state.emulated.io_in, Ordering::Relaxed);
+    EMULATED_OUT.store(state.emulated.io_out, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -157,11 +164,14 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
         // Meaningful only for EPT exits; decide never looks at it otherwise.
         None => Some(0),
     };
-    // Likewise, only an EPT exit needs EXIT_QUALIFICATION to be judged; an
-    // unreadable one was printed above.
-    let qualification = match ept_exit {
-        Some(_) => qualification,
-        None => Some(qualification.unwrap_or(0)),
+    // Only EPT and I/O exits are judged by EXIT_QUALIFICATION. For any other
+    // exit an unreadable one (printed above) does not matter.
+    let judged_by_qualification = ept_exit.is_some()
+        || reason.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_IO_INSTRUCTION);
+    let qualification = if judged_by_qualification {
+        qualification
+    } else {
+        Some(qualification.unwrap_or(0))
     };
     let rip = read_or_report("GUEST_RIP", GUEST_RIP);
     let length = read_or_report("VM_EXIT_INSTRUCTION_LEN", VM_EXIT_INSTRUCTION_LEN);
@@ -204,7 +214,7 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
                 interruptibility: blocking as u32,
                 // IDT_VECTORING_INFO has the interruption-information layout.
                 idt_vectoring_valid: InterruptionInfo(vectoring as u32).is_valid(),
-                exit_qualification: EptQualification(qualification),
+                qualification,
                 guest_physical,
                 protected_page: protected.map_or(0, |page| page.gpa),
             })
@@ -278,6 +288,10 @@ pub(super) enum EmulationOutcome {
     Rdmsr { msr: u32, value: u64 },
     /// WRMSR wrote `value` to `msr`.
     Wrmsr { msr: u32, value: u64 },
+    /// IN of `size` from `port` read `value`.
+    In { port: u16, size: IoSize, value: u32 },
+    /// OUT of `value` (`size` wide) to `port`.
+    Out { port: u16, size: IoSize, value: u32 },
 }
 
 /// Executes `emulation` in root operation and writes its result into the
@@ -318,6 +332,31 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome 
             // SWAPGS, so the guest's value is simply the CPU's.
             unsafe { msr::wrmsr(msr, value) };
             EmulationOutcome::Wrmsr { msr, value }
+        }
+        Emulation::In { port, size } => {
+            // SAFETY: the guest's own IN, which it could have run without
+            // Aleph0; at CPL 0 in root operation it cannot fault. Ports
+            // Aleph0 intercepts are ones serial.rs does not use.
+            let value = unsafe {
+                match size {
+                    IoSize::Byte => u32::from(port::inb(port)),
+                    IoSize::Word => u32::from(port::inw(port)),
+                    IoSize::Dword => port::inl(port),
+                }
+            };
+            frame.rax = merge_in(frame.rax, size, value);
+            EmulationOutcome::In { port, size, value }
+        }
+        Emulation::Out { port, size, value } => {
+            // SAFETY: as for In: the guest's own OUT.
+            unsafe {
+                match size {
+                    IoSize::Byte => port::outb(port, value as u8),
+                    IoSize::Word => port::outw(port, value as u16),
+                    IoSize::Dword => port::outl(port, value),
+                }
+            }
+            EmulationOutcome::Out { port, size, value }
         }
     }
 }

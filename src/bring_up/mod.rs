@@ -45,7 +45,7 @@ use crate::vmx;
 use crate::vmx::VmxCapabilities;
 use crate::vmx::ept::{self, Ept, InveptType};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
-use crate::vmx::guest::GuestMemory;
+use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
@@ -70,6 +70,7 @@ pub struct GuestRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PassthroughState {
     kernel_gs_base: u64,
+    com1_scratch: u8,
 }
 
 impl PassthroughState {
@@ -79,6 +80,9 @@ impl PassthroughState {
             // SAFETY: IA32_KERNEL_GS_BASE exists on every 64-bit CPU, and
             // reading it has no side effect.
             kernel_gs_base: unsafe { vmx::msr::rdmsr(IA32_KERNEL_GS_BASE) },
+            // SAFETY: the COM1 scratch register: COM1 is the UART `serial`
+            // owns, and reading the scratch register has no side effect.
+            com1_scratch: unsafe { crate::port::inb(GUEST_SCRATCH_PORT) },
         }
     }
 }
