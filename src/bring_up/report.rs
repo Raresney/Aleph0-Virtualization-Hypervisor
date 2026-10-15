@@ -3,6 +3,7 @@
 //!
 //! Nothing here changes CPU state or can fail.
 
+use super::PassthroughState;
 use crate::vmx;
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
@@ -131,6 +132,15 @@ pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps) {
         bitmaps.io_b_address(),
     );
     log!("Intercepted MSRs (read and write): {INTERCEPTED_MSRS:x?}; intercepted ports: {INTERCEPTED_PORTS:x?}.");
+}
+
+/// Prints the host state the guest reached through passthrough emulation,
+/// before and after its run. Still in the exit phase, so serial only.
+pub(super) fn passthrough_state(before: PassthroughState, after: PassthroughState) {
+    log!(
+        "Passthrough state before the guest {before:x?}, after it {after:x?}: restored={}.",
+        before == after
+    );
 }
 
 /// Prints the guest state that was written to the VMCS. If VM entry later

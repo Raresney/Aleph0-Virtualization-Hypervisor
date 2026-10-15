@@ -1,5 +1,5 @@
 //! Model-specific registers (MSRs): their addresses, the bits this
-//! hypervisor reads in them, and RDMSR.
+//! hypervisor reads in them, and RDMSR and WRMSR.
 use core::arch::asm;
 
 use super::vmcs::fields::{CPU_BASED_ACTIVATE_SECONDARY_CONTROLS, SECONDARY_ENABLE_EPT, SECONDARY_ENABLE_VPID};
@@ -246,6 +246,27 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
     }
 
     ((high as u64) << 32) | low as u64
+}
+
+/// Writes an arbitrary MSR.
+///
+/// # Safety
+///
+/// `msr` must exist on this CPU and accept `value`, or WRMSR raises #GP.
+/// The new value changes how the CPU behaves, so it must be one the code
+/// running afterwards (Aleph0, firmware) can live with.
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: the caller guarantees the MSR exists, accepts the value, and
+    // that the change is harmless here.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 #[cfg(test)]

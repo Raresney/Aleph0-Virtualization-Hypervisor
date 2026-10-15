@@ -123,6 +123,10 @@ pub(super) fn report_event(
             },
         ),
         ExitEvent::Emulated(_) => report_emulation(number, resumed.and_then(|resumed| resumed.emulated), rip),
+        ExitEvent::GuestGeneralProtection => crate::serial_println!(
+            "{tag} VM exit #{number}: MSR {:#x} is outside the MSR bitmap, or the WRMSR value is not canonical; injecting #GP(0) at rip={rip:#018x}.",
+            exit.map_or(0, |exit| exit.guest_rcx as u32),
+        ),
         ExitEvent::EmulationMissing => crate::serial_println!(
             "{tag} VM exit #{number}: last main VMCALL (rax={rax:#x}), but the emulated exits were {} instead of {EXPECTED_EMULATION}.",
             state.emulated,
@@ -160,6 +164,12 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
             guest.ecx,
             guest.edx,
             raw.ecx,
+        ),
+        Some(EmulationOutcome::Rdmsr { msr, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: RDMSR {msr:#x} -> {value:#018x}; resuming at rip={rip:#018x}."
+        ),
+        Some(EmulationOutcome::Wrmsr { msr, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: WRMSR {msr:#x} <- {value:#018x}; resuming at rip={rip:#018x}."
         ),
         None => crate::serial_println!("{tag} VM exit #{number}: emulated instruction not executed."),
     }

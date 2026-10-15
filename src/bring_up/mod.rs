@@ -18,7 +18,9 @@
 //!    the host's descriptor tables, and stop if it did.
 //! 6. Launch the guest with VMLAUNCH. `vmx::vmcs::launch` returns once the
 //!    guest has stopped: after its last planned exit, or at an exit or
-//!    failure the exit handler in `vmx::vmexit` does not handle.
+//!    failure the exit handler in `vmx::vmexit` does not handle. The host
+//!    state the guest reaches through passthrough emulation
+//!    ([`PassthroughState`]) is read before and after, and printed.
 //! 7. Leave VMX operation and restore the firmware's state
 //!    ([`teardown::teardown`]). Runs whatever happened after VMXON
 //!    succeeded (creating the VMCS, steps 5 and 6), so firmware gets the CPU
@@ -46,7 +48,7 @@ use crate::vmx::exit_bitmaps::ExitBitmaps;
 use crate::vmx::guest::GuestMemory;
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
-use crate::vmx::msr::VmcsControlMsrs;
+use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
 use crate::vmx::segment::DescriptorTable;
 use crate::vmx::vmcs::{DesiredControls, GuestStop, VmcsRegion};
 use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
@@ -60,6 +62,25 @@ use teardown::FirmwareState;
 pub struct GuestRun {
     /// VM exits handled, all of them the planned VMCALLs.
     pub exits: u64,
+}
+
+/// Host state the guest reaches through passthrough emulation: real
+/// hardware, not a copy. The guest saves and restores it, so it reads the
+/// same before and after the guest's run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassthroughState {
+    kernel_gs_base: u64,
+}
+
+impl PassthroughState {
+    /// Reads the current values.
+    fn read() -> Self {
+        Self {
+            // SAFETY: IA32_KERNEL_GS_BASE exists on every 64-bit CPU, and
+            // reading it has no side effect.
+            kernel_gs_base: unsafe { vmx::msr::rdmsr(IA32_KERNEL_GS_BASE) },
+        }
+    }
 }
 
 /// The host GDT and TSS, plus the descriptor-table state recorded right
@@ -313,10 +334,14 @@ fn launch_guest(
     check_host_tables_preserved(host_tables)?;
 
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
+    let before = PassthroughState::read();
     // SAFETY: `prepare_vmcs` wrote the controls, the host state
     // (HOST_RSP/HOST_RIP at the live exit stack and handler) and the guest
-    // state; the exit stack, guest pages and EPT tables are never freed.
-    guest_result(unsafe { vmx::vmcs::launch() })
+    // state; the exit stack, guest pages, EPT tables and exit bitmaps are
+    // never freed.
+    let stop = unsafe { vmx::vmcs::launch() };
+    report::passthrough_state(before, PassthroughState::read());
+    guest_result(stop)
 }
 
 /// Fills in the current VMCS: controls, EPT pointer, exit bitmaps, host state,

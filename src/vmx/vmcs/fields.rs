@@ -81,6 +81,9 @@ pub const VM_ENTRY_MSR_LOAD_COUNT: u32 = 0x4014;
 /// VM-entry interruption-information field: bit 31 set injects an event on
 /// entry, so 0 means no injection.
 pub const VM_ENTRY_INTERRUPTION_INFO: u32 = 0x4016;
+/// VM-entry exception error code (32-bit): the error code delivered with an
+/// injected exception whose interruption info has bit 11 set.
+pub const VM_ENTRY_EXCEPTION_ERROR_CODE: u32 = 0x4018;
 /// Secondary processor-based VM-execution controls. The CPU reads this field
 /// only while primary bit 31 ([`CPU_BASED_ACTIVATE_SECONDARY_CONTROLS`]) is
 /// set.

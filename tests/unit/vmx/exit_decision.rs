@@ -7,7 +7,9 @@
 
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
-use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
+use crate::vmx::guest::{
+    EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_NMI_MARKER,
+};
 
 const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;
@@ -502,6 +504,7 @@ fn each_event_maps_to_its_action() {
             nmi_window,
             grant_write,
             emulate: None,
+            inject_gp: false,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
@@ -528,6 +531,12 @@ fn each_event_maps_to_its_action() {
         })
     );
     assert_eq!(ExitEvent::EmulationMissing.action(), ExitAction::Unexpected);
+    assert_eq!(
+        ExitEvent::GuestGeneralProtection.action(),
+        ExitAction::Resume(ResumePlan::INJECT_GP)
+    );
+    // A fault: RIP stays on the instruction. A constant, so checked at compile time.
+    const { assert!(!ResumePlan::INJECT_GP.advance_rip) };
 }
 
 #[test]
@@ -604,11 +613,23 @@ fn ept_page_permissions_come_from_bits_5_to_3() {
 
 /// The exits the guest's emulation block causes, in order.
 fn emulated_exits() -> Vec<ExitInfo> {
-    vec![ExitInfo {
-        guest_rax: 1,
-        guest_rcx: 0,
-        ..exit(EXIT_REASON_CPUID)
-    }]
+    let msr = |basic, rax: u64, rdx: u64| ExitInfo {
+        guest_rax: rax,
+        guest_rcx: 0xC000_0102,
+        guest_rdx: rdx,
+        ..exit(basic)
+    };
+    vec![
+        ExitInfo {
+            guest_rax: 1,
+            guest_rcx: 0,
+            ..exit(EXIT_REASON_CPUID)
+        },
+        msr(EXIT_REASON_RDMSR, 0, 0),
+        msr(EXIT_REASON_WRMSR, GUEST_MSR_VALUE & 0xFFFF_FFFF, GUEST_MSR_VALUE >> 32),
+        msr(EXIT_REASON_RDMSR, 0, 0),
+        msr(EXIT_REASON_WRMSR, 0, 0),
+    ]
 }
 
 #[test]
@@ -657,4 +678,30 @@ fn whole_guest_run_from_the_first_exit_finishes() {
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!(state.emulated, EXPECTED_EMULATION);
+}
+
+#[test]
+fn injected_general_protection_is_a_hardware_exception_with_error_code() {
+    // Valid (bit 31), error code (bit 11), hardware exception (type 3),
+    // vector 13.
+    assert_eq!(InterruptionInfo::GENERAL_PROTECTION, InterruptionInfo(0x8000_0B0D));
+}
+
+#[test]
+fn msr_exits_are_dispatched_to_emulation() {
+    // RDX = 0: `exit` defaults it to GUEST_EPT_VALUE, which as the upper half
+    // of a WRMSR value would be non-canonical.
+    let msr = |basic| ExitInfo {
+        guest_rcx: 0xC000_0102,
+        guest_rdx: 0,
+        ..exit(basic)
+    };
+    assert_eq!(
+        decide(START, msr(EXIT_REASON_RDMSR)).0,
+        ExitEvent::Emulated(Emulation::Rdmsr { msr: 0xC000_0102 })
+    );
+    assert!(matches!(
+        decide(START, msr(EXIT_REASON_WRMSR)).0,
+        ExitEvent::Emulated(Emulation::Wrmsr { msr: 0xC000_0102, .. })
+    ));
 }

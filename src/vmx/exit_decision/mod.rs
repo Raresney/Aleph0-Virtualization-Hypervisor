@@ -12,7 +12,7 @@
 //! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
 //! `match`, which the compiler checks and turns into the same jump table:
 //!
-//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID).
+//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR).
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
 //!   NMI reinjection).
 //!
@@ -83,6 +83,11 @@ pub const EXIT_REASON_NMI_WINDOW: u16 = 8;
 pub const EXIT_REASON_CPUID: u16 = 10;
 /// Basic exit reason of a VMCALL exit.
 pub const EXIT_REASON_VMCALL: u16 = 18;
+/// Basic exit reason of RDMSR, which exits for MSRs the MSR bitmap
+/// intercepts or does not cover.
+pub const EXIT_REASON_RDMSR: u16 = 31;
+/// Basic exit reason of WRMSR, which exits for the same MSRs as RDMSR.
+pub const EXIT_REASON_WRMSR: u16 = 32;
 /// Basic exit reason of an EPT violation: an access the EPT entries do not
 /// allow.
 pub const EXIT_REASON_EPT_VIOLATION: u16 = 48;
@@ -185,11 +190,23 @@ impl InterruptionInfo {
     pub const VALID: u32 = 1 << 31;
     /// Interruption type 2 (bits 10:8): NMI.
     const TYPE_NMI: u32 = 2;
+    /// Interruption type 3 (bits 10:8): hardware exception.
+    const TYPE_HARDWARE_EXCEPTION: u32 = 3;
+    /// Bit 11: deliver an error code (VM_ENTRY_EXCEPTION_ERROR_CODE).
+    const DELIVER_ERROR_CODE: u32 = 1 << 11;
+    /// IDT vector of #GP.
+    const GP_VECTOR: u32 = 13;
 
     /// The VM_ENTRY_INTERRUPTION_INFO value that injects an NMI at the next
     /// VM entry: valid, type NMI, vector 2. The CPU clears the field after
     /// each successful entry, so it injects once.
     pub const NMI: Self = Self(Self::VALID | (Self::TYPE_NMI << 8) | NMI_VECTOR as u32);
+
+    /// The VM_ENTRY_INTERRUPTION_INFO value that injects #GP with an error
+    /// code at the next VM entry, delivered before the faulting instruction
+    /// runs again.
+    pub const GENERAL_PROTECTION: Self =
+        Self(Self::VALID | (Self::TYPE_HARDWARE_EXCEPTION << 8) | Self::DELIVER_ERROR_CODE | Self::GP_VECTOR);
 
     /// Whether the field describes an event at all (bit 31).
     pub fn is_valid(self) -> bool {
@@ -215,7 +232,8 @@ pub struct ExitInfo {
     /// VM_EXIT_INTERRUPTION_INFO.
     pub interruption_info: InterruptionInfo,
     /// The guest's RAX, RCX and RDX. CPUID reads its leaf from EAX and its
-    /// subleaf from ECX. At main VMCALL #1, ECX and EDX hold what the guest
+    /// subleaf from ECX. RDMSR and WRMSR read the MSR from ECX, and WRMSR its
+    /// value from EDX:EAX. At main VMCALL #1, ECX and EDX hold what the guest
     /// read from its data page before and after its write.
     pub guest_rax: u64,
     pub guest_rcx: u64,
@@ -281,6 +299,9 @@ pub enum ExitEvent {
     DataPageMismatch,
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
+    /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
+    /// bitmap, or a non-canonical value for an intercepted one.
+    GuestGeneralProtection,
     /// The last main VMCALL arrived, but the guest's emulated exits do not
     /// match `guest::EXPECTED_EMULATION`.
     EmulationMissing,
@@ -304,6 +325,9 @@ pub struct ResumePlan {
     /// Execute this instruction for the guest and put its result in the
     /// guest's registers, before RIP moves past it.
     pub emulate: Option<Emulation>,
+    /// Write [`InterruptionInfo::GENERAL_PROTECTION`] (error code 0) to
+    /// VM_ENTRY_INTERRUPTION_INFO.
+    pub inject_gp: bool,
 }
 
 impl ResumePlan {
@@ -314,6 +338,7 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: false,
         emulate: None,
+        inject_gp: false,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -325,6 +350,7 @@ impl ResumePlan {
         nmi_window: Some(false),
         grant_write: false,
         emulate: None,
+        inject_gp: false,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -334,6 +360,7 @@ impl ResumePlan {
         nmi_window: Some(true),
         grant_write: false,
         emulate: None,
+        inject_gp: false,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -343,6 +370,17 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: true,
         emulate: None,
+        inject_gp: false,
+    };
+    /// Inject #GP(0); RIP stays on the faulting instruction, as for any
+    /// fault.
+    pub const INJECT_GP: Self = Self {
+        advance_rip: false,
+        inject_nmi: false,
+        nmi_window: None,
+        grant_write: false,
+        emulate: None,
+        inject_gp: true,
     };
 }
 
@@ -369,6 +407,7 @@ impl ExitEvent {
                 emulate: Some(emulation),
                 ..ResumePlan::PAST_INSTRUCTION
             }),
+            Self::GuestGeneralProtection => ExitAction::Resume(ResumePlan::INJECT_GP),
             Self::LastMainVmcall => ExitAction::Finished,
             Self::InterruptedDelivery
             | Self::EptWriteMissing
@@ -393,6 +432,8 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     }
     match exit.reason.basic {
         EXIT_REASON_CPUID => emulation::cpuid(state, &exit),
+        EXIT_REASON_RDMSR => emulation::rdmsr(state, &exit),
+        EXIT_REASON_WRMSR => emulation::wrmsr(state, &exit),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
         EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),

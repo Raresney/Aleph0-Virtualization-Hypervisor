@@ -18,9 +18,10 @@ use crate::vmx::exit_decision::{
     EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, ResumePlan,
     UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name,
 };
+use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_INTERRUPTION_INFO,
-    VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE,
+    VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
 use crate::vmx::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
@@ -37,6 +38,8 @@ static NMIS_INJECTED: AtomicU32 = AtomicU32::new(0);
 static NMIS_HANDLED: AtomicU32 = AtomicU32::new(0);
 static EPT_WRITES_GRANTED: AtomicU32 = AtomicU32::new(0);
 static EMULATED_CPUID: AtomicU32 = AtomicU32::new(0);
+static EMULATED_RDMSR: AtomicU32 = AtomicU32::new(0);
+static EMULATED_WRMSR: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
@@ -47,6 +50,8 @@ fn load_state() -> ExitState {
         ept_writes_granted: EPT_WRITES_GRANTED.load(Ordering::Relaxed),
         emulated: EmulationCounts {
             cpuid: EMULATED_CPUID.load(Ordering::Relaxed),
+            rdmsr: EMULATED_RDMSR.load(Ordering::Relaxed),
+            wrmsr: EMULATED_WRMSR.load(Ordering::Relaxed),
         },
     }
 }
@@ -58,6 +63,8 @@ fn store_state(state: ExitState) {
     NMIS_HANDLED.store(state.nmis_handled, Ordering::Relaxed);
     EPT_WRITES_GRANTED.store(state.ept_writes_granted, Ordering::Relaxed);
     EMULATED_CPUID.store(state.emulated.cpuid, Ordering::Relaxed);
+    EMULATED_RDMSR.store(state.emulated.rdmsr, Ordering::Relaxed);
+    EMULATED_WRMSR.store(state.emulated.wrmsr, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -267,6 +274,10 @@ pub(super) enum EmulationOutcome {
         raw: CpuidResult,
         guest: CpuidResult,
     },
+    /// RDMSR of `msr` returned `value`.
+    Rdmsr { msr: u32, value: u64 },
+    /// WRMSR wrote `value` to `msr`.
+    Wrmsr { msr: u32, value: u64 },
 }
 
 /// Executes `emulation` in root operation and writes its result into the
@@ -290,6 +301,24 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome 
                 guest,
             }
         }
+        Emulation::Rdmsr { msr } => {
+            // SAFETY: `decide` emulates only INTERCEPTED_MSRS, which exist on
+            // every CPU Aleph0 runs on (IA32_KERNEL_GS_BASE: every 64-bit
+            // CPU) and have no read side effects.
+            let value = unsafe { msr::rdmsr(msr) };
+            // RDMSR writes EAX and EDX, which zero-extends them.
+            frame.rax = value & 0xFFFF_FFFF;
+            frame.rdx = value >> 32;
+            EmulationOutcome::Rdmsr { msr, value }
+        }
+        Emulation::Wrmsr { msr, value } => {
+            // SAFETY: an intercepted MSR (see Rdmsr), and `decide` checked
+            // the value is canonical, so WRMSR cannot fault. VM entry and
+            // exit do not switch IA32_KERNEL_GS_BASE and Aleph0 never runs
+            // SWAPGS, so the guest's value is simply the CPU's.
+            unsafe { msr::wrmsr(msr, value) };
+            EmulationOutcome::Wrmsr { msr, value }
+        }
     }
 }
 
@@ -306,8 +335,8 @@ pub(super) struct Resumed {
 
 /// Prepares the VMCS (and EPT) as `plan` says: executes the emulated
 /// instruction into `frame`, moves GUEST_RIP past the exiting instruction,
-/// queues an NMI for injection at the next VM entry, turns NMI-window
-/// exiting on or off, and makes `protected` writable. Returns how the guest
+/// queues an NMI or a #GP(0) for injection at the next VM entry, turns
+/// NMI-window exiting on or off, and makes `protected` writable. Returns how the guest
 /// resumes, or `None` after printing why it cannot.
 fn prepare_resume(
     number: u64,
@@ -323,6 +352,7 @@ fn prepare_resume(
         nmi_window,
         grant_write,
         emulate,
+        inject_gp,
     } = plan;
     let tag = crate::TAG;
     let Some(rip) = rip else {
@@ -348,7 +378,8 @@ fn prepare_resume(
     } else {
         // An NMI exit: the guest goes on at the instruction it was about to
         // run, and the injected NMI is delivered before it. An EPT
-        // violation: the faulting write runs again.
+        // violation: the faulting write runs again. A #GP: delivered at the
+        // RDMSR/WRMSR, which faults.
         rip
     };
 
@@ -360,6 +391,14 @@ fn prepare_resume(
         crate::serial_println!(
             "{tag} VM exit #{number}: could not queue the NMI for injection ({error:?}); not resuming."
         );
+        return None;
+    }
+    if inject_gp
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current.
+        && let Err(error) = unsafe { queue_general_protection() }
+    {
+        crate::serial_println!("{tag} VM exit #{number}: could not queue #GP for injection ({error:?}); not resuming.");
         return None;
     }
     if let Some(on) = nmi_window
@@ -399,6 +438,23 @@ fn prepare_resume(
         invept,
         emulated,
     })
+}
+
+/// Queues #GP(0) for the next VM entry, delivered through the guest's own
+/// IDT at the instruction RIP points to.
+///
+/// # Safety
+///
+/// VMX root operation with the guest's VMCS current.
+unsafe fn queue_general_protection() -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX root operation with a current VMCS.
+    unsafe {
+        vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
+        vmcs::vmwrite(
+            VM_ENTRY_INTERRUPTION_INFO,
+            InterruptionInfo::GENERAL_PROTECTION.0.into(),
+        )
+    }
 }
 
 /// Called by the entry stub when VMRESUME falls through instead of entering
