@@ -552,7 +552,114 @@ check failed after a write.
 
 ## 7. On Hyper-V
 
-Filled in after the Hyper-V run (ROADMAP §5).
+The first Hyper-V run of this work had the bitmaps on and the guest
+unchanged. It printed `VMX primary: required=0x240065f2 allowed=0xf7f9fffe`
+(bits 25 and 28 are allowed, and neither is required, so Aleph0 has to set
+them), wrote and read back the three bitmap addresses, and showed the old
+three exits and `SUCCESS`: turning the bitmaps on changed nothing for that
+guest, which runs no MSR or port instruction.
+
+Plain run (`.\scripts\run-hyperv.ps1`), twelve exits. This is an excerpt of
+`run\serial.log`. The `[Aleph0 Virtualization Hypervisor]` prefix is
+removed, and of the five lines each exit prints only the reason line and the
+result line are kept.
+
+Bring-up, before the guest:
+
+```text
+Exit bitmaps allocated: MSR=0x000000007eaf2000 I/O A=0x000000007eaf1000 I/O B=0x000000007eaf0000.
+Intercepted MSRs (read and write): [c0000102]; intercepted ports: [3ff].
+VMCS MSR and I/O bitmap addresses written and read back.
+```
+
+The nine emulated exits:
+
+```text
+VM exit #1: reason=10 (CPUID)
+VM exit #1: CPUID leaf=0x1 subleaf=0x0 -> eax=0x00090672 ebx=0x00020800 ecx=0xf7fa3203 edx=0x1f8bfbff (processor ecx=0xf7fa3223); resuming at rip=0x000000007eaf5009.
+VM exit #2: reason=31 (RDMSR)
+VM exit #2: RDMSR 0xc0000102 -> 0x0000000000000000; resuming at rip=0x000000007eaf501a.
+VM exit #3: reason=32 (WRMSR)
+VM exit #3: WRMSR 0xc0000102 <- 0x00007a1e00000000; resuming at rip=0x000000007eaf502a.
+VM exit #4: reason=31 (RDMSR)
+VM exit #4: RDMSR 0xc0000102 -> 0x00007a1e00000000; resuming at rip=0x000000007eaf5030.
+VM exit #5: reason=32 (WRMSR)
+VM exit #5: WRMSR 0xc0000102 <- 0x0000000000000000; resuming at rip=0x000000007eaf5043.
+VM exit #6: reason=30 (I/O instruction)
+VM exit #6: IN port 0x3ff size=1 -> 0x0; resuming at rip=0x000000007eaf5048.
+VM exit #7: reason=30 (I/O instruction)
+VM exit #7: OUT port 0x3ff size=1 value=0xa5; resuming at rip=0x000000007eaf504e.
+VM exit #8: reason=30 (I/O instruction)
+VM exit #8: IN port 0x3ff size=1 -> 0xa5; resuming at rip=0x000000007eaf5051.
+VM exit #9: reason=30 (I/O instruction)
+VM exit #9: OUT port 0x3ff size=1 value=0x0; resuming at rip=0x000000007eaf5059.
+```
+
+- Exit #1: the processor returned `ecx=0xf7fa3223` and the guest got
+  `0xf7fa3203`. They differ by `0x20`, bit 5, the VMX bit, which the
+  nested Hyper-V shows to Aleph0 and the policy hides from the guest. The
+  policy changes nothing else. The guest value still has bit 31 set
+  (hypervisor present), one of the open decisions of section 3.
+- Exits #2 to #5: IA32_KERNEL_GS_BASE was `0x0`. The guest wrote
+  `0x00007a1e00000000` (exit #3 shows it split as RDX = `0x7a1e`,
+  RAX = `0x0`), read the same value back, and wrote `0x0` again.
+- Exits #6 to #9: the exit qualification is `0x03ff0008` for the two INs and
+  `0x03ff0000` for the two OUTs: port `0x3ff`, size 1, direction in bit 3.
+  The scratch byte was `0x0`; `0xa5` written by exit #7 was read back by
+  exit #8. So the scratch register of Hyper-V's UART works, and its absence
+  (a read-back other than `0xa5`, which would stop the guest at `ud2` with
+  `0xFA11` in EAX, section 6) did not happen. Exit #9 put `0x0` back.
+- Each RIP in `resuming at` is the exit's RIP plus its instruction length
+  (2 for `cpuid`, `rdmsr` and `wrmsr`, 1 for `in` and `out`), as in
+  section 2.
+
+The EPT write, the VMCALLs and the end of the run:
+
+```text
+VM exit #10: reason=48 (EPT violation)
+VM exit #10: EPT violation at GPA 0x000000007eaf6000 (linear 0x000000007eaf6000): write; page R=1 W=0 X=0.
+VM exit #10: write to the protected data page: write granted (W=1), INVEPT single-context; retrying the write at rip=0x000000007eaf506b.
+VM exit #11: reason=18 (VMCALL)
+VM exit #11: expected VMCALL (rax=0xa1e0); resuming the guest at rip=0x000000007eaf507b.
+VM exit #12: reason=18 (VMCALL)
+VM exit #12: expected VMCALL (rax=0xa1e1); all 2 planned VMCALLs handled; no NMI arrived.
+VM exit #12: EPT: 1 write violation(s) on the protected data page, write granted.
+VM exit #12: emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2.
+VM exit #12: stopping the guest; returning to bring-up.
+Passthrough state before the guest PassthroughState { kernel_gs_base: 0, com1_scratch: 0 }, after it PassthroughState { kernel_gs_base: 0, com1_scratch: 0 }: restored=true.
+Teardown: CR4.VMXE=0 firmware GDTR/IDTR restored=true IF=1.
+Guest finished after 12 VM exits; VMX operation left.
+Firmware timer fired: interrupts reach the firmware again.
+Returning to firmware with SUCCESS.
+```
+
+- Exit #10 is the EPT violation that was exit #1 in `docs/EPT.md`, with the
+  same qualification, `0x58a`. Its addresses differ (the data page is at
+  `0x7eaf6000`) because the guest code grew to 169 bytes and the
+  allocations moved.
+- Exits #11 and #12 are the main VMCALL #1 and #2.
+- `emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2.` is
+  `EXPECTED_EMULATION`. Aleph0's own count agrees with the guest's checks,
+  so each of the nine instructions did cause an exit (section 6).
+- `restored=true`: before and after the guest, IA32_KERNEL_GS_BASE and the
+  COM1 scratch byte are both `0`. The guest wrote other values in between
+  (exits #3 and #7), so it put both back (exits #5 and #9).
+
+With `-InjectNmi`, fourteen exits: exits #1 to #11 as above, then the NMI
+flow of `docs/NMI.md`, with the emulated exits before it unchanged:
+
+```text
+VM exit #12: reason=0 (exception or NMI)
+VM exit #12: NMI (interruption info=0x80000202); reinjecting it into the guest at rip=0x000000007eaf5086.
+VM exit #13: reason=18 (VMCALL)
+VM exit #13: guest NMI handler ran (rax=0x4e4d49); the reinjected NMI was delivered; resuming the guest at rip=0x000000007eaf509a.
+VM exit #14: expected VMCALL (rax=0xa1e1); all 2 planned VMCALLs handled; NMIs: 1 reinjected, 1 handled by the guest.
+VM exit #14: emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2.
+Passthrough state before the guest PassthroughState { kernel_gs_base: 0, com1_scratch: 0 }, after it PassthroughState { kernel_gs_base: 0, com1_scratch: 0 }: restored=true.
+Guest finished after 14 VM exits; VMX operation left.
+```
+
+The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 
 ## 8. Limits before an OS guest
 
