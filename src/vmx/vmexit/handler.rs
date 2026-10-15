@@ -334,9 +334,12 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome 
             EmulationOutcome::Wrmsr { msr, value }
         }
         Emulation::In { port, size } => {
-            // SAFETY: the guest's own IN, which it could have run without
-            // Aleph0; at CPL 0 in root operation it cannot fault. Ports
-            // Aleph0 intercepts are ones serial.rs does not use.
+            // SAFETY: the guest asked for exactly this access, which it could
+            // have made without Aleph0, and IN/OUT at CPL 0 in root operation
+            // cannot fault. A 2- or 4-byte access at 0x3FC-0x3FE also touches
+            // 0x3FF, so it exits and passes through to the UART registers at
+            // 0x3FC-0x3FE, which serial.rs uses (docs/EMULATED_EXITS.md
+            // section 5).
             let value = unsafe {
                 match size {
                     IoSize::Byte => u32::from(port::inb(port)),
@@ -398,15 +401,23 @@ fn prepare_resume(
         crate::serial_println!("{tag} VM exit #{number}: guest RIP unreadable; not resuming.");
         return None;
     };
-    // Before RIP moves: the guest resumes past the instruction with its
-    // result already in its registers.
-    let emulated = emulate.map(|emulation| execute(emulation, frame));
-
-    let resume_rip = if advance_rip {
+    // Checked before the emulation: with the length unreadable, a WRMSR or
+    // OUT would already have happened when the guest stops, and serial would
+    // never show it.
+    let advance_by = if advance_rip {
         let Some(length) = length else {
             crate::serial_println!("{tag} VM exit #{number}: instruction length unreadable; not resuming.");
             return None;
         };
+        Some(length)
+    } else {
+        None
+    };
+    // Before RIP moves: the guest resumes past the instruction with its
+    // result already in its registers.
+    let emulated = emulate.map(|emulation| execute(emulation, frame));
+
+    let resume_rip = if let Some(length) = advance_by {
         // SAFETY: exit context: VMX root operation, with the guest's VMCS
         // current.
         if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, rip + length) } {

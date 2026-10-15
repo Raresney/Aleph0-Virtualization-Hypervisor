@@ -10,7 +10,9 @@
 //! interrupted event delivery), then dispatches on the exit reason to a
 //! handler with the signature `fn(ExitState, &ExitInfo) -> (ExitEvent,
 //! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
-//! `match`, which the compiler checks and turns into the same jump table:
+//! `match` instead of a table of function pointers: each handler stays a
+//! separate pure function with one signature, and the handled reasons are
+//! listed in one place:
 //!
 //! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR, IN, OUT).
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
@@ -248,8 +250,12 @@ pub struct ExitInfo {
     pub idt_vectoring_valid: bool,
     /// EXIT_QUALIFICATION. Its layout depends on the reason; [`decide`]
     /// reads it for EPT violations ([`EptQualification`]) and I/O
-    /// instructions (`emulation::IoQualification`) only, and it is 0
-    /// otherwise.
+    /// instructions (`emulation::IoQualification`) only. `read_exit` keeps
+    /// the real value whenever the VMCS field is readable, and uses 0 only
+    /// when it is unreadable on an exit `decide` does not judge by it. A
+    /// handler that reads it for another reason (CR access, reason 28, for
+    /// example) must add that reason to `judged_by_qualification` in
+    /// `vmexit/handler.rs`.
     pub qualification: u64,
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only; 0 otherwise.
     pub guest_physical: u64,
