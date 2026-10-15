@@ -63,11 +63,13 @@ pub struct DesiredControls {
 impl DesiredControls {
     /// Minimal requests for a 64-bit guest on this 64-bit host, plus NMI
     /// exiting with virtual NMIs, so Aleph0 sees the guest's NMIs and can
-    /// reinject them, and EPT, so guest memory goes through Aleph0's tables.
+    /// reinject them, EPT, so guest memory goes through Aleph0's tables, and
+    /// the MSR and I/O bitmaps, so only the MSRs and ports Aleph0 chooses
+    /// exit (`vmx::exit_bitmaps`).
     pub const fn minimal_64_bit_guest() -> Self {
         Self {
             pin: PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS,
-            primary: 0,
+            primary: CPU_BASED_USE_IO_BITMAPS | CPU_BASED_USE_MSR_BITMAPS,
             secondary: SECONDARY_ENABLE_EPT,
             exit: VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
             entry: VM_ENTRY_IA32E_MODE_GUEST,

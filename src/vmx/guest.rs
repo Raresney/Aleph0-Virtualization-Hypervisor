@@ -14,6 +14,12 @@
 //! (an EPT violation, after which Aleph0 makes it writable and the write is
 //! retried), and reads it back.
 //!
+//! Before that, the guest runs the instructions Aleph0 emulates (CPUID,
+//! RDMSR/WRMSR of IA32_KERNEL_GS_BASE, IN/OUT of the COM1 scratch register)
+//! and checks each result itself. A wrong one ends in `ud2` with
+//! [`GUEST_EMULATION_FAIL_MARKER`] in EAX. MSRs and ports it writes are real
+//! hardware, so it saves each one first and restores it afterwards.
+//!
 //! Guest RIP is [`GuestMemory::code_base`], guest RSP
 //! [`GuestMemory::stack_top`], and guest IDTR [`GuestMemory::idt`];
 //! `GuestState::write` (in `guest_state`) writes them to the VMCS.
@@ -32,7 +38,8 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
-use super::exit_decision::NMI_VECTOR;
+use super::exit_decision::{EmulationCounts, NMI_VECTOR};
+use super::msr::IA32_KERNEL_GS_BASE;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable};
@@ -67,12 +74,82 @@ pub const GUEST_DATA_SEED: u32 = 0xDA7A;
 /// seeing it at main VMCALL #1 shows the retried write landed.
 pub const GUEST_EPT_VALUE: u32 = 0x0045_5054;
 
+/// The I/O port the guest reads and writes through Aleph0: the COM1 scratch
+/// register (base + 7), a byte with no effect on the UART, which
+/// `serial.rs` never uses.
+pub const GUEST_SCRATCH_PORT: u16 = crate::serial::COM1 + 7;
+
+/// Value the guest writes to IA32_KERNEL_GS_BASE through Aleph0 and reads
+/// back: canonical (bits 63:47 equal), so WRMSR accepts it. The guest puts
+/// the original back afterwards.
+pub const GUEST_MSR_VALUE: u64 = 0x0000_7A1E_0000_0000;
+
+/// Byte the guest writes to [`GUEST_SCRATCH_PORT`] through Aleph0 and reads
+/// back. The guest puts the original back afterwards.
+pub const GUEST_IO_VALUE: u8 = 0xA5;
+
+/// Value the guest loads into EAX before `ud2` when an emulated instruction
+/// returned the wrong value. The #UD exit (vector 6) stops the guest, and
+/// this marker in RAX on serial says why.
+pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
+
+/// The emulated exits the guest causes before its last main VMCALL.
+/// `exit_decision` stops the guest at that VMCALL if the counts differ.
+pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts {
+    cpuid: 1,
+    rdmsr: 2,
+    wrmsr: 2,
+    io_in: 2,
+    io_out: 2,
+};
+
 core::arch::global_asm!(
     r#"
     .globl guest_code_start
     .globl guest_nmi_handler
     .globl guest_code_end
 guest_code_start:
+    // CPUID always exits; Aleph0 executes it and hides VMX (CPUID.1:ECX
+    // bit 5), so a guest never tries VMXON.
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    bt ecx, 5
+    jc guest_emulation_failed
+    // IA32_KERNEL_GS_BASE exits through the MSR bitmap; Aleph0 runs the
+    // real RDMSR/WRMSR. Save it, write GUEST_MSR_VALUE, read it back,
+    // restore it.
+    mov ecx, {kernel_gs_base}
+    rdmsr
+    mov esi, eax
+    mov edi, edx
+    mov eax, {msr_low}
+    mov edx, {msr_high}
+    wrmsr
+    xor eax, eax
+    xor edx, edx
+    rdmsr
+    cmp eax, {msr_low}
+    jne guest_emulation_failed
+    cmp edx, {msr_high}
+    jne guest_emulation_failed
+    mov eax, esi
+    mov edx, edi
+    wrmsr
+    // The COM1 scratch register exits through the I/O bitmap; Aleph0 runs
+    // the real IN/OUT. Save it, write GUEST_IO_VALUE, read it back, restore
+    // it.
+    mov dx, {scratch_port}
+    in al, dx
+    mov sil, al
+    mov al, {io_value}
+    out dx, al
+    xor eax, eax
+    in al, dx
+    cmp al, {io_value}
+    jne guest_emulation_failed
+    mov al, sil
+    out dx, al
     // No NMI handled yet. General-purpose registers are not VMCS fields, so
     // without this EBX would hold whatever the host had at VMLAUNCH.
     xor ebx, ebx
@@ -120,12 +197,23 @@ guest_nmi_handler:
     // the wait loop. With virtual NMIs on, it also ends the guest's NMI
     // blocking.
     iretq
+guest_emulation_failed:
+    // An emulated instruction returned the wrong value: stop with a marker
+    // in RAX, which the #UD exit prints.
+    mov eax, {fail_marker}
+    ud2
 guest_code_end:
 "#,
     marker = const GUEST_MARKER,
     iterations = const GUEST_WAIT_ITERATIONS,
     nmi_marker = const GUEST_NMI_MARKER,
     ept_value = const GUEST_EPT_VALUE,
+    fail_marker = const GUEST_EMULATION_FAIL_MARKER,
+    kernel_gs_base = const IA32_KERNEL_GS_BASE,
+    msr_low = const GUEST_MSR_VALUE as u32,
+    msr_high = const (GUEST_MSR_VALUE >> 32) as u32,
+    scratch_port = const GUEST_SCRATCH_PORT,
+    io_value = const GUEST_IO_VALUE,
 );
 
 unsafe extern "C" {

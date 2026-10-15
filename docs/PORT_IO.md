@@ -62,7 +62,7 @@ The data always travels through the **A register**, in one of three sizes:
 There is **no 64-bit port I/O**. A 16-bit access to port `P` covers ports `P`
 and `P + 1`; a 32-bit access covers `P` to `P + 3`. Use the size the device
 register expects: the UART's registers are all 8-bit, so serial code only
-uses `inb`/`outb`.
+uses `inb`/`outb`. Aleph0 keeps all six functions in `src/port.rs`.
 
 The string forms `ins`/`outs` (usually with `rep`) move a block of data
 between memory and one port; disk controllers used them. Aleph0 does not.
@@ -219,8 +219,11 @@ COM1 (0x3F8 = 1016):         byte 127, bit 0  ...  0x3FF: byte 127, bit 7
 
 An access that spans several ports exits if any of their bits is 1.
 
-Aleph0 requests neither control today (`DesiredControls::minimal_64_bit_guest`),
-so its guest's port I/O does not exit to Aleph0.
+Aleph0 turns on "use I/O bitmaps" (`DesiredControls::minimal_64_bit_guest`)
+and sets one bit, for the COM1 scratch register `0x3FF`
+(`vmx::exit_bitmaps::INTERCEPTED_PORTS`). Every other port goes straight to
+the hardware. Exits for `0x3FF` are emulated by passthrough: see
+[EMULATED_EXITS.md](EMULATED_EXITS.md).
 
 ### Handling the exit (reason 30)
 

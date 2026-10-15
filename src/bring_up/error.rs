@@ -2,6 +2,7 @@
 
 use crate::vmx;
 use crate::vmx::ept::EptError;
+use crate::vmx::exit_bitmaps::ExitBitmapsError;
 use crate::vmx::exit_decision::ExitReason;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
@@ -20,6 +21,7 @@ pub enum BringUpError {
     Gdt(GdtError),
     VmExitStack(VmExitStackError),
     GuestMemory(GuestMemoryError),
+    ExitBitmaps(ExitBitmapsError),
     VmxNotSupportedByCpu,
     VmxDisabledByFirmware,
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
@@ -84,6 +86,12 @@ impl From<VmExitStackError> for BringUpError {
 impl From<GuestMemoryError> for BringUpError {
     fn from(error: GuestMemoryError) -> Self {
         Self::GuestMemory(error)
+    }
+}
+
+impl From<ExitBitmapsError> for BringUpError {
+    fn from(error: ExitBitmapsError) -> Self {
+        Self::ExitBitmaps(error)
     }
 }
 
@@ -152,6 +160,7 @@ pub fn report_error(error: BringUpError) {
             "Guest memory setup failed: page {virtual_address:#018x} is mapped at {physical:#018x}, not identity-mapped."
         ),
         BringUpError::GuestMemory(error) => log!("Guest memory setup failed: {error:?}"),
+        BringUpError::ExitBitmaps(error) => log!("Exit bitmap allocation failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
         BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(

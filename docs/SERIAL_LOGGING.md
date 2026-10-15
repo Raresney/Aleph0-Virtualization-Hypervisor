@@ -71,10 +71,10 @@ Only two instructions use them:
 | `out dx, al` | send the byte in AL to port number DX |
 | `in al, dx` | read a byte from port number DX into AL |
 
-`serial.rs` wraps them in `outb(port, value)` and `inb(port) -> u8`. Every
-other step is just calls to these two. The full story (instruction forms,
-what happens on the bus, ordering, privilege, virtualization) is in
-[PORT_IO.md](PORT_IO.md).
+`src/port.rs` wraps them in `outb(port, value)` and `inb(port) -> u8`, which
+`serial.rs` uses. Every other step is just calls to these two. The full story
+(instruction forms, what happens on the bus, ordering, privilege,
+virtualization) is in [PORT_IO.md](PORT_IO.md).
 
 ### Step 1: find the chip
 

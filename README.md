@@ -13,7 +13,9 @@ It currently enters VMX root operation, fills in a complete VMCS, launches
 a minimal guest, and resumes it after its first VMCALL exit; every exit is
 reported over serial. Guest memory goes through EPT: an identity map of all
 memory with one guest page read-only, so the guest's write to it exits to
-Aleph0, which grants the write and retries it. An NMI that arrives while
+Aleph0, which grants the write and retries it. The guest also executes CPUID,
+RDMSR/WRMSR and IN/OUT, which Aleph0 emulates by passthrough, with MSR and I/O
+bitmaps limiting which MSRs and ports exit. An NMI that arrives while
 the guest runs is caught and reinjected into the guest's own IDT. After the
 last exit it leaves VMX operation and returns to firmware.
 See [ROADMAP.md](ROADMAP.md) for what has been verified and what comes next.
@@ -84,20 +86,22 @@ diagnostics that run before VMXON.
 | `src/bring_up/` | The bring-up sequence (`mod.rs`), its errors (`error.rs`), status lines (`report.rs`) and the return to firmware (`teardown.rs`) |
 | `src/output.rs` | Output phases and the firmware-free panic handler |
 | `src/serial.rs` | COM1 serial logger usable without firmware |
+| `src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
 | `src/vmx/host_tables.rs`, `segment.rs` | Host GDT/TSS setup and segmentation state |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT |
+| `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
 | `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge and apply (`handler.rs`); its report lines (`report.rs`) |
-| `src/vmx/exit_decision.rs` | The pure decision for each exit (the EPT write, VMCALLs, NMI reinjection), and the types of the exit fields it reads |
+| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
-| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation) |
+| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation) |
 
 ## License
 

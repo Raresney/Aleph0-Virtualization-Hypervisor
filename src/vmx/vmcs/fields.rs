@@ -18,8 +18,6 @@
 //! So the leading hex digits already say what a field is: `0x08xx` is a
 //! 16-bit guest field, `0x6Cxx` a natural-width host field.
 
-// ── Control fields (32-bit) ──────────────────────────────────────────────
-
 /// Pin-based VM-execution controls.
 pub const PIN_BASED_VM_EXEC_CONTROL: u32 = 0x4000;
 /// Primary processor-based VM-execution controls.
@@ -35,6 +33,14 @@ pub const PIN_BASED_VIRTUAL_NMIS: u32 = 1 << 5;
 /// Primary processor-based control bit 22: a VM exit (reason 8) as soon as
 /// the guest can take an NMI. Requires virtual NMIs.
 pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
+/// Primary processor-based control bit 25: IN/OUT exit only for ports whose
+/// bit is set in the I/O bitmaps ([`IO_BITMAP_A`], [`IO_BITMAP_B`]). While
+/// set, the CPU ignores bit 24 (unconditional I/O exiting).
+pub const CPU_BASED_USE_IO_BITMAPS: u32 = 1 << 25;
+/// Primary processor-based control bit 28: RDMSR/WRMSR exit only for MSRs
+/// whose bit is set in the MSR bitmap ([`MSR_BITMAP`]). Without it, every
+/// RDMSR and WRMSR exits.
+pub const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 /// Primary processor-based control bit 31: the CPU also uses the secondary
 /// controls ([`SECONDARY_VM_EXEC_CONTROL`]). Without it they all count as 0.
 pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
@@ -73,18 +79,23 @@ pub const VM_ENTRY_MSR_LOAD_COUNT: u32 = 0x4014;
 /// VM-entry interruption-information field: bit 31 set injects an event on
 /// entry, so 0 means no injection.
 pub const VM_ENTRY_INTERRUPTION_INFO: u32 = 0x4016;
+/// VM-entry exception error code (32-bit): the error code delivered with an
+/// injected exception whose interruption info has bit 11 set.
+pub const VM_ENTRY_EXCEPTION_ERROR_CODE: u32 = 0x4018;
 /// Secondary processor-based VM-execution controls. The CPU reads this field
 /// only while primary bit 31 ([`CPU_BASED_ACTIVATE_SECONDARY_CONTROLS`]) is
 /// set.
 pub const SECONDARY_VM_EXEC_CONTROL: u32 = 0x401E;
 
-// ── Control fields (64-bit) ──────────────────────────────────────────────
-
+/// Physical addresses of the I/O bitmaps: A covers ports 0x0000–0x7FFF,
+/// B ports 0x8000–0xFFFF, one bit per port (64-bit).
+pub const IO_BITMAP_A: u32 = 0x2000;
+pub const IO_BITMAP_B: u32 = 0x2002;
+/// Physical address of the 4 KiB MSR bitmap (64-bit).
+pub const MSR_BITMAP: u32 = 0x2004;
 /// EPT pointer (EPTP): the physical address of the EPT PML4 table, with the
 /// memory type and page-walk length in its low bits (see `vmx::ept::Eptp`).
 pub const EPT_POINTER: u32 = 0x201A;
-
-// ── Bits inside the control fields ───────────────────────────────────────
 
 /// VM-exit control bit 9: the host runs in 64-bit mode after a VM exit.
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
@@ -98,8 +109,6 @@ pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 /// guest field may not even exist.
 pub const VM_ENTRY_LOAD_IA32_PAT: u64 = 1 << 14;
 pub const VM_ENTRY_LOAD_IA32_EFER: u64 = 1 << 15;
-
-// ── Read-only data fields ────────────────────────────────────────────────
 
 /// Why the last VMX instruction failed (32-bit; valid after VMfailValid).
 pub const VM_INSTRUCTION_ERROR: u32 = 0x4400;
@@ -123,8 +132,6 @@ pub const GUEST_PHYSICAL_ADDRESS: u32 = 0x2400;
 /// Guest-linear address of an EPT violation (natural width), valid when
 /// exit qualification bit 7 is set.
 pub const GUEST_LINEAR_ADDRESS: u32 = 0x640A;
-
-// ── Guest-state fields ───────────────────────────────────────────────────
 
 /// Guest segment selectors (16-bit).
 pub const GUEST_ES_SELECTOR: u32 = 0x0800;
@@ -209,8 +216,6 @@ pub const GUEST_PENDING_DEBUG_EXCEPTIONS: u32 = 0x6822;
 /// Guest SYSENTER stack and entry addresses (natural width).
 pub const GUEST_IA32_SYSENTER_ESP: u32 = 0x6824;
 pub const GUEST_IA32_SYSENTER_EIP: u32 = 0x6826;
-
-// ── Host-state fields ────────────────────────────────────────────────────
 
 /// Host segment selectors (16-bit).
 pub const HOST_ES_SELECTOR: u32 = 0x0C00;

@@ -3,7 +3,9 @@
 //!
 //! Nothing here changes CPU state or can fail.
 
+use super::PassthroughState;
 use crate::vmx;
+use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::msr::VmcsControlMsrs;
@@ -118,6 +120,26 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
         "Guest code page executable, stack and data pages writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
         cr4 & vmx::cr::CR4_SMEP != 0,
         cr4 & vmx::cr::CR4_SMAP != 0,
+    );
+}
+
+/// Prints where the exit bitmaps are and what they intercept.
+pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps) {
+    log!(
+        "Exit bitmaps allocated: MSR={:#018x} I/O A={:#018x} I/O B={:#018x}.",
+        bitmaps.msr_address(),
+        bitmaps.io_a_address(),
+        bitmaps.io_b_address(),
+    );
+    log!("Intercepted MSRs (read and write): {INTERCEPTED_MSRS:x?}; intercepted ports: {INTERCEPTED_PORTS:x?}.");
+}
+
+/// Prints the host state the guest reached through passthrough emulation,
+/// before and after its run. Still in the exit phase, so serial only.
+pub(super) fn passthrough_state(before: PassthroughState, after: PassthroughState) {
+    log!(
+        "Passthrough state before the guest {before:x?}, after it {after:x?}: restored={}.",
+        before == after
     );
 }
 

@@ -7,18 +7,20 @@
 //!    a nonzero host TR. The firmware's GDTR is recorded first, and put back
 //!    on every return path once this step has succeeded: by `run` if a
 //!    failure comes before VMXON, by step 7 after it.
-//! 2. Allocate the VM-exit stack and the guest's pages, and check how the
-//!    page tables map the guest pages.
+//! 2. Allocate the VM-exit stack, the guest's pages and the MSR and I/O
+//!    bitmaps, and check how the page tables map the guest pages.
 //! 3. Detect VMX, read its capability MSRs and check EPT support
 //!    ([`check_vmx_support`]), then build the EPT identity map with the
 //!    guest's data page read-only.
 //! 4. Enter VMX root operation and create the VMCS.
-//! 5. Fill in the VMCS: controls, EPT pointer, host state, guest state
-//!    ([`prepare_vmcs`]). Then check that none of this disturbed the host's
-//!    descriptor tables, and stop if it did.
+//! 5. Fill in the VMCS: controls, EPT pointer, exit bitmaps, host state,
+//!    guest state ([`prepare_vmcs`]). Then check that none of this disturbed
+//!    the host's descriptor tables, and stop if it did.
 //! 6. Launch the guest with VMLAUNCH. `vmx::vmcs::launch` returns once the
 //!    guest has stopped: after its last planned exit, or at an exit or
-//!    failure the exit handler in `vmx::vmexit` does not handle.
+//!    failure the exit handler in `vmx::vmexit` does not handle. The host
+//!    state the guest reaches through passthrough emulation
+//!    ([`PassthroughState`]) is read before and after, and printed.
 //! 7. Leave VMX operation and restore the firmware's state
 //!    ([`teardown::teardown`]). Runs whatever happened after VMXON
 //!    succeeded (creating the VMCS, steps 5 and 6), so firmware gets the CPU
@@ -42,10 +44,11 @@ pub use error::{BringUpError, report_error};
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
 use crate::vmx::ept::{self, Ept, InveptType};
-use crate::vmx::guest::GuestMemory;
+use crate::vmx::exit_bitmaps::ExitBitmaps;
+use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
-use crate::vmx::msr::VmcsControlMsrs;
+use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
 use crate::vmx::segment::DescriptorTable;
 use crate::vmx::vmcs::{DesiredControls, GuestStop, VmcsRegion};
 use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
@@ -59,6 +62,29 @@ use teardown::FirmwareState;
 pub struct GuestRun {
     /// VM exits handled, all of them the planned VMCALLs.
     pub exits: u64,
+}
+
+/// Host state the guest reaches through passthrough emulation: real
+/// hardware, not a copy. The guest saves and restores it, so it reads the
+/// same before and after the guest's run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassthroughState {
+    kernel_gs_base: u64,
+    com1_scratch: u8,
+}
+
+impl PassthroughState {
+    /// Reads the current values.
+    fn read() -> Self {
+        Self {
+            // SAFETY: IA32_KERNEL_GS_BASE exists on every 64-bit CPU, and
+            // reading it has no side effect.
+            kernel_gs_base: unsafe { vmx::msr::rdmsr(IA32_KERNEL_GS_BASE) },
+            // SAFETY: the COM1 scratch register: COM1 is the UART `serial`
+            // owns, and reading the scratch register has no side effect.
+            com1_scratch: unsafe { crate::port::inb(GUEST_SCRATCH_PORT) },
+        }
+    }
 }
 
 /// The host GDT and TSS, plus the descriptor-table state recorded right
@@ -87,6 +113,7 @@ const _: () = assert!(
         && !core::mem::needs_drop::<VmExitStack>()
         && !core::mem::needs_drop::<GuestMemory>()
         && !core::mem::needs_drop::<Ept>()
+        && !core::mem::needs_drop::<ExitBitmaps>()
         && !core::mem::needs_drop::<VmxOperation>()
         && !core::mem::needs_drop::<VmcsRegion>()
 );
@@ -101,9 +128,9 @@ const _: () = assert!(
 /// in VMX root operation with CR4.VMXE set, and teardown prints that.
 ///
 /// Every region allocated here (TSS, GDT, VM-exit stack, guest pages, EPT
-/// tables, VMXON region, VMCS) stays allocated, even after this returns. None of these
-/// types implement `Drop`, so their pages are never returned to UEFI. TR
-/// keeps pointing at the TSS (see `teardown`).
+/// tables, exit bitmaps, VMXON region, VMCS) stays allocated, even after this
+/// returns. None of these types implement `Drop`, so their pages are never
+/// returned to UEFI. TR keeps pointing at the TSS (see `teardown`).
 pub fn run() -> Result<GuestRun, BringUpError> {
     let host_tables = activate_host_tables()?;
 
@@ -126,6 +153,7 @@ pub fn run() -> Result<GuestRun, BringUpError> {
         vmexit_stack,
         guest,
         ept,
+        bitmaps,
         controls,
         firmware,
         vmx_operation,
@@ -136,7 +164,7 @@ pub fn run() -> Result<GuestRun, BringUpError> {
     // operation; outside it the VMCS instructions would raise #UD.
     let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
     let result = match &vmcs {
-        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &ept, &host_tables),
+        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &ept, &bitmaps, &host_tables),
         Err(error) => Err(*error),
     };
     // SAFETY: `vmx_operation` is this CPU's and `vmcs` its only VMCS; the
@@ -158,15 +186,16 @@ struct VmxEntry {
     vmexit_stack: VmExitStack,
     guest: GuestMemory,
     ept: Ept,
+    bitmaps: ExitBitmaps,
     controls: VmcsControlMsrs,
     firmware: FirmwareState,
     vmx_operation: VmxOperation,
 }
 
-/// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack and the guest's
-/// pages, checks VMX and EPT support, builds the EPT tables, and enters VMX
-/// root operation. A failure here leaves the CPU outside VMX operation, so
-/// `run` only has to put the firmware's GDTR back.
+/// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack, the guest's
+/// pages and the exit bitmaps, checks VMX and EPT support, builds the EPT
+/// tables, and enters VMX root operation. A failure here leaves the CPU
+/// outside VMX operation, so `run` only has to put the firmware's GDTR back.
 fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmexit_stack = VmExitStack::allocate()?;
     log!(
@@ -191,6 +220,9 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
 
+    let bitmaps = ExitBitmaps::allocate()?;
+    report::exit_bitmaps(&bitmaps);
+
     let (controls, invept) = check_vmx_support()?;
 
     // SAFETY: boot services are still active, and UEFI identity-maps
@@ -214,6 +246,7 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
         vmexit_stack,
         guest,
         ept,
+        bitmaps,
         controls,
         firmware,
         vmx_operation,
@@ -298,25 +331,31 @@ fn launch_guest(
     vmexit_stack: &VmExitStack,
     guest: &GuestMemory,
     ept: &Ept,
+    bitmaps: &ExitBitmaps,
     host_tables: &HostTables,
 ) -> Result<GuestRun, BringUpError> {
-    prepare_vmcs(controls, vmexit_stack, guest, ept)?;
+    prepare_vmcs(controls, vmexit_stack, guest, ept, bitmaps)?;
     check_host_tables_preserved(host_tables)?;
 
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
+    let before = PassthroughState::read();
     // SAFETY: `prepare_vmcs` wrote the controls, the host state
     // (HOST_RSP/HOST_RIP at the live exit stack and handler) and the guest
-    // state; the exit stack, guest pages and EPT tables are never freed.
-    guest_result(unsafe { vmx::vmcs::launch() })
+    // state; the exit stack, guest pages, EPT tables and exit bitmaps are
+    // never freed.
+    let stop = unsafe { vmx::vmcs::launch() };
+    report::passthrough_state(before, PassthroughState::read());
+    guest_result(stop)
 }
 
-/// Fills in the current VMCS: controls, EPT pointer, host state, and guest
-/// state. VM entry is not attempted.
+/// Fills in the current VMCS: controls, EPT pointer, exit bitmaps, host state,
+/// and guest state. VM entry is not attempted.
 fn prepare_vmcs(
     controls: &VmcsControlMsrs,
     vmexit_stack: &VmExitStack,
     guest: &GuestMemory,
     ept: &Ept,
+    bitmaps: &ExitBitmaps,
 ) -> Result<(), BringUpError> {
     // SAFETY: VMX root operation with the VMCS `run` created and made
     // current.
@@ -336,6 +375,11 @@ fn prepare_vmcs(
         "VMCS EPT pointer {:#018x} (WB, 4-level) written and read back.",
         ept.eptp().raw()
     );
+
+    // SAFETY: VMX root operation with the VMCS `run` created and made
+    // current. The bitmap pages are never freed.
+    unsafe { bitmaps.write_to_vmcs() }.map_err(vmcs_step("exit bitmap setup"))?;
+    log!("VMCS MSR and I/O bitmap addresses written and read back.");
 
     // SAFETY: VMX root operation with the VMCS `run` created and made
     // current. The host GDT and TSS were activated first and are never freed.

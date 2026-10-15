@@ -1,28 +1,30 @@
-//! What the VM-exit handler does with each exit: a pure state machine.
+//! What the VM-exit handler does with each exit: pure decisions, one
+//! handler per exit reason.
 //!
 //! The handler reads the exit's VMCS fields into an [`ExitInfo`], calls
 //! [`decide`] with the [`ExitState`] kept between exits, and applies the
 //! [`ExitAction`] of the returned [`ExitEvent`]. Nothing here touches the
 //! CPU, so every case is a host unit test.
 //!
-//! The guest (`guest.rs`) writes its read-only data page, makes two main
-//! VMCALLs, with `GUEST_MARKER` and then `GUEST_MARKER + 1` in RAX, and
-//! waits between them for an NMI:
+//! [`decide`] first checks what holds for every exit (a failed VM entry, an
+//! interrupted event delivery), then dispatches on the exit reason to a
+//! handler with the signature `fn(ExitState, &ExitInfo) -> (ExitEvent,
+//! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
+//! `match` instead of a table of function pointers: each handler stays a
+//! separate pure function with one signature, and the handled reasons are
+//! listed in one place:
 //!
-//! ```text
-//! EPT violation  ──▶ a write to the protected data page: make it writable,
-//!                    resume at the same RIP so the write is retried
-//! main VMCALL #1 ──▶ resume past it (only after the EPT violation, and only
-//!                    if ECX/EDX hold the data page's seed and new value)
-//! NMI exit       ──▶ guest can take the NMI:  inject it at the next entry
-//!                    guest cannot yet (STI, MOV SS or NMI blocking):
-//!                                             turn on NMI-window exiting,
-//! NMI-window exit──▶                          inject when the window opens
-//! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
-//! main VMCALL #2 ──▶ finished
-//! ```
+//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR, IN, OUT).
+//! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
+//!   NMI reinjection).
+//!
+//! An exit reason without a handler stops the guest.
 
-use super::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
+mod emulation;
+mod scenario;
+
+pub use emulation::{Emulation, EmulationCounts, IoSize, cpuid_policy, merge_in};
+pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +81,18 @@ pub const UNREADABLE_REASON: u16 = 0xFFFF;
 pub const EXIT_REASON_EXCEPTION_OR_NMI: u16 = 0;
 /// Basic exit reason of an NMI-window exit.
 pub const EXIT_REASON_NMI_WINDOW: u16 = 8;
+/// Basic exit reason of CPUID, which always exits.
+pub const EXIT_REASON_CPUID: u16 = 10;
 /// Basic exit reason of a VMCALL exit.
 pub const EXIT_REASON_VMCALL: u16 = 18;
+/// Basic exit reason of IN/OUT (and INS/OUTS) to a port the I/O bitmaps
+/// intercept.
+pub const EXIT_REASON_IO_INSTRUCTION: u16 = 30;
+/// Basic exit reason of RDMSR, which exits for MSRs the MSR bitmap
+/// intercepts or does not cover.
+pub const EXIT_REASON_RDMSR: u16 = 31;
+/// Basic exit reason of WRMSR, which exits for the same MSRs as RDMSR.
+pub const EXIT_REASON_WRMSR: u16 = 32;
 /// Basic exit reason of an EPT violation: an access the EPT entries do not
 /// allow.
 pub const EXIT_REASON_EPT_VIOLATION: u16 = 48;
@@ -113,8 +125,7 @@ pub const EPT_TRANSLATED_ACCESS: u64 = 1 << 8;
 pub const EPT_NMI_UNBLOCKING_IRET: u64 = 1 << 12;
 
 /// An EPT violation's exit qualification (EXIT_QUALIFICATION), decoded with
-/// the bits above. Other exits carry other layouts in the same field; only
-/// EPT exits are read through this type.
+/// the bits above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EptQualification(pub u64);
 
@@ -162,9 +173,6 @@ impl EptQualification {
     }
 }
 
-/// How many main VMCALLs the guest makes; the last one ends the run.
-pub const PLANNED_MAIN_VMCALLS: u32 = 2;
-
 /// IDT vector of NMI.
 pub const NMI_VECTOR: u8 = 2;
 
@@ -186,11 +194,23 @@ impl InterruptionInfo {
     pub const VALID: u32 = 1 << 31;
     /// Interruption type 2 (bits 10:8): NMI.
     const TYPE_NMI: u32 = 2;
+    /// Interruption type 3 (bits 10:8): hardware exception.
+    const TYPE_HARDWARE_EXCEPTION: u32 = 3;
+    /// Bit 11: deliver an error code (VM_ENTRY_EXCEPTION_ERROR_CODE).
+    const DELIVER_ERROR_CODE: u32 = 1 << 11;
+    /// IDT vector of #GP.
+    const GP_VECTOR: u32 = 13;
 
     /// The VM_ENTRY_INTERRUPTION_INFO value that injects an NMI at the next
     /// VM entry: valid, type NMI, vector 2. The CPU clears the field after
     /// each successful entry, so it injects once.
     pub const NMI: Self = Self(Self::VALID | (Self::TYPE_NMI << 8) | NMI_VECTOR as u32);
+
+    /// The VM_ENTRY_INTERRUPTION_INFO value that injects #GP with an error
+    /// code at the next VM entry, delivered before the faulting instruction
+    /// runs again.
+    pub const GENERAL_PROTECTION: Self =
+        Self(Self::VALID | (Self::TYPE_HARDWARE_EXCEPTION << 8) | Self::DELIVER_ERROR_CODE | Self::GP_VECTOR);
 
     /// Whether the field describes an event at all (bit 31).
     pub fn is_valid(self) -> bool {
@@ -209,32 +229,18 @@ impl InterruptionInfo {
     }
 }
 
-/// Guest interruptibility bit 0: blocking by STI. The Intel SDM (Vol. 3C,
-/// checks on guest non-register state) says: "A processor may require bit 0
-/// (blocking by STI) to be 0 if the valid bit is 1 and the interruption type
-/// is NMI." So an NMI is injected only when this bit is clear too.
-const BLOCKING_BY_STI: u32 = 1 << 0;
-/// Guest interruptibility bit 1: blocking by MOV SS. VM entry refuses to
-/// inject an NMI while it is set.
-const BLOCKING_BY_MOV_SS: u32 = 1 << 1;
-/// Guest interruptibility bit 3: blocking by NMI. With virtual NMIs this is
-/// an injected NMI the guest has not ended with IRET yet; VM entry refuses
-/// to inject another while it is set.
-const BLOCKING_BY_NMI: u32 = 1 << 3;
-/// Any of the blocking bits that may stop an NMI injection. The handler
-/// injects only when none is set, and otherwise waits for the NMI window
-/// instead of injecting blindly.
-const NMI_INJECTION_BLOCKED: u32 = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
-
 /// What the handler read about the current exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitInfo {
     pub reason: ExitReason,
     /// VM_EXIT_INTERRUPTION_INFO.
     pub interruption_info: InterruptionInfo,
+    /// The guest's RAX, RCX and RDX. CPUID reads its leaf from EAX and its
+    /// subleaf from ECX. RDMSR and WRMSR read the MSR from ECX, and WRMSR its
+    /// value from EDX:EAX. OUT reads its value from AL, AX or EAX. At main
+    /// VMCALL #1, ECX and EDX hold what the guest read from its data page
+    /// before and after its write.
     pub guest_rax: u64,
-    /// The guest's RCX and RDX: at main VMCALL #1, what it read from its
-    /// data page before and after its write.
     pub guest_rcx: u64,
     pub guest_rdx: u64,
     /// GUEST_INTERRUPTIBILITY_STATE.
@@ -242,8 +248,15 @@ pub struct ExitInfo {
     /// IDT_VECTORING_INFO bit 31: the exit interrupted an event's delivery
     /// through the guest IDT.
     pub idt_vectoring_valid: bool,
-    /// EXIT_QUALIFICATION, which [`decide`] reads for EPT violations only.
-    pub exit_qualification: EptQualification,
+    /// EXIT_QUALIFICATION. Its layout depends on the reason; [`decide`]
+    /// reads it for EPT violations ([`EptQualification`]) and I/O
+    /// instructions (`emulation::IoQualification`) only. `read_exit` keeps
+    /// the real value whenever the VMCS field is readable, and uses 0 only
+    /// when it is unreadable on an exit `decide` does not judge by it. A
+    /// handler that reads it for another reason (CR access, reason 28, for
+    /// example) must add that reason to `judged_by_qualification` in
+    /// `vmexit/handler.rs`.
+    pub qualification: u64,
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only; 0 otherwise.
     pub guest_physical: u64,
     /// GPA of the page EPT maps read-only (`ept::protected_page`), 0 if none.
@@ -263,6 +276,8 @@ pub struct ExitState {
     pub nmis_handled: u32,
     /// EPT violations on the protected page after which write was granted.
     pub ept_writes_granted: u32,
+    /// Exits emulated so far, per instruction.
+    pub emulated: EmulationCounts,
 }
 
 /// What an exit turned out to be.
@@ -294,6 +309,14 @@ pub enum ExitEvent {
     /// the guest should have read from its data page: the seed before its
     /// write, its own value after it.
     DataPageMismatch,
+    /// An instruction Aleph0 executes for the guest, then resumes past it.
+    Emulated(Emulation),
+    /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
+    /// bitmap, or a non-canonical value for an intercepted one.
+    GuestGeneralProtection,
+    /// The last main VMCALL arrived, but the guest's emulated exits do not
+    /// match `guest::EXPECTED_EMULATION`.
+    EmulationMissing,
     /// Anything else.
     Unexpected,
 }
@@ -311,6 +334,12 @@ pub struct ResumePlan {
     /// Make the protected page writable in EPT
     /// (`ept::ProtectedPage::grant_write`).
     pub grant_write: bool,
+    /// Execute this instruction for the guest and put its result in the
+    /// guest's registers, before RIP moves past it.
+    pub emulate: Option<Emulation>,
+    /// Write [`InterruptionInfo::GENERAL_PROTECTION`] (error code 0) to
+    /// VM_ENTRY_INTERRUPTION_INFO.
+    pub inject_gp: bool,
 }
 
 impl ResumePlan {
@@ -320,6 +349,8 @@ impl ResumePlan {
         inject_nmi: false,
         nmi_window: None,
         grant_write: false,
+        emulate: None,
+        inject_gp: false,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -330,6 +361,8 @@ impl ResumePlan {
         inject_nmi: true,
         nmi_window: Some(false),
         grant_write: false,
+        emulate: None,
+        inject_gp: false,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -338,6 +371,8 @@ impl ResumePlan {
         inject_nmi: false,
         nmi_window: Some(true),
         grant_write: false,
+        emulate: None,
+        inject_gp: false,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -346,6 +381,18 @@ impl ResumePlan {
         inject_nmi: false,
         nmi_window: None,
         grant_write: true,
+        emulate: None,
+        inject_gp: false,
+    };
+    /// Inject #GP(0); RIP stays on the faulting instruction, as for any
+    /// fault.
+    pub const INJECT_GP: Self = Self {
+        advance_rip: false,
+        inject_nmi: false,
+        nmi_window: None,
+        grant_write: false,
+        emulate: None,
+        inject_gp: true,
     };
 }
 
@@ -368,35 +415,26 @@ impl ExitEvent {
             Self::NmiInjected | Self::NmiWindowInjected => ExitAction::Resume(ResumePlan::INJECT_NMI),
             Self::NmiDeferred => ExitAction::Resume(ResumePlan::WAIT_FOR_NMI_WINDOW),
             Self::EptWriteGranted => ExitAction::Resume(ResumePlan::RETRY_AFTER_GRANT),
+            Self::Emulated(emulation) => ExitAction::Resume(ResumePlan {
+                emulate: Some(emulation),
+                ..ResumePlan::PAST_INSTRUCTION
+            }),
+            Self::GuestGeneralProtection => ExitAction::Resume(ResumePlan::INJECT_GP),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::InterruptedDelivery | Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => {
-                ExitAction::Unexpected
-            }
+            Self::InterruptedDelivery
+            | Self::EptWriteMissing
+            | Self::DataPageMismatch
+            | Self::EmulationMissing
+            | Self::Unexpected => ExitAction::Unexpected,
         }
     }
-}
-
-/// Whether, at main VMCALL #1, ECX holds the seed the guest read from its
-/// data page and EDX the value it wrote and read back. Compared as 32-bit
-/// values: the guest loads both with 32-bit moves.
-fn data_page_read_back(exit: &ExitInfo) -> bool {
-    exit.guest_rcx as u32 == GUEST_DATA_SEED && exit.guest_rdx as u32 == GUEST_EPT_VALUE
-}
-
-/// The guest's RAX at its next main VMCALL: the marker, plus one for each
-/// main VMCALL already handled (the guest runs `inc eax` before #2).
-pub fn expected_main_rax(state: ExitState) -> u64 {
-    u64::from(GUEST_MARKER) + u64::from(state.main_vmcalls)
 }
 
 /// Decides what `exit` is, given what happened before (`state`), and
 /// returns the event with the state for the next exit.
 ///
-/// A VM-entry failure or an interrupted delivery is never handled. Several
-/// NMIs never queue: a new NMI while one is pending replaces it, as on real
-/// hardware, where at most one NMI waits. Exactly one EPT violation is
-/// handled, a write to the protected page, and it must come before the
-/// first main VMCALL, which must show the data page read back as planned.
+/// A VM-entry failure or an interrupted delivery is never handled, whatever
+/// the reason. Every other exit goes to the handler for its reason.
 pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
@@ -404,78 +442,19 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.idt_vectoring_valid {
         return (ExitEvent::InterruptedDelivery, state);
     }
-
-    let injected = ExitState {
-        nmi_pending: false,
-        nmis_injected: state.nmis_injected + 1,
-        ..state
-    };
     match exit.reason.basic {
-        EXIT_REASON_EXCEPTION_OR_NMI if exit.interruption_info.is_nmi() => {
-            if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
-                (ExitEvent::NmiInjected, injected)
-            } else {
-                (
-                    ExitEvent::NmiDeferred,
-                    ExitState {
-                        nmi_pending: true,
-                        ..state
-                    },
-                )
-            }
-        }
-        // Per the SDM, NMI-window exits never occur under MOV SS blocking, but
-        // the processor may still report one under STI blocking. Injecting
-        // then would fail the VM entry, so keep waiting. (MOV SS stays in the
-        // mask; it is harmless.)
-        EXIT_REASON_NMI_WINDOW if state.nmi_pending && exit.interruptibility & NMI_INJECTION_BLOCKED != 0 => {
-            (ExitEvent::NmiDeferred, state)
-        }
-        EXIT_REASON_NMI_WINDOW if state.nmi_pending => (ExitEvent::NmiWindowInjected, injected),
-        EXIT_REASON_EPT_VIOLATION
-            if exit.protected_page != 0
-                && exit.guest_physical & !0xFFF == exit.protected_page
-                && exit.exit_qualification.is_protected_write()
-                && state.ept_writes_granted == 0 =>
-        {
-            (
-                ExitEvent::EptWriteGranted,
-                ExitState {
-                    ept_writes_granted: 1,
-                    ..state
-                },
-            )
-        }
-        EXIT_REASON_VMCALL if exit.guest_rax == u64::from(GUEST_NMI_MARKER) => (
-            ExitEvent::GuestNmiHandler,
-            ExitState {
-                nmis_handled: state.nmis_handled + 1,
-                ..state
-            },
-        ),
-        EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) && state.ept_writes_granted == 0 => {
-            (ExitEvent::EptWriteMissing, state)
-        }
-        EXIT_REASON_VMCALL
-            if exit.guest_rax == expected_main_rax(state) && state.main_vmcalls == 0 && !data_page_read_back(&exit) =>
-        {
-            (ExitEvent::DataPageMismatch, state)
-        }
-        EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) => {
-            let state = ExitState {
-                main_vmcalls: state.main_vmcalls + 1,
-                ..state
-            };
-            if state.main_vmcalls < PLANNED_MAIN_VMCALLS {
-                (ExitEvent::MainVmcall, state)
-            } else {
-                (ExitEvent::LastMainVmcall, state)
-            }
-        }
+        EXIT_REASON_CPUID => emulation::cpuid(state, &exit),
+        EXIT_REASON_RDMSR => emulation::rdmsr(state, &exit),
+        EXIT_REASON_WRMSR => emulation::wrmsr(state, &exit),
+        EXIT_REASON_IO_INSTRUCTION => emulation::io(state, &exit),
+        EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
+        EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
+        EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),
+        EXIT_REASON_VMCALL => scenario::vmcall(state, &exit),
         _ => (ExitEvent::Unexpected, state),
     }
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/exit_decision.rs"]
+#[path = "../../../tests/unit/vmx/exit_decision.rs"]
 mod tests;

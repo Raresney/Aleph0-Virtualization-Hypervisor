@@ -16,6 +16,7 @@
 pub mod cpuid;
 pub mod cr;
 pub mod ept;
+pub mod exit_bitmaps;
 pub mod exit_decision;
 pub mod guest;
 pub mod guest_state;
