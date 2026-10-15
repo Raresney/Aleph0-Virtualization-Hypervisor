@@ -12,13 +12,16 @@
 //! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
 //! `match`, which the compiler checks and turns into the same jump table:
 //!
+//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID).
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
 //!   NMI reinjection).
 //!
 //! An exit reason without a handler stops the guest.
 
+mod emulation;
 mod scenario;
 
+pub use emulation::{Emulation, EmulationCounts, cpuid_policy};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
@@ -76,6 +79,8 @@ pub const UNREADABLE_REASON: u16 = 0xFFFF;
 pub const EXIT_REASON_EXCEPTION_OR_NMI: u16 = 0;
 /// Basic exit reason of an NMI-window exit.
 pub const EXIT_REASON_NMI_WINDOW: u16 = 8;
+/// Basic exit reason of CPUID, which always exits.
+pub const EXIT_REASON_CPUID: u16 = 10;
 /// Basic exit reason of a VMCALL exit.
 pub const EXIT_REASON_VMCALL: u16 = 18;
 /// Basic exit reason of an EPT violation: an access the EPT entries do not
@@ -209,9 +214,10 @@ pub struct ExitInfo {
     pub reason: ExitReason,
     /// VM_EXIT_INTERRUPTION_INFO.
     pub interruption_info: InterruptionInfo,
+    /// The guest's RAX, RCX and RDX. CPUID reads its leaf from EAX and its
+    /// subleaf from ECX. At main VMCALL #1, ECX and EDX hold what the guest
+    /// read from its data page before and after its write.
     pub guest_rax: u64,
-    /// The guest's RCX and RDX: at main VMCALL #1, what it read from its
-    /// data page before and after its write.
     pub guest_rcx: u64,
     pub guest_rdx: u64,
     /// GUEST_INTERRUPTIBILITY_STATE.
@@ -240,6 +246,8 @@ pub struct ExitState {
     pub nmis_handled: u32,
     /// EPT violations on the protected page after which write was granted.
     pub ept_writes_granted: u32,
+    /// Exits emulated so far, per instruction.
+    pub emulated: EmulationCounts,
 }
 
 /// What an exit turned out to be.
@@ -271,6 +279,11 @@ pub enum ExitEvent {
     /// the guest should have read from its data page: the seed before its
     /// write, its own value after it.
     DataPageMismatch,
+    /// An instruction Aleph0 executes for the guest, then resumes past it.
+    Emulated(Emulation),
+    /// The last main VMCALL arrived, but the guest's emulated exits do not
+    /// match `guest::EXPECTED_EMULATION`.
+    EmulationMissing,
     /// Anything else.
     Unexpected,
 }
@@ -288,6 +301,9 @@ pub struct ResumePlan {
     /// Make the protected page writable in EPT
     /// (`ept::ProtectedPage::grant_write`).
     pub grant_write: bool,
+    /// Execute this instruction for the guest and put its result in the
+    /// guest's registers, before RIP moves past it.
+    pub emulate: Option<Emulation>,
 }
 
 impl ResumePlan {
@@ -297,6 +313,7 @@ impl ResumePlan {
         inject_nmi: false,
         nmi_window: None,
         grant_write: false,
+        emulate: None,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -307,6 +324,7 @@ impl ResumePlan {
         inject_nmi: true,
         nmi_window: Some(false),
         grant_write: false,
+        emulate: None,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -315,6 +333,7 @@ impl ResumePlan {
         inject_nmi: false,
         nmi_window: Some(true),
         grant_write: false,
+        emulate: None,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -323,6 +342,7 @@ impl ResumePlan {
         inject_nmi: false,
         nmi_window: None,
         grant_write: true,
+        emulate: None,
     };
 }
 
@@ -345,10 +365,16 @@ impl ExitEvent {
             Self::NmiInjected | Self::NmiWindowInjected => ExitAction::Resume(ResumePlan::INJECT_NMI),
             Self::NmiDeferred => ExitAction::Resume(ResumePlan::WAIT_FOR_NMI_WINDOW),
             Self::EptWriteGranted => ExitAction::Resume(ResumePlan::RETRY_AFTER_GRANT),
+            Self::Emulated(emulation) => ExitAction::Resume(ResumePlan {
+                emulate: Some(emulation),
+                ..ResumePlan::PAST_INSTRUCTION
+            }),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::InterruptedDelivery | Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => {
-                ExitAction::Unexpected
-            }
+            Self::InterruptedDelivery
+            | Self::EptWriteMissing
+            | Self::DataPageMismatch
+            | Self::EmulationMissing
+            | Self::Unexpected => ExitAction::Unexpected,
         }
     }
 }
@@ -366,6 +392,7 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         return (ExitEvent::InterruptedDelivery, state);
     }
     match exit.reason.basic {
+        EXIT_REASON_CPUID => emulation::cpuid(state, &exit),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
         EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),

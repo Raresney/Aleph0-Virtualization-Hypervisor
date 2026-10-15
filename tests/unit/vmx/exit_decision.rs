@@ -7,20 +7,22 @@
 
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
-use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
+use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 
 const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;
 /// VM_EXIT_INTERRUPTION_INFO of an NMI exit.
 const NMI_INFO: InterruptionInfo = InterruptionInfo(0x8000_0202);
 
-/// Before the first exit.
+/// After the guest's emulated exits, before the EPT violation: the state the
+/// scenario's own exits start from.
 const START: ExitState = ExitState {
     main_vmcalls: 0,
     nmi_pending: false,
     nmis_injected: 0,
     nmis_handled: 0,
     ept_writes_granted: 0,
+    emulated: EXPECTED_EMULATION,
 };
 /// After the EPT violation: the data page is writable, main VMCALL #1 next.
 const WRITTEN: ExitState = ExitState {
@@ -426,7 +428,8 @@ fn full_nmi_run_finishes_with_both_counts() {
             nmi_pending: false,
             nmis_injected: 1,
             nmis_handled: 1,
-            ept_writes_granted: 1
+            ept_writes_granted: 1,
+            emulated: EXPECTED_EMULATION,
         },
     );
 }
@@ -454,7 +457,8 @@ fn deferred_nmi_run_finishes_with_both_counts() {
             nmi_pending: false,
             nmis_injected: 1,
             nmis_handled: 1,
-            ept_writes_granted: 1
+            ept_writes_granted: 1,
+            emulated: EXPECTED_EMULATION,
         },
     );
 }
@@ -497,6 +501,7 @@ fn each_event_maps_to_its_action() {
             inject_nmi,
             nmi_window,
             grant_write,
+            emulate: None,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
@@ -514,6 +519,15 @@ fn each_event_maps_to_its_action() {
     assert_eq!(ExitEvent::EptWriteMissing.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::DataPageMismatch.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::Unexpected.action(), ExitAction::Unexpected);
+    let cpuid = Emulation::Cpuid { leaf: 1, subleaf: 0 };
+    assert_eq!(
+        ExitEvent::Emulated(cpuid).action(),
+        ExitAction::Resume(ResumePlan {
+            emulate: Some(cpuid),
+            ..ResumePlan::PAST_INSTRUCTION
+        })
+    );
+    assert_eq!(ExitEvent::EmulationMissing.action(), ExitAction::Unexpected);
 }
 
 #[test]
@@ -586,4 +600,61 @@ fn ept_page_permissions_come_from_bits_5_to_3() {
     // The guest's data page: readable only.
     assert_eq!(EptQualification(0x18A).permissions(), (1, 0, 0));
     assert_eq!(EptQualification(0x38).permissions(), (1, 1, 1));
+}
+
+/// The exits the guest's emulation block causes, in order.
+fn emulated_exits() -> Vec<ExitInfo> {
+    vec![ExitInfo {
+        guest_rax: 1,
+        guest_rcx: 0,
+        ..exit(EXIT_REASON_CPUID)
+    }]
+}
+
+#[test]
+fn cpuid_exit_is_dispatched_to_emulation() {
+    let cpuid = ExitInfo {
+        guest_rax: 1,
+        guest_rcx: 0,
+        ..exit(EXIT_REASON_CPUID)
+    };
+    assert_eq!(
+        decide(START, cpuid).0,
+        ExitEvent::Emulated(Emulation::Cpuid { leaf: 1, subleaf: 0 })
+    );
+}
+
+#[test]
+fn last_main_vmcall_without_the_emulated_exits_is_emulation_missing() {
+    let unemulated = ExitState {
+        emulated: EmulationCounts::default(),
+        ..WAITING
+    };
+    assert_eq!(
+        decide(unemulated, vmcall(MARKER + 1)),
+        (ExitEvent::EmulationMissing, unemulated)
+    );
+}
+
+#[test]
+fn first_main_vmcall_does_not_check_the_emulated_exits() {
+    let unemulated = ExitState {
+        emulated: EmulationCounts::default(),
+        ..WRITTEN
+    };
+    assert_eq!(decide(unemulated, vmcall(MARKER)).0, ExitEvent::MainVmcall);
+}
+
+#[test]
+fn whole_guest_run_from_the_first_exit_finishes() {
+    let mut state = ExitState::default();
+    let mut event = ExitEvent::Unexpected;
+    for exit in emulated_exits()
+        .into_iter()
+        .chain([protected_write(), vmcall(MARKER), vmcall(MARKER + 1)])
+    {
+        (event, state) = decide(state, exit);
+    }
+    assert_eq!(event, ExitEvent::LastMainVmcall);
+    assert_eq!(state.emulated, EXPECTED_EMULATION);
 }

@@ -4,13 +4,13 @@
 //! Like the handler, everything here runs in exit context: only VMREAD and
 //! the serial port, never firmware.
 
-use super::handler::Resumed;
+use super::handler::{EmulationOutcome, Resumed};
 use crate::vmx::ept::InveptType;
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo,
     PLANNED_MAIN_VMCALLS, expected_main_rax,
 };
-use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
+use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::vmcs::fields::{GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS, VM_EXIT_INTERRUPTION_INFO};
 use crate::vmx::vmcs::{self, VmcsError};
 
@@ -122,6 +122,11 @@ pub(super) fn report_event(
                 ""
             },
         ),
+        ExitEvent::Emulated(_) => report_emulation(number, resumed.and_then(|resumed| resumed.emulated), rip),
+        ExitEvent::EmulationMissing => crate::serial_println!(
+            "{tag} VM exit #{number}: last main VMCALL (rax={rax:#x}), but the emulated exits were {} instead of {EXPECTED_EMULATION}.",
+            state.emulated,
+        ),
         ExitEvent::InterruptedDelivery => crate::serial_println!(
             "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
         ),
@@ -135,6 +140,28 @@ pub(super) fn report_event(
             "{tag} VM exit #{number}: EPT: {} write violation(s) on the protected data page, write granted.",
             state.ept_writes_granted,
         );
+        crate::serial_println!("{tag} VM exit #{number}: emulated exits: {}.", state.emulated);
+    }
+}
+
+/// Prints what an emulated instruction did and where the guest resumes.
+fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
+    let tag = crate::TAG;
+    match outcome {
+        Some(EmulationOutcome::Cpuid {
+            leaf,
+            subleaf,
+            raw,
+            guest,
+        }) => crate::serial_println!(
+            "{tag} VM exit #{number}: CPUID leaf={leaf:#x} subleaf={subleaf:#x} -> eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x} (processor ecx={:#010x}); resuming at rip={rip:#018x}.",
+            guest.eax,
+            guest.ebx,
+            guest.ecx,
+            guest.edx,
+            raw.ecx,
+        ),
+        None => crate::serial_println!("{tag} VM exit #{number}: emulated instruction not executed."),
     }
 }
 

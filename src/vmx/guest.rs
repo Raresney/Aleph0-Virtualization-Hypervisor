@@ -14,6 +14,10 @@
 //! (an EPT violation, after which Aleph0 makes it writable and the write is
 //! retried), and reads it back.
 //!
+//! Before that, the guest runs the instructions Aleph0 emulates (CPUID) and
+//! checks each result itself. A wrong one ends in `ud2` with
+//! [`GUEST_EMULATION_FAIL_MARKER`] in EAX.
+//!
 //! Guest RIP is [`GuestMemory::code_base`], guest RSP
 //! [`GuestMemory::stack_top`], and guest IDTR [`GuestMemory::idt`];
 //! `GuestState::write` (in `guest_state`) writes them to the VMCS.
@@ -32,7 +36,7 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
-use super::exit_decision::NMI_VECTOR;
+use super::exit_decision::{EmulationCounts, NMI_VECTOR};
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable};
@@ -72,12 +76,28 @@ pub const GUEST_EPT_VALUE: u32 = 0x0045_5054;
 /// `serial.rs` never uses.
 pub const GUEST_SCRATCH_PORT: u16 = crate::serial::COM1 + 7;
 
+/// Value the guest loads into EAX before `ud2` when an emulated instruction
+/// returned the wrong value. The #UD exit (vector 6) stops the guest, and
+/// this marker in RAX on serial says why.
+pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
+
+/// The emulated exits the guest causes before its last main VMCALL.
+/// `exit_decision` stops the guest at that VMCALL if the counts differ.
+pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts { cpuid: 1 };
+
 core::arch::global_asm!(
     r#"
     .globl guest_code_start
     .globl guest_nmi_handler
     .globl guest_code_end
 guest_code_start:
+    // CPUID always exits; Aleph0 executes it and hides VMX (CPUID.1:ECX
+    // bit 5), so a guest never tries VMXON.
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    bt ecx, 5
+    jc guest_emulation_failed
     // No NMI handled yet. General-purpose registers are not VMCS fields, so
     // without this EBX would hold whatever the host had at VMLAUNCH.
     xor ebx, ebx
@@ -125,12 +145,18 @@ guest_nmi_handler:
     // the wait loop. With virtual NMIs on, it also ends the guest's NMI
     // blocking.
     iretq
+guest_emulation_failed:
+    // An emulated instruction returned the wrong value: stop with a marker
+    // in RAX, which the #UD exit prints.
+    mov eax, {fail_marker}
+    ud2
 guest_code_end:
 "#,
     marker = const GUEST_MARKER,
     iterations = const GUEST_WAIT_ITERATIONS,
     nmi_marker = const GUEST_NMI_MARKER,
     ept_value = const GUEST_EPT_VALUE,
+    fail_marker = const GUEST_EMULATION_FAIL_MARKER,
 );
 
 unsafe extern "C" {

@@ -6,6 +6,7 @@
 //! waits between them for an NMI:
 //!
 //! ```text
+//! (before these: the guest's emulated exits, counted; see emulation.rs)
 //! EPT violation  ──▶ a write to the protected data page: make it writable,
 //!                    resume at the same RIP so the write is retried
 //! main VMCALL #1 ──▶ resume past it (only after the EPT violation, and only
@@ -15,11 +16,11 @@
 //!                                             turn on NMI-window exiting,
 //! NMI-window exit──▶                          inject when the window opens
 //! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
-//! main VMCALL #2 ──▶ finished
+//! main VMCALL #2 ──▶ finished, if every emulated exit came (EXPECTED_EMULATION)
 //! ```
 
 use super::{ExitEvent, ExitInfo, ExitState};
-use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
+use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 
 /// How many main VMCALLs the guest makes; the last one ends the run.
 pub const PLANNED_MAIN_VMCALLS: u32 = 2;
@@ -148,6 +149,10 @@ pub(super) fn vmcall(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState
     };
     if next.main_vmcalls < PLANNED_MAIN_VMCALLS {
         (ExitEvent::MainVmcall, next)
+    } else if state.emulated != EXPECTED_EMULATION {
+        // The guest emulates before its first main VMCALL; by its last one
+        // every emulated exit has to have happened, exactly once each.
+        (ExitEvent::EmulationMissing, state)
     } else {
         (ExitEvent::LastMainVmcall, next)
     }

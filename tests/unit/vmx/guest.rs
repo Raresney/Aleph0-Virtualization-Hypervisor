@@ -11,9 +11,14 @@ fn guest_code_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls() {
     assert_eq!(
         guest_code(),
         [
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x31, 0xC9, // xor ecx, ecx
+            0x0F, 0xA2, // cpuid
+            0x0F, 0xBA, 0xE1, 0x05, // bt ecx, 5
+            0x72, 0x49, // jc guest_emulation_failed (+73)
             0x31, 0xDB, // xor ebx, ebx
             0x48, 0x8D, 0x3D, // lea rdi, [rip + guest_code_start]:
-            0xF7, 0xFF, 0xFF, 0xFF, //   -9, back to byte 0
+            0xE8, 0xFF, 0xFF, 0xFF, //   -24, back to byte 0
             0x48, 0x81, 0xC7, // add rdi, 0x1000
             0x00, 0x10, 0x00, 0x00, 0x8B, 0x0F, // mov ecx, [rdi]
             0xC7, 0x07, // mov dword ptr [rdi], GUEST_EPT_VALUE
@@ -35,14 +40,16 @@ fn guest_code_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls() {
             0x58, // pop rax
             0xBB, 0x01, 0x00, 0x00, 0x00, // mov ebx, 1
             0x48, 0xCF, // iretq
+            0xB8, 0x11, 0xFA, 0x00, 0x00, // guest_emulation_failed: mov eax, GUEST_EMULATION_FAIL_MARKER
+            0x0F, 0x0B, // ud2
         ],
     );
 }
 
 #[test]
 fn nmi_handler_starts_after_the_main_code() {
-    // Byte 56 in the listing above: right after the ud2.
-    assert_eq!(nmi_handler_offset(), 56);
+    // Byte 71 in the listing above: right after the ud2.
+    assert_eq!(nmi_handler_offset(), 71);
 }
 
 #[test]

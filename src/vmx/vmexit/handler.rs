@@ -4,18 +4,19 @@
 //! [`vmexit_handler`] runs three steps. [`read_exit`] reads the exit's VMCS
 //! fields and the guest registers and prints them; [`judge`] passes them to
 //! `exit_decision::decide` with the state kept between exits; [`apply`]
-//! prepares the VMCS as the event's `ResumePlan` says, or stops, and
-//! prints the outcome.
+//! executes an emulated instruction, prepares the VMCS as the event's
+//! `ResumePlan` says, or stops, and prints the outcome.
 
+use core::arch::x86_64::{__cpuid_count, CpuidResult};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::RegisterFrame;
 use super::report::{read_or_report, report_ept_exit, report_event, report_exception};
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, EptQualification, ExitAction,
-    ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, ResumePlan, UNREADABLE_REASON, decide,
-    exit_reason_name,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, Emulation, EmulationCounts,
+    EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, ResumePlan,
+    UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name,
 };
 use crate::vmx::vmcs::fields::{
     EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_INTERRUPTION_INFO,
@@ -35,6 +36,7 @@ static NMI_PENDING: AtomicBool = AtomicBool::new(false);
 static NMIS_INJECTED: AtomicU32 = AtomicU32::new(0);
 static NMIS_HANDLED: AtomicU32 = AtomicU32::new(0);
 static EPT_WRITES_GRANTED: AtomicU32 = AtomicU32::new(0);
+static EMULATED_CPUID: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
@@ -43,6 +45,9 @@ fn load_state() -> ExitState {
         nmis_injected: NMIS_INJECTED.load(Ordering::Relaxed),
         nmis_handled: NMIS_HANDLED.load(Ordering::Relaxed),
         ept_writes_granted: EPT_WRITES_GRANTED.load(Ordering::Relaxed),
+        emulated: EmulationCounts {
+            cpuid: EMULATED_CPUID.load(Ordering::Relaxed),
+        },
     }
 }
 
@@ -52,6 +57,7 @@ fn store_state(state: ExitState) {
     NMIS_INJECTED.store(state.nmis_injected, Ordering::Relaxed);
     NMIS_HANDLED.store(state.nmis_handled, Ordering::Relaxed);
     EPT_WRITES_GRANTED.store(state.ept_writes_granted, Ordering::Relaxed);
+    EMULATED_CPUID.store(state.emulated.cpuid, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -77,19 +83,24 @@ fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
 /// Runs on the VM-exit stack with interrupts off. It may only use things
 /// that need no firmware: VMREAD/VMWRITE (the VMCS is still current) and the
 /// serial port. `uefi::println!` must not be called here; `log!` and the
-/// panic handler skip the console once the phase below is set.
+/// panic handler skip the console once the phase below is set. For an
+/// emulated instruction it also writes the result into the guest's registers
+/// in `frame`.
 #[unsafe(no_mangle)]
-extern "efiapi" fn vmexit_handler(frame: *const RegisterFrame) -> u64 {
+extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     // First, so every line below (and any panic) skips the firmware console.
     // Bring-up switches it back once it has left VMX operation.
     crate::output::set_phase(crate::output::Phase::VmExit);
 
     let number = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     // SAFETY: the entry stub passes a pointer to the frame it just pushed on
-    // the exit stack, which stays put until this returns.
-    let read = read_exit(number, unsafe { &*frame });
+    // the exit stack. It stays put until this returns and nothing else
+    // touches it meanwhile; the stub pops it into the guest's registers
+    // afterwards, so writes here reach the guest.
+    let frame = unsafe { &mut *frame };
+    let read = read_exit(number, frame);
     let (event, next) = judge(read.exit);
-    let action = apply(number, event, &read, next);
+    let action = apply(number, event, &read, next, frame);
     stub_return(action, number, read.raw_reason.unwrap_or(u32::from(UNREADABLE_REASON)))
 }
 
@@ -220,9 +231,9 @@ fn judge(exit: Option<ExitInfo>) -> (ExitEvent, ExitState) {
 /// Carries out `event` at exit `number`: prepares the guest to resume as
 /// its plan says, or stops it, and prints what happened. `next` is the
 /// state after the exit. Returns what the entry stub should do.
-fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState) -> ExitAction {
+fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut RegisterFrame) -> ExitAction {
     let action = match event.action() {
-        ExitAction::Resume(plan) => match prepare_resume(number, read.rip, read.length, plan, read.protected) {
+        ExitAction::Resume(plan) => match prepare_resume(number, read.rip, read.length, plan, read.protected, frame) {
             Some(resumed) => {
                 report_event(number, event, read.exit, next, Some(resumed));
                 ExitAction::Resume(plan)
@@ -245,6 +256,43 @@ fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState) -> Exi
     action
 }
 
+/// What an emulated instruction did, for the report.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum EmulationOutcome {
+    /// CPUID `leaf`/`subleaf`: what the processor returned (`raw`) and what
+    /// the guest got after `cpuid_policy` (`guest`).
+    Cpuid {
+        leaf: u32,
+        subleaf: u32,
+        raw: CpuidResult,
+        guest: CpuidResult,
+    },
+}
+
+/// Executes `emulation` in root operation and writes its result into the
+/// guest's registers in `frame`.
+fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome {
+    match emulation {
+        Emulation::Cpuid { leaf, subleaf } => {
+            // In root operation CPUID returns the processor's values (under
+            // Hyper-V: what Hyper-V shows Aleph0).
+            let raw = __cpuid_count(leaf, subleaf);
+            let guest = cpuid_policy(leaf, raw);
+            // CPUID writes 32-bit registers, which zero-extends them.
+            frame.rax = guest.eax.into();
+            frame.rbx = guest.ebx.into();
+            frame.rcx = guest.ecx.into();
+            frame.rdx = guest.edx.into();
+            EmulationOutcome::Cpuid {
+                leaf,
+                subleaf,
+                raw,
+                guest,
+            }
+        }
+    }
+}
+
 /// How the guest goes on after [`prepare_resume`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Resumed {
@@ -252,30 +300,38 @@ pub(super) struct Resumed {
     pub(super) rip: u64,
     /// The INVEPT type used, if the protected page was made writable.
     pub(super) invept: Option<InveptType>,
+    /// What the emulated instruction did, if the plan emulated one.
+    pub(super) emulated: Option<EmulationOutcome>,
 }
 
-/// Prepares the VMCS (and EPT) as `plan` says: moves GUEST_RIP past the
-/// exiting instruction, queues an NMI for injection at the next VM entry,
-/// turns NMI-window exiting on or off, and makes `protected` writable.
-/// Returns how the guest resumes, or `None` after printing why it cannot.
+/// Prepares the VMCS (and EPT) as `plan` says: executes the emulated
+/// instruction into `frame`, moves GUEST_RIP past the exiting instruction,
+/// queues an NMI for injection at the next VM entry, turns NMI-window
+/// exiting on or off, and makes `protected` writable. Returns how the guest
+/// resumes, or `None` after printing why it cannot.
 fn prepare_resume(
     number: u64,
     rip: Option<u64>,
     length: Option<u64>,
     plan: ResumePlan,
     protected: Option<ProtectedPage>,
+    frame: &mut RegisterFrame,
 ) -> Option<Resumed> {
     let ResumePlan {
         advance_rip,
         inject_nmi,
         nmi_window,
         grant_write,
+        emulate,
     } = plan;
     let tag = crate::TAG;
     let Some(rip) = rip else {
         crate::serial_println!("{tag} VM exit #{number}: guest RIP unreadable; not resuming.");
         return None;
     };
+    // Before RIP moves: the guest resumes past the instruction with its
+    // result already in its registers.
+    let emulated = emulate.map(|emulation| execute(emulation, frame));
 
     let resume_rip = if advance_rip {
         let Some(length) = length else {
@@ -341,6 +397,7 @@ fn prepare_resume(
     Some(Resumed {
         rip: resume_rip,
         invept,
+        emulated,
     })
 }
 
