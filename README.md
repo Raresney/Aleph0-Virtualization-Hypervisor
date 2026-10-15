@@ -93,7 +93,7 @@ diagnostics that run before VMXON.
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
 | `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge and apply (`handler.rs`); its report lines (`report.rs`) |
-| `src/vmx/exit_decision.rs` | The pure decision for each exit (the EPT write, VMCALLs, NMI reinjection), and the types of the exit fields it reads |
+| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the test guest's own exits (EPT write, VMCALLs, NMI reinjection) are in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |

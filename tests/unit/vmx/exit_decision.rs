@@ -1,10 +1,13 @@
-//! Unit tests for `src/vmx/exit_decision.rs`.
+//! Unit tests for `src/vmx/exit_decision/mod.rs`: the shared types, the
+//! dispatch, and through `decide` the handlers in `scenario.rs`.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
 //! private items.
 
+use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
+use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 
 const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;

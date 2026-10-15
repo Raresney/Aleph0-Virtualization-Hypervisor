@@ -1,28 +1,25 @@
-//! What the VM-exit handler does with each exit: a pure state machine.
+//! What the VM-exit handler does with each exit: pure decisions, one
+//! handler per exit reason.
 //!
 //! The handler reads the exit's VMCS fields into an [`ExitInfo`], calls
 //! [`decide`] with the [`ExitState`] kept between exits, and applies the
 //! [`ExitAction`] of the returned [`ExitEvent`]. Nothing here touches the
 //! CPU, so every case is a host unit test.
 //!
-//! The guest (`guest.rs`) writes its read-only data page, makes two main
-//! VMCALLs, with `GUEST_MARKER` and then `GUEST_MARKER + 1` in RAX, and
-//! waits between them for an NMI:
+//! [`decide`] first checks what holds for every exit (a failed VM entry, an
+//! interrupted event delivery), then dispatches on the exit reason to a
+//! handler with the signature `fn(ExitState, &ExitInfo) -> (ExitEvent,
+//! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
+//! `match`, which the compiler checks and turns into the same jump table:
 //!
-//! ```text
-//! EPT violation  ──▶ a write to the protected data page: make it writable,
-//!                    resume at the same RIP so the write is retried
-//! main VMCALL #1 ──▶ resume past it (only after the EPT violation, and only
-//!                    if ECX/EDX hold the data page's seed and new value)
-//! NMI exit       ──▶ guest can take the NMI:  inject it at the next entry
-//!                    guest cannot yet (STI, MOV SS or NMI blocking):
-//!                                             turn on NMI-window exiting,
-//! NMI-window exit──▶                          inject when the window opens
-//! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
-//! main VMCALL #2 ──▶ finished
-//! ```
+//! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
+//!   NMI reinjection).
+//!
+//! An exit reason without a handler stops the guest.
 
-use super::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
+mod scenario;
+
+pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +159,6 @@ impl EptQualification {
     }
 }
 
-/// How many main VMCALLs the guest makes; the last one ends the run.
-pub const PLANNED_MAIN_VMCALLS: u32 = 2;
-
 /// IDT vector of NMI.
 pub const NMI_VECTOR: u8 = 2;
 
@@ -208,23 +202,6 @@ impl InterruptionInfo {
         self.is_valid().then_some(self.0 as u8)
     }
 }
-
-/// Guest interruptibility bit 0: blocking by STI. The Intel SDM (Vol. 3C,
-/// checks on guest non-register state) says: "A processor may require bit 0
-/// (blocking by STI) to be 0 if the valid bit is 1 and the interruption type
-/// is NMI." So an NMI is injected only when this bit is clear too.
-const BLOCKING_BY_STI: u32 = 1 << 0;
-/// Guest interruptibility bit 1: blocking by MOV SS. VM entry refuses to
-/// inject an NMI while it is set.
-const BLOCKING_BY_MOV_SS: u32 = 1 << 1;
-/// Guest interruptibility bit 3: blocking by NMI. With virtual NMIs this is
-/// an injected NMI the guest has not ended with IRET yet; VM entry refuses
-/// to inject another while it is set.
-const BLOCKING_BY_NMI: u32 = 1 << 3;
-/// Any of the blocking bits that may stop an NMI injection. The handler
-/// injects only when none is set, and otherwise waits for the NMI window
-/// instead of injecting blindly.
-const NMI_INJECTION_BLOCKED: u32 = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
 
 /// What the handler read about the current exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,27 +353,11 @@ impl ExitEvent {
     }
 }
 
-/// Whether, at main VMCALL #1, ECX holds the seed the guest read from its
-/// data page and EDX the value it wrote and read back. Compared as 32-bit
-/// values: the guest loads both with 32-bit moves.
-fn data_page_read_back(exit: &ExitInfo) -> bool {
-    exit.guest_rcx as u32 == GUEST_DATA_SEED && exit.guest_rdx as u32 == GUEST_EPT_VALUE
-}
-
-/// The guest's RAX at its next main VMCALL: the marker, plus one for each
-/// main VMCALL already handled (the guest runs `inc eax` before #2).
-pub fn expected_main_rax(state: ExitState) -> u64 {
-    u64::from(GUEST_MARKER) + u64::from(state.main_vmcalls)
-}
-
 /// Decides what `exit` is, given what happened before (`state`), and
 /// returns the event with the state for the next exit.
 ///
-/// A VM-entry failure or an interrupted delivery is never handled. Several
-/// NMIs never queue: a new NMI while one is pending replaces it, as on real
-/// hardware, where at most one NMI waits. Exactly one EPT violation is
-/// handled, a write to the protected page, and it must come before the
-/// first main VMCALL, which must show the data page read back as planned.
+/// A VM-entry failure or an interrupted delivery is never handled, whatever
+/// the reason. Every other exit goes to the handler for its reason.
 pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
@@ -404,78 +365,15 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.idt_vectoring_valid {
         return (ExitEvent::InterruptedDelivery, state);
     }
-
-    let injected = ExitState {
-        nmi_pending: false,
-        nmis_injected: state.nmis_injected + 1,
-        ..state
-    };
     match exit.reason.basic {
-        EXIT_REASON_EXCEPTION_OR_NMI if exit.interruption_info.is_nmi() => {
-            if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
-                (ExitEvent::NmiInjected, injected)
-            } else {
-                (
-                    ExitEvent::NmiDeferred,
-                    ExitState {
-                        nmi_pending: true,
-                        ..state
-                    },
-                )
-            }
-        }
-        // Per the SDM, NMI-window exits never occur under MOV SS blocking, but
-        // the processor may still report one under STI blocking. Injecting
-        // then would fail the VM entry, so keep waiting. (MOV SS stays in the
-        // mask; it is harmless.)
-        EXIT_REASON_NMI_WINDOW if state.nmi_pending && exit.interruptibility & NMI_INJECTION_BLOCKED != 0 => {
-            (ExitEvent::NmiDeferred, state)
-        }
-        EXIT_REASON_NMI_WINDOW if state.nmi_pending => (ExitEvent::NmiWindowInjected, injected),
-        EXIT_REASON_EPT_VIOLATION
-            if exit.protected_page != 0
-                && exit.guest_physical & !0xFFF == exit.protected_page
-                && exit.exit_qualification.is_protected_write()
-                && state.ept_writes_granted == 0 =>
-        {
-            (
-                ExitEvent::EptWriteGranted,
-                ExitState {
-                    ept_writes_granted: 1,
-                    ..state
-                },
-            )
-        }
-        EXIT_REASON_VMCALL if exit.guest_rax == u64::from(GUEST_NMI_MARKER) => (
-            ExitEvent::GuestNmiHandler,
-            ExitState {
-                nmis_handled: state.nmis_handled + 1,
-                ..state
-            },
-        ),
-        EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) && state.ept_writes_granted == 0 => {
-            (ExitEvent::EptWriteMissing, state)
-        }
-        EXIT_REASON_VMCALL
-            if exit.guest_rax == expected_main_rax(state) && state.main_vmcalls == 0 && !data_page_read_back(&exit) =>
-        {
-            (ExitEvent::DataPageMismatch, state)
-        }
-        EXIT_REASON_VMCALL if exit.guest_rax == expected_main_rax(state) => {
-            let state = ExitState {
-                main_vmcalls: state.main_vmcalls + 1,
-                ..state
-            };
-            if state.main_vmcalls < PLANNED_MAIN_VMCALLS {
-                (ExitEvent::MainVmcall, state)
-            } else {
-                (ExitEvent::LastMainVmcall, state)
-            }
-        }
+        EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
+        EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
+        EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),
+        EXIT_REASON_VMCALL => scenario::vmcall(state, &exit),
         _ => (ExitEvent::Unexpected, state),
     }
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/exit_decision.rs"]
+#[path = "../../../tests/unit/vmx/exit_decision.rs"]
 mod tests;
