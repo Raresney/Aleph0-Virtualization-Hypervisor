@@ -67,6 +67,11 @@ pub const GUEST_DATA_SEED: u32 = 0xDA7A;
 /// seeing it at main VMCALL #1 shows the retried write landed.
 pub const GUEST_EPT_VALUE: u32 = 0x0045_5054;
 
+/// The I/O port the guest reads and writes through Aleph0: the COM1 scratch
+/// register (base + 7), a byte with no effect on the UART, which
+/// `serial.rs` never uses.
+pub const GUEST_SCRATCH_PORT: u16 = crate::serial::COM1 + 7;
+
 core::arch::global_asm!(
     r#"
     .globl guest_code_start

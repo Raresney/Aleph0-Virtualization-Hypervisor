@@ -35,6 +35,14 @@ pub const PIN_BASED_VIRTUAL_NMIS: u32 = 1 << 5;
 /// Primary processor-based control bit 22: a VM exit (reason 8) as soon as
 /// the guest can take an NMI. Requires virtual NMIs.
 pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
+/// Primary processor-based control bit 25: IN/OUT exit only for ports whose
+/// bit is set in the I/O bitmaps ([`IO_BITMAP_A`], [`IO_BITMAP_B`]). While
+/// set, the CPU ignores bit 24 (unconditional I/O exiting).
+pub const CPU_BASED_USE_IO_BITMAPS: u32 = 1 << 25;
+/// Primary processor-based control bit 28: RDMSR/WRMSR exit only for MSRs
+/// whose bit is set in the MSR bitmap ([`MSR_BITMAP`]). Without it, every
+/// RDMSR and WRMSR exits.
+pub const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 /// Primary processor-based control bit 31: the CPU also uses the secondary
 /// controls ([`SECONDARY_VM_EXEC_CONTROL`]). Without it they all count as 0.
 pub const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
@@ -80,6 +88,12 @@ pub const SECONDARY_VM_EXEC_CONTROL: u32 = 0x401E;
 
 // ── Control fields (64-bit) ──────────────────────────────────────────────
 
+/// Physical addresses of the I/O bitmaps: A covers ports 0x0000–0x7FFF,
+/// B ports 0x8000–0xFFFF, one bit per port (64-bit).
+pub const IO_BITMAP_A: u32 = 0x2000;
+pub const IO_BITMAP_B: u32 = 0x2002;
+/// Physical address of the 4 KiB MSR bitmap (64-bit).
+pub const MSR_BITMAP: u32 = 0x2004;
 /// EPT pointer (EPTP): the physical address of the EPT PML4 table, with the
 /// memory type and page-walk length in its low bits (see `vmx::ept::Eptp`).
 pub const EPT_POINTER: u32 = 0x201A;

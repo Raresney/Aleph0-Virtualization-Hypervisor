@@ -4,6 +4,7 @@
 //! Nothing here changes CPU state or can fail.
 
 use crate::vmx;
+use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::msr::VmcsControlMsrs;
@@ -119,6 +120,17 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
         cr4 & vmx::cr::CR4_SMEP != 0,
         cr4 & vmx::cr::CR4_SMAP != 0,
     );
+}
+
+/// Prints where the exit bitmaps are and what they intercept.
+pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps) {
+    log!(
+        "Exit bitmaps allocated: MSR={:#018x} I/O A={:#018x} I/O B={:#018x}.",
+        bitmaps.msr_address(),
+        bitmaps.io_a_address(),
+        bitmaps.io_b_address(),
+    );
+    log!("Intercepted MSRs (read and write): {INTERCEPTED_MSRS:x?}; intercepted ports: {INTERCEPTED_PORTS:x?}.");
 }
 
 /// Prints the guest state that was written to the VMCS. If VM entry later
