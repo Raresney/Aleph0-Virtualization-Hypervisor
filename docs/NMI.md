@@ -218,6 +218,13 @@ with them; exit #2 is no longer necessarily the second VMCALL.
 
 What serial showed, with the code page at `0x7eb0c000`:
 
+> This log predates EPT and the emulated exits. Since then the guest first
+> causes nine emulated exits (CPUID, four MSR, four I/O; see
+> [EMULATED_EXITS.md](EMULATED_EXITS.md)) and one EPT violation, so in a
+> current run its VMCALLs and NMI exits are numbered ten higher (the first
+> main VMCALL is exit #11, the NMI exit #12). The guest RIPs and addresses
+> differ too.
+
 ```text
 VM exit #1: expected VMCALL (rax=0xa1e0); resuming the guest at rip=0x000000007eb0c00a.
 VM exit #2: reason=0 (exception or NMI)

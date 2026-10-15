@@ -260,9 +260,11 @@ Then `main` returns the status, and the firmware's boot manager takes over.
 
 The tail of `run\serial.log` from the clean-stop step, before NMI exiting was added, with what each part shows. Its addresses and the exit #2 RIP match that older guest, not the current one:
 
-> Since the emulated-exits step the guest first causes nine emulated exits
-> (CPUID, four MSR, four I/O; see [EMULATED_EXITS.md](EMULATED_EXITS.md)), so
-> in a current run these lines come with exit numbers nine higher.
+> This log predates EPT and the emulated exits. Since then the guest first
+> causes nine emulated exits (CPUID, four MSR, four I/O; see
+> [EMULATED_EXITS.md](EMULATED_EXITS.md)) and one EPT violation, so in a
+> current run its VMCALLs are exits #11 and #12: the numbers are ten higher.
+> The guest RIPs and addresses differ too.
 
 ```text
 VM exit #1: guest rip=0x000000007eb0f005 instruction length=3

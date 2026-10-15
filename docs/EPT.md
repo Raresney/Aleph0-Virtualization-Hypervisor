@@ -290,7 +290,8 @@ the guest runs, for example) will need it.
 
 > Since the emulated-exits step the guest first causes nine emulated exits
 > (CPUID, four MSR, four I/O; see [EMULATED_EXITS.md](EMULATED_EXITS.md)), so
-> in a current run these lines come with exit numbers nine higher.
+> in a current run these lines come with exit numbers nine higher. The guest
+> RIPs and addresses differ too.
 
 Plain run (`.\scripts\run-hyperv.ps1`), three exits:
 
