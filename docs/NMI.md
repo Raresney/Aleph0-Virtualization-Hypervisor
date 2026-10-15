@@ -11,7 +11,7 @@ guest runs:
 
 Code:
 - `src/vmx/guest.rs`: guest code, guest IDT;
-- `src/vmx/exit_decision.rs`: the pure decision `decide`;
+- `src/vmx/exit_decision/`: the pure decision `decide` (`mod.rs`), and the NMI, NMI-window and VMCALL handlers it dispatches to (`scenario.rs`);
 - `src/vmx/vmexit/`: the handler that applies it;
 - `src/vmx/vmcs/mod.rs` and `fields.rs`: the controls;
 - `scripts/run-hyperv.ps1 -InjectNmi`: the test.
@@ -173,7 +173,12 @@ on.
 ## 6. The decision on each exit
 
 `exit_decision::decide(state, exit)` is a pure function, and every row
-below is a host unit test:
+below is a host unit test. `decide` itself makes the two `any` decisions;
+it sends every other exit to the handler for its reason, and the NMI,
+NMI-window and VMCALL rows are the handlers in `exit_decision/scenario.rs`.
+The emulated instructions (CPUID, RDMSR, WRMSR, IN/OUT) have handlers of
+their own in `emulation.rs` and are not in this table
+([EMULATED_EXITS.md](EMULATED_EXITS.md)):
 
 | Exit | Condition | Event | Action |
 |---|---|---|---|
@@ -188,11 +193,16 @@ below is a host unit test:
 | VMCALL | `rax = 0xa1e1`, second main VMCALL | `LastMainVmcall` | stop: finished |
 | anything else | — | `Unexpected` | stop |
 
+Since the emulated-exits step the second main VMCALL also needs every
+emulated exit to have happened (`guest::EXPECTED_EMULATION`); otherwise the
+event is `EmulationMissing` and the guest stops.
+
 The state between exits counts:
 - main VMCALLs;
 - whether an NMI is pending;
 - NMIs injected;
-- NMIs handled by the guest (its handler's VMCALLs).
+- NMIs handled by the guest (its handler's VMCALLs);
+- emulated exits, per instruction.
 
 Main VMCALLs are counted on their own, because NMI exits now interleave
 with them; exit #2 is no longer necessarily the second VMCALL.
@@ -271,6 +281,6 @@ with `rcx = 0`: the loop ran out.
 | `PIN_BASED_NMI_EXITING`, `PIN_BASED_VIRTUAL_NMIS` | `vmcs/fields.rs` | pin bits 3 and 5 |
 | `CPU_BASED_NMI_WINDOW_EXITING` | `vmcs/fields.rs` | primary bit 22 |
 | `set_nmi_window_exiting` | `vmcs/mod.rs` | turns the NMI window on or off |
-| `InterruptionInfo::NMI` (`0x80000202`) | `exit_decision.rs` | `VM_ENTRY_INTERRUPTION_INFO` value |
-| `decide` | `exit_decision.rs` | the decision table of section 6 |
+| `InterruptionInfo::NMI` (`0x80000202`) | `exit_decision/mod.rs` | `VM_ENTRY_INTERRUPTION_INFO` value |
+| `decide` | `exit_decision/mod.rs` | the dispatch; the NMI, NMI-window and VMCALL rows of section 6 are the handlers in `scenario.rs` |
 | `-InjectNmi` | `scripts/run-hyperv.ps1` | one vCPU, `Debug-VM` NMI after VMCALL #1 |

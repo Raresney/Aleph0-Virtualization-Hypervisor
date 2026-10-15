@@ -12,7 +12,7 @@ How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 Code:
 - `src/vmx/ept.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
 - `src/vmx/guest.rs`: the data page and the guest code that writes it;
-- `src/vmx/exit_decision.rs`: which EPT violation is accepted;
+- `src/vmx/exit_decision/`: which EPT violation is accepted (`scenario.rs`, reached from `decide` in `mod.rs`);
 - `src/vmx/vmexit/`: the handler that reports and applies it;
 - `src/vmx/vmcs/mod.rs` and `fields.rs`: secondary controls, `EPT_POINTER`;
 - `src/bring_up/mod.rs`: where EPT is checked, built and enabled.
@@ -234,7 +234,8 @@ Bit 10 confirms directly what `check_mappings` checked: as far as the
 guest's own page tables go the page is writable, so EPT alone refused the
 write.
 
-`exit_decision::decide` accepts exactly one EPT violation, and only if all
+`exit_decision::decide` (through `scenario::ept_violation`) accepts exactly
+one EPT violation, and only if all
 of these hold:
 - the GPA's page is the protected page;
 - bits 1, 3, 7 and 8 are set and bit 4 is clear: a write to a readable,
@@ -286,6 +287,10 @@ EPT change, and changes not caused by a violation (protecting a page while
 the guest runs, for example) will need it.
 
 ## 8. The Hyper-V runs
+
+> Since the emulated-exits step the guest first causes nine emulated exits
+> (CPUID, four MSR, four I/O; see [EMULATED_EXITS.md](EMULATED_EXITS.md)), so
+> in a current run these lines come with exit numbers nine higher.
 
 Plain run (`.\scripts\run-hyperv.ps1`), three exits:
 
