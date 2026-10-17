@@ -103,6 +103,11 @@ diagnostics that run before VMXON.
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
 | `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation) |
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md): the checks every pull request must
+pass, the code conventions, and how to verify a change on Hyper-V.
+
 ## License
 
 Licensed under either of
