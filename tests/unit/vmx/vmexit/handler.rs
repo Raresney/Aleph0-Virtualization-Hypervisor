@@ -44,3 +44,16 @@ fn next_rip_past_the_top_of_the_address_space_is_refused() {
     assert_eq!(next_rip(u64::MAX - 14, 15), None);
     assert_eq!(next_rip(0xFFFF_FFFF_FFFF_FFFE, 3), None);
 }
+
+#[test]
+fn next_rip_may_reach_the_last_canonical_address_of_the_lower_half() {
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFC, 3), Some(0x0000_7FFF_FFFF_FFFF));
+}
+
+#[test]
+fn next_rip_past_the_lower_half_is_refused() {
+    // A 1-byte instruction at the last canonical byte of the lower half: the add does not overflow, but
+    // 0x0000_8000_0000_0000 is non-canonical.
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFF, 1), None);
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFF1, 15), None);
+}

@@ -17,7 +17,8 @@ use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_IO_INSTRUCTION,
     Emulation, EmulationCounts, EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
-    InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name, merge_in,
+    InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name, is_canonical_48,
+    merge_in,
 };
 use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
@@ -89,12 +90,14 @@ fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
 }
 
 /// The guest RIP after an instruction of `length` bytes, or `None` when that would wrap past the top of the
-/// address space.
+/// address space or land outside the canonical range.
 ///
 /// `rip` is the guest's: a guest kernel can map code in the last bytes of the address space, where the sum
-/// overflows (a panic in debug builds, a silent wrap in release). The caller stops the guest instead.
+/// overflows (a panic in debug builds, a silent wrap in release). An instruction ending at the last canonical
+/// byte of the lower half does not overflow, but gives `0x0000_8000_0000_0000`, and VM entry would then fail its
+/// guest-state checks on RIP. The caller stops the guest instead, in both cases.
 fn next_rip(rip: u64, length: u64) -> Option<u64> {
-    rip.checked_add(length)
+    rip.checked_add(length).filter(|&next| is_canonical_48(next))
 }
 
 /// VM-exit handler: prints the exit over serial, decides what it is
@@ -411,8 +414,8 @@ fn prepare_resume(
         return None;
     };
     // Checked before the emulation: with the length unreadable or the new RIP
-    // wrapping, a WRMSR or OUT would already have happened when the guest
-    // stops, and serial would never show it.
+    // wrapping or non-canonical, a WRMSR or OUT would already have happened
+    // when the guest stops, and serial would never show it.
     let advance_to = if advance_rip {
         let Some(length) = length else {
             crate::serial_println!("{tag} VM exit #{number}: instruction length unreadable; not resuming.");
@@ -420,7 +423,7 @@ fn prepare_resume(
         };
         let Some(next) = next_rip(rip, length) else {
             crate::serial_println!(
-                "{tag} VM exit #{number}: guest RIP would wrap past the top of the address space; not resuming."
+                "{tag} VM exit #{number}: next guest RIP would wrap or be non-canonical; not resuming."
             );
             return None;
         };

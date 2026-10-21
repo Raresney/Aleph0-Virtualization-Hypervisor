@@ -97,7 +97,7 @@ pub(super) fn cpuid(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
 /// Whether `value` is a canonical 48-bit address: bits 63:47 all equal.
 /// With 5-level paging (CR4.LA57) it would be bits 63:56; Aleph0's guest
 /// shares the host's CR4, which UEFI leaves without LA57.
-pub(super) fn is_canonical_48(value: u64) -> bool {
+pub fn is_canonical_48(value: u64) -> bool {
     ((value as i64) << 16 >> 16) as u64 == value
 }
 
