@@ -23,7 +23,7 @@
 mod emulation;
 mod scenario;
 
-pub use emulation::{Emulation, EmulationCounts, IoSize, cpuid_policy, merge_in};
+pub use emulation::{Emulation, EmulationCounts, IoSize, cpuid_policy, is_canonical_48, merge_in};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.

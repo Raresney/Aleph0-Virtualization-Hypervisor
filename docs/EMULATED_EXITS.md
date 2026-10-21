@@ -114,6 +114,13 @@ executed **before** RIP moves, so the guest never runs past it without its
 result. `VM_EXIT_INSTRUCTION_LEN` gives the length; Aleph0 does not decode
 the instruction.
 
+Where RIP will go is worked out before the instruction runs, with
+`next_rip`. RIP is the guest's: for an instruction at the very top of the
+address space `RIP + length` would wrap, and for one ending at the last
+canonical byte of the lower half it would be `0x0000_8000_0000_0000`, which
+VM entry refuses. In both cases the guest is stopped instead, before the
+instruction takes effect (the same as when the length cannot be read).
+
 The stub pushed the guest's registers into a `RegisterFrame` on the exit
 stack, and `execute` takes it as `&mut RegisterFrame`. After the handler
 returns 0 the stub pops that frame into the CPU, so what `execute` wrote
@@ -298,7 +305,7 @@ the host, where nothing can handle it (the host IDT is the firmware's). So
 guest's #GP instead of executing:
 
 ```rust
-pub(super) fn is_canonical_48(value: u64) -> bool {
+pub fn is_canonical_48(value: u64) -> bool {
     ((value as i64) << 16 >> 16) as u64 == value
 }
 ```

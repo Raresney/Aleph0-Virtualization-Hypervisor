@@ -27,3 +27,33 @@ fn unexpected_stops_with_the_exit_and_its_reason() {
         vmcs::encode_unexpected(1, 10)
     );
 }
+
+#[test]
+fn next_rip_adds_the_instruction_length() {
+    assert_eq!(next_rip(0x1000, 3), Some(0x1003));
+}
+
+#[test]
+fn next_rip_may_reach_the_last_address() {
+    // A 15-byte instruction at ...FFF0 ends at ...FFFE; the next RIP is then the last representable address.
+    assert_eq!(next_rip(u64::MAX - 15, 15), Some(u64::MAX));
+}
+
+#[test]
+fn next_rip_past_the_top_of_the_address_space_is_refused() {
+    assert_eq!(next_rip(u64::MAX - 14, 15), None);
+    assert_eq!(next_rip(0xFFFF_FFFF_FFFF_FFFE, 3), None);
+}
+
+#[test]
+fn next_rip_may_reach_the_last_canonical_address_of_the_lower_half() {
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFC, 3), Some(0x0000_7FFF_FFFF_FFFF));
+}
+
+#[test]
+fn next_rip_past_the_lower_half_is_refused() {
+    // A 1-byte instruction at the last canonical byte of the lower half: the add does not overflow, but
+    // 0x0000_8000_0000_0000 is non-canonical.
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFF, 1), None);
+    assert_eq!(next_rip(0x0000_7FFF_FFFF_FFF1, 15), None);
+}
