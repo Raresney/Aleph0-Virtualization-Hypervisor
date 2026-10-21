@@ -5,7 +5,6 @@ always causes a VM exit. Until Aleph0 handles such exits, no real guest code
 can run under it. This page explains how Aleph0 handles the exits every guest
 needs: it executes the instruction itself and hands the result back
 (**passthrough emulation**):
-
 - one handler per exit reason;
 - the flow of one emulated exit;
 - CPUID, and the one value Aleph0 changes;
@@ -16,7 +15,6 @@ needs: it executes the instruction itself and hands the result back
 - what is not covered yet.
 
 Code:
-
 - `src/vmx/exit_decision/mod.rs`: `decide`, the dispatch on the exit reason, and the shared exit types;
 - `src/vmx/exit_decision/emulation.rs`: the handlers for CPUID, RDMSR, WRMSR and IN/OUT, and `cpuid_policy`;
 - `src/vmx/exit_decision/scenario.rs`: the test guest's own exits (EPT write, VMCALLs, NMI);
@@ -69,7 +67,6 @@ of handled reasons is readable in one place. A reason without a handler lands
 in the `_` arm, which is `Unexpected` and stops the guest.
 
 The handlers live in two files:
-
 - `emulation.rs`: instructions Aleph0 executes for **any** guest (CPUID,
   RDMSR, WRMSR, IN, OUT). It stays when an OS guest comes.
 - `scenario.rs`: the test guest's own exits (its write to the protected data
@@ -128,14 +125,14 @@ stack, and `execute` takes it as `&mut RegisterFrame`. After the handler
 returns 0 the stub pops that frame into the CPU, so what `execute` wrote
 reaches the guest. The register rules are the instructions' own:
 
-| Instruction      | Result             | What `execute` writes                                               |
-| ---------------- | ------------------ | ------------------------------------------------------------------- |
-| CPUID            | EAX, EBX, ECX, EDX | each as a 32-bit write, which zero-extends into the 64-bit register |
-| RDMSR            | EDX:EAX            | `rax = value & 0xFFFF_FFFF`, `rdx = value >> 32`                    |
-| WRMSR            | —                  | no register                                                         |
-| IN, 8 or 16 bits | AL or AX           | only those bits; the rest of RAX stays                              |
-| IN, 32 bits      | EAX                | zero-extends into RAX                                               |
-| OUT              | —                  | no register                                                         |
+| Instruction | Result | What `execute` writes |
+|---|---|---|
+| CPUID | EAX, EBX, ECX, EDX | each as a 32-bit write, which zero-extends into the 64-bit register |
+| RDMSR | EDX:EAX | `rax = value & 0xFFFF_FFFF`, `rdx = value >> 32` |
+| WRMSR | — | no register |
+| IN, 8 or 16 bits | AL or AX | only those bits; the rest of RAX stays |
+| IN, 32 bits | EAX | zero-extends into RAX |
+| OUT | — | no register |
 
 The IN rule is `merge_in`:
 
@@ -149,7 +146,6 @@ pub fn merge_in(rax: u64, size: IoSize, value: u32) -> u64 {
 ```
 
 For `rax = 0x1122_3344_5566_7788`:
-
 - `in al, dx` reading `0xA5` gives `0x1122_3344_5566_77A5`;
 - `in ax, dx` reading `0xBEEF` gives `0x1122_3344_5566_BEEF`;
 - `in eax, dx` reading `0x1234_5678` gives `0x0000_0000_1234_5678`.
@@ -192,7 +188,6 @@ emulate VMX. The report line prints both values, so the effect is visible:
 `ecx=` is what the guest got, `processor ecx=` what the CPU returned.
 
 What passes through, and must be decided before an OS guest:
-
 - **ECX bit 31 (hypervisor present) and the leaves from 0x40000000.** Under
   nested Hyper-V they describe Hyper-V. A Windows guest that sees them would
   use Hyper-V's interface, and its hypercalls are VMCALLs, which exit to
@@ -204,7 +199,6 @@ What passes through, and must be decided before an OS guest:
 ## 4. The MSR bitmap
 
 RDMSR and WRMSR cause a VM exit depending on one primary control:
-
 - without "use MSR bitmaps" (bit 28), **every** RDMSR and WRMSR exits;
 - with it, they exit only for MSRs whose bit is set in the MSR bitmap, and
   always for MSRs outside the two ranges the bitmap covers.
@@ -249,13 +243,13 @@ bit 2 for writes. `None` means the MSR is outside both ranges.
 
 For an MSR whose bit is clear, the guest's own RDMSR/WRMSR runs in non-root
 operation, and the CPU uses the guest's value. That holds even for MSRs
-whose guest value is a VMCS field (IA32*GS_BASE, IA32_EFER, IA32_PAT,
-IA32_SYSENTER*\*): while the guest runs, the CPU holds the guest's value, so
+whose guest value is a VMCS field (IA32_GS_BASE, IA32_EFER, IA32_PAT,
+IA32_SYSENTER_*): while the guest runs, the CPU holds the guest's value, so
 the guest reads and writes its own.
 
 ### The trap: emulating an MSR the VMCS holds
 
-An _intercepted_ MSR is different. Aleph0 emulates it with a real
+An *intercepted* MSR is different. Aleph0 emulates it with a real
 RDMSR/WRMSR in root operation, which reaches the **host's** value, not the
 guest's. For IA32_GS_BASE, say, a VM exit loads `HOST_GS_BASE`, so an
 emulated RDMSR would give the guest the host's GS base, and an emulated
@@ -292,11 +286,11 @@ guest's.
 
 An RDMSR or WRMSR exit takes one of three routes, chosen by `route`:
 
-| MSR                                       | Route                                                   | Event                    |
-| ----------------------------------------- | ------------------------------------------------------- | ------------------------ |
-| in `INTERCEPTED_MSRS`                     | emulate with the real RDMSR/WRMSR                       | `Emulated`               |
-| outside both ranges (`msr_bit` is `None`) | inject #GP(0) into the guest                            | `GuestGeneralProtection` |
-| in range, bit clear                       | it should never have exited: the bitmap is broken; stop | `Unexpected`             |
+| MSR | Route | Event |
+|---|---|---|
+| in `INTERCEPTED_MSRS` | emulate with the real RDMSR/WRMSR | `Emulated` |
+| outside both ranges (`msr_bit` is `None`) | inject #GP(0) into the guest | `GuestGeneralProtection` |
+| in range, bit clear | it should never have exited: the bitmap is broken; stop | `Unexpected` |
 
 The middle row is what hardware does for an MSR that does not exist.
 Aleph0 does not know whether such an MSR exists, and a real RDMSR/WRMSR of a
@@ -370,12 +364,11 @@ pub const fn io_bit(port: u16) -> (IoBitmap, usize, u8) {
 }
 ```
 
-The bit of port _p_ is bit `p % 8` of byte `(p & 0x7FFF) / 8` in its page.
+The bit of port *p* is bit `p % 8` of byte `(p & 0x7FFF) / 8` in its page.
 Aleph0 intercepts one port, `0x3FF`, the COM1 scratch register (base `0x3F8`
-
-- 7): a byte with no effect on the UART that `serial.rs` never uses. It is
-  bit 7 of byte `0x7F` in page A. `write_to_vmcs` writes the pages' addresses
-  to `IO_BITMAP_A` (`0x2000`) and `IO_BITMAP_B` (`0x2002`).
++ 7): a byte with no effect on the UART that `serial.rs` never uses. It is
+bit 7 of byte `0x7F` in page A. `write_to_vmcs` writes the pages' addresses
+to `IO_BITMAP_A` (`0x2000`) and `IO_BITMAP_B` (`0x2002`).
 
 ### The multi-port rule
 
@@ -479,27 +472,27 @@ guest_emulation_failed:
 
 The placeholders are the constants of `guest.rs`:
 
-| Placeholder           | Value                                                                      |
-| --------------------- | -------------------------------------------------------------------------- |
-| `kernel_gs_base`      | `IA32_KERNEL_GS_BASE`, `0xC0000102`                                        |
+| Placeholder | Value |
+|---|---|
+| `kernel_gs_base` | `IA32_KERNEL_GS_BASE`, `0xC0000102` |
 | `msr_low`, `msr_high` | the halves of `GUEST_MSR_VALUE`, `0x0000_7A1E_0000_0000`: `0` and `0x7A1E` |
-| `scratch_port`        | `GUEST_SCRATCH_PORT`, `0x3FF`                                              |
-| `io_value`            | `GUEST_IO_VALUE`, `0xA5`                                                   |
-| `fail_marker`         | `GUEST_EMULATION_FAIL_MARKER`, `0xFA11`                                    |
+| `scratch_port` | `GUEST_SCRATCH_PORT`, `0x3FF` |
+| `io_value` | `GUEST_IO_VALUE`, `0xA5` |
+| `fail_marker` | `GUEST_EMULATION_FAIL_MARKER`, `0xFA11` |
 
 The nine exits, in the order they happen:
 
-| #   | Instruction    | What it checks                            |
-| --- | -------------- | ----------------------------------------- |
-| 1   | `cpuid` leaf 1 | bit 5 of ECX is clear: VMX is hidden      |
-| 2   | `rdmsr`        | saves the original IA32_KERNEL_GS_BASE    |
-| 3   | `wrmsr`        | writes `GUEST_MSR_VALUE`                  |
-| 4   | `rdmsr`        | reads back `GUEST_MSR_VALUE`, both halves |
-| 5   | `wrmsr`        | writes the original back                  |
-| 6   | `in al, dx`    | saves the original scratch byte           |
-| 7   | `out dx, al`   | writes `GUEST_IO_VALUE`                   |
-| 8   | `in al, dx`    | reads back `GUEST_IO_VALUE`               |
-| 9   | `out dx, al`   | writes the original back                  |
+| # | Instruction | What it checks |
+|---|---|---|
+| 1 | `cpuid` leaf 1 | bit 5 of ECX is clear: VMX is hidden |
+| 2 | `rdmsr` | saves the original IA32_KERNEL_GS_BASE |
+| 3 | `wrmsr` | writes `GUEST_MSR_VALUE` |
+| 4 | `rdmsr` | reads back `GUEST_MSR_VALUE`, both halves |
+| 5 | `wrmsr` | writes the original back |
+| 6 | `in al, dx` | saves the original scratch byte |
+| 7 | `out dx, al` | writes `GUEST_IO_VALUE` |
+| 8 | `in al, dx` | reads back `GUEST_IO_VALUE` |
+| 9 | `out dx, al` | writes the original back |
 
 The guest's CPUID check only tests the VMX bit. The full CPUID result is
 visible on serial, but the guest does not check it. The MSR and port are real
@@ -701,19 +694,19 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 
 ## Cheat sheet
 
-| Item                                 | Value                                                                      |
-| ------------------------------------ | -------------------------------------------------------------------------- |
-| Primary control bit 28               | use MSR bitmaps                                                            |
-| Primary control bit 25               | use I/O bitmaps (bit 24 is then ignored)                                   |
-| `MSR_BITMAP`                         | `0x2004`                                                                   |
-| `IO_BITMAP_A` / `IO_BITMAP_B`        | `0x2000` / `0x2002`                                                        |
-| Exit reason 10 / 31 / 32 / 30        | CPUID / RDMSR / WRMSR / I/O instruction                                    |
-| MSR bitmap quarters                  | `0x000` read low, `0x400` read high, `0x800` write low, `0xC00` write high |
-| I/O bit of port _p_                  | bit `p % 8` of byte `(p & 0x7FFF) / 8`, page A below `0x8000`              |
-| Intercepted                          | `IA32_KERNEL_GS_BASE` (`0xC0000102`), port `0x3FF`                         |
-| I/O qualification                    | 2:0 size − 1, 3 IN, 4 string, 5 REP, 6 immediate, 31:16 port               |
-| CPUID policy                         | CPUID.1:ECX bit 5 (VMX) cleared                                            |
-| Injected #GP                         | `0x80000B0D`, error code 0, RIP unchanged                                  |
-| `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5`                                           |
-| `GUEST_EMULATION_FAIL_MARKER`        | `0xFA11` in EAX at the `ud2`                                               |
-| `EXPECTED_EMULATION`                 | cpuid 1, rdmsr 2, wrmsr 2, in 2, out 2                                     |
+| Item | Value |
+|---|---|
+| Primary control bit 28 | use MSR bitmaps |
+| Primary control bit 25 | use I/O bitmaps (bit 24 is then ignored) |
+| `MSR_BITMAP` | `0x2004` |
+| `IO_BITMAP_A` / `IO_BITMAP_B` | `0x2000` / `0x2002` |
+| Exit reason 10 / 31 / 32 / 30 | CPUID / RDMSR / WRMSR / I/O instruction |
+| MSR bitmap quarters | `0x000` read low, `0x400` read high, `0x800` write low, `0xC00` write high |
+| I/O bit of port *p* | bit `p % 8` of byte `(p & 0x7FFF) / 8`, page A below `0x8000` |
+| Intercepted | `IA32_KERNEL_GS_BASE` (`0xC0000102`), port `0x3FF` |
+| I/O qualification | 2:0 size − 1, 3 IN, 4 string, 5 REP, 6 immediate, 31:16 port |
+| CPUID policy | CPUID.1:ECX bit 5 (VMX) cleared |
+| Injected #GP | `0x80000B0D`, error code 0, RIP unchanged |
+| `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
+| `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
+| `EXPECTED_EMULATION` | cpuid 1, rdmsr 2, wrmsr 2, in 2, out 2 |
