@@ -314,3 +314,48 @@ fn io_with_an_unused_size_stops_the_guest() {
         ExitEvent::Unexpected
     );
 }
+
+/// Every MSR index the bitmap covers: the two ranges whose bits the CPU consults.
+fn bitmap_msr_indexes() -> impl Iterator<Item = u32> {
+    (0u32..=0x1FFF).chain(0xC000_0000..=0xC000_1FFF)
+}
+
+#[test]
+fn rdmsr_is_emulated_only_for_the_intercepted_msrs() {
+    for msr in bitmap_msr_indexes() {
+        let exit = ExitInfo {
+            guest_rcx: msr.into(),
+            ..exit(EXIT_REASON_RDMSR)
+        };
+        let (event, state) = rdmsr(ExitState::default(), &exit);
+        if INTERCEPTED_MSRS.contains(&msr) {
+            assert_eq!(event, ExitEvent::Emulated(Emulation::Rdmsr { msr }), "MSR {msr:#x}");
+        } else {
+            // In range with its bit clear: it should never have exited, so the bitmap is broken.
+            assert_eq!(event, ExitEvent::Unexpected, "MSR {msr:#x}");
+            assert_eq!(state, ExitState::default(), "MSR {msr:#x}");
+        }
+    }
+}
+
+#[test]
+fn wrmsr_is_emulated_only_for_the_intercepted_msrs() {
+    for msr in bitmap_msr_indexes() {
+        // RAX and RDX are zero, so the value is 0, which is canonical.
+        let exit = ExitInfo {
+            guest_rcx: msr.into(),
+            ..exit(EXIT_REASON_WRMSR)
+        };
+        let (event, state) = wrmsr(ExitState::default(), &exit);
+        if INTERCEPTED_MSRS.contains(&msr) {
+            assert_eq!(
+                event,
+                ExitEvent::Emulated(Emulation::Wrmsr { msr, value: 0 }),
+                "MSR {msr:#x}"
+            );
+        } else {
+            assert_eq!(event, ExitEvent::Unexpected, "MSR {msr:#x}");
+            assert_eq!(state, ExitState::default(), "MSR {msr:#x}");
+        }
+    }
+}
