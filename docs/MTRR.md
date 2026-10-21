@@ -180,7 +180,10 @@ the first 2 MiB has a PT because the fixed ranges give it three types, and
 - **Guest writes to the MTRRs.** The MSR bitmap does not intercept the MTRR
   MSRs, so a guest's WRMSR to them reaches the CPU, while the EPT types stay
   as they were at bring-up. An OS guest that reprograms its MTRRs needs
-  those writes intercepted, the EPT types rebuilt, and INVEPT.
+  those writes intercepted, the EPT types rebuilt, and INVEPT. The same
+  write also changes Aleph0's own memory types: the MTRRs still apply to
+  accesses in root operation, so a guest could make the hypervisor's memory
+  UC or WP. Intercepting the writes closes both.
 - **Several CPUs.** The MTRRs are read on the bootstrap processor only.
   Firmware programs every CPU the same way, so that holds until Aleph0 runs
   on several vCPUs and a guest can change one CPU's MTRRs.
