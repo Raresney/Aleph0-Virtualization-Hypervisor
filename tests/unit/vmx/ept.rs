@@ -278,6 +278,42 @@ fn a_mixed_region_maps_each_4k_page_with_its_own_type() {
 }
 
 #[test]
+fn pd_entries_read_back_how_they_map() {
+    assert_eq!(
+        EptEntry::<Pd>::large_page(0xC000_0000, UC).mapping(),
+        RegionMapping::LargePage(UC)
+    );
+    assert_eq!(
+        EptEntry::<Pd>::large_page(0, WB).mapping(),
+        RegionMapping::LargePage(WB)
+    );
+    assert_eq!(EptEntry::<Pd>::table(0x10_0000).mapping(), RegionMapping::Pt);
+    assert_eq!(EptEntry::<Pd>::EMPTY.mapping(), RegionMapping::Invalid);
+    // RWX, large page, type 2: reserved, an EPT misconfiguration.
+    assert_eq!(EptEntry::<Pd>::from_raw(0x97).mapping(), RegionMapping::Invalid);
+    assert_eq!(RegionMapping::LargePage(WB).to_string(), "2 MiB pages, WB");
+}
+
+#[test]
+fn region_runs_merge_pd_entries_that_map_alike() {
+    let ((_, _, pds, _), _) = filled(0x7eb1_d000);
+    let runs: Vec<_> = region_runs(&pds).map(|run| (run.start, run.end, run.mapping)).collect();
+    assert_eq!(
+        runs,
+        [
+            (0, 0x4000_0000, RegionMapping::LargePage(WB)),
+            (0x4000_0000, 0x4020_0000, RegionMapping::LargePage(UC)),
+            (0x4020_0000, 0x7EA0_0000, RegionMapping::LargePage(WB)),
+            // The protected page's region.
+            (0x7EA0_0000, 0x7EC0_0000, RegionMapping::Pt),
+            (0x7EC0_0000, 0x7FE0_0000, RegionMapping::LargePage(WB)),
+            // The region the 1 MiB UC hole splits.
+            (0x7FE0_0000, 2 * SIZE_1G, RegionMapping::Pt),
+        ]
+    );
+}
+
+#[test]
 fn only_published_invept_types_decode() {
     assert_eq!(decode_invept(0), None, "nothing published");
     assert_eq!(decode_invept(1), Some(InveptType::SingleContext));

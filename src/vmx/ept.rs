@@ -67,6 +67,8 @@ pub const EPT_RWX: u64 = EPT_READ | EPT_WRITE | EPT_EXECUTE;
 
 /// Leaf entries keep the memory type in bits 5:3.
 const MEMORY_TYPE_SHIFT: u32 = 3;
+/// The memory type field, once shifted down by [`MEMORY_TYPE_SHIFT`].
+const MEMORY_TYPE_BITS: u64 = 0b111;
 /// PD entry bit 7: maps a 2 MiB page instead of pointing to a PT.
 const LARGE_PAGE: u64 = 1 << 7;
 /// Bits 51:12: the physical address in an entry.
@@ -289,6 +291,68 @@ impl EptEntry<Pd> {
     pub fn large_page(address: u64, memory_type: MemoryType) -> Self {
         Self::from_raw((address & ADDRESS_MASK) | EPT_RWX | (memory_type.raw() << MEMORY_TYPE_SHIFT) | LARGE_PAGE)
     }
+
+    /// How the entry maps its 2 MiB region, read back from its bits.
+    pub fn mapping(self) -> RegionMapping {
+        if self.raw & EPT_RWX == 0 {
+            return RegionMapping::Invalid;
+        }
+        if self.raw & LARGE_PAGE == 0 {
+            return RegionMapping::Pt;
+        }
+        let memory_type = (self.raw >> MEMORY_TYPE_SHIFT) & MEMORY_TYPE_BITS;
+        MemoryType::from_raw(memory_type as u8).map_or(RegionMapping::Invalid, RegionMapping::LargePage)
+    }
+}
+
+/// How a PD entry maps its 2 MiB region: see [`EptEntry::mapping`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionMapping {
+    /// One 2 MiB page of this memory type.
+    LargePage(MemoryType),
+    /// A PT of 4 KiB pages, each with its own type and access.
+    Pt,
+    /// Neither: not present, or a 2 MiB page whose type bits hold a
+    /// reserved value. `Ept::build` makes no such entry.
+    Invalid,
+}
+
+impl fmt::Display for RegionMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LargePage(memory_type) => write!(f, "2 MiB pages, {}", memory_type.name()),
+            Self::Pt => f.write_str("4 KiB pages (a PT each)"),
+            Self::Invalid => f.write_str("invalid (not present or reserved type)"),
+        }
+    }
+}
+
+/// Consecutive 2 MiB regions the PDs map the same way: see
+/// [`Ept::region_runs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionRun {
+    pub start: u64,
+    pub end: u64,
+    pub mapping: RegionMapping,
+}
+
+/// The regions `pds` map, consecutive ones with the same
+/// [`mapping`](EptEntry::mapping) merged into one run. `pds` are back to
+/// back from GPA 0, as [`fill_identity_map`] fills them.
+fn region_runs(pds: &[EptEntry<Pd>]) -> impl Iterator<Item = RegionRun> + '_ {
+    let mut regions = pds.iter().map(|entry| entry.mapping()).enumerate().peekable();
+    core::iter::from_fn(move || {
+        let (first, mapping) = regions.next()?;
+        let mut last = first;
+        while let Some((next, _)) = regions.next_if(|&(_, next_mapping)| next_mapping == mapping) {
+            last = next;
+        }
+        Some(RegionRun {
+            start: first as u64 * SIZE_2M,
+            end: (last as u64 + 1) * SIZE_2M,
+            mapping,
+        })
+    })
 }
 
 impl EptEntry<Pt> {
@@ -465,6 +529,10 @@ fn fill_identity_map(tables: Tables<'_>, gibs: usize, mtrrs: &Mtrrs, protected_p
 pub struct Ept {
     eptp: Eptp,
     end: u64,
+    /// The PDs, kept to report how they map memory. Nothing writes them
+    /// after the build: the EPTP enables no accessed/dirty flags, and
+    /// [`ProtectedPage`] changes a PT entry only.
+    pds: &'static [EptEntry<Pd>],
     split_regions: usize,
     table_pages: usize,
 }
@@ -506,13 +574,17 @@ impl Ept {
             // the slice; an all-zero `EptEntry` is a valid (empty) entry.
             unsafe { core::slice::from_raw_parts_mut(address as *mut EptEntry<L>, pages * ENTRIES) }
         }
-        // SAFETY: each allocation above is page-aligned, zeroed and as long
-        // as its slice, and nothing else refers to it yet.
+        // SAFETY: the PD allocation is page-aligned, zeroed and `gibs` pages
+        // long, and nothing else refers to it yet. It is never freed, so the
+        // slice can live as long as the map.
+        let pd_entries: &'static mut [EptEntry<Pd>] = unsafe { table(pds, gibs) };
+        // SAFETY: each other allocation above is page-aligned, zeroed and as
+        // long as its slice, and nothing else refers to it yet.
         let tables = unsafe {
             Tables {
                 pml4: table(pml4, 1),
                 pdpt: table(pdpt, 1),
-                pds: table(pds, gibs),
+                pds: &mut *pd_entries,
                 pts: table(pts, split_regions),
                 pdpt_address: pdpt,
                 pds_address: pds,
@@ -524,6 +596,7 @@ impl Ept {
         let ept = Self {
             eptp: Eptp::new(pml4),
             end,
+            pds: pd_entries,
             split_regions,
             table_pages: 2 + gibs + split_regions,
         };
@@ -555,6 +628,12 @@ impl Ept {
     /// Pages holding the tables: PML4, PDPT, the PDs and the PTs.
     pub fn table_pages(&self) -> usize {
         self.table_pages
+    }
+
+    /// The map as its PD entries hold it: runs of 2 MiB regions mapped the
+    /// same way, from GPA 0 to [`end`](Self::end).
+    pub fn region_runs(&self) -> impl Iterator<Item = RegionRun> + '_ {
+        region_runs(self.pds)
     }
 }
 

@@ -230,7 +230,7 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the data page's address its GPA.
     let ept = unsafe { Ept::build(guest.data_page(), invept, &mtrrs) }?;
-    report::ept(&ept, &mtrrs, guest.data_page());
+    report::ept(&ept, guest.data_page());
 
     // Recorded before VMXON: once the guest runs, its VM exits clear IF, and
     // teardown turns interrupts back on only if firmware had them on.

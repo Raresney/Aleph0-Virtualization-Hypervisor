@@ -11,9 +11,6 @@ use crate::vmx::guest_state::GuestState;
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::mtrr::{MemoryType, Mtrrs};
 
-/// The size of an EPT large page, the unit the memory types are reported in.
-const SIZE_2M: u64 = 1 << 21;
-
 /// Prints the segmentation state that will go into the VMCS host fields.
 ///
 /// TR is the one to watch: VM entry rejects a host TR selector of 0.
@@ -127,8 +124,9 @@ pub(super) fn mtrrs(mtrrs: &Mtrrs) {
 }
 
 /// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made,
-/// and the memory type of each run of 2 MiB regions in it.
-pub(super) fn ept(ept: &vmx::ept::Ept, mtrrs: &Mtrrs, data_page: u64) {
+/// and how its PD entries map each run of 2 MiB regions: read back from the
+/// entries, so the lines show what the CPU walks.
+pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
     log!(
         "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
         ept.end(),
@@ -136,13 +134,8 @@ pub(super) fn ept(ept: &vmx::ept::Ept, mtrrs: &Mtrrs, data_page: u64) {
         ept.table_pages(),
         ept.split_regions(),
     );
-    for run in mtrrs.runs(ept.end(), SIZE_2M) {
-        log!(
-            "EPT memory type {:#014x}..{:#014x}: {}",
-            run.start,
-            run.end,
-            type_name(run.memory_type)
-        );
+    for run in ept.region_runs() {
+        log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
     }
 }
 

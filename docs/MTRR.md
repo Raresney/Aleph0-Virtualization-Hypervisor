@@ -160,17 +160,20 @@ MTRR fixed 0x00000..0xa0000: WB
 MTRR fixed 0xa0000..0xc0000: UC
 MTRR fixed 0xc0000..0x100000: WP
 EPT built: identity 0x0..0x100000000 (4 GiB), 8 table pages, 2 of them PTs for 2 MiB regions mapped in 4 KiB pages; data page 0x000000007eb01000 read-only (R=1 W=0 X=0).
-EPT memory type 0x000000000000..0x000000200000: mixed (4 KiB pages)
-EPT memory type 0x000000200000..0x000080000000: WB
-EPT memory type 0x000080000000..0x000100000000: UC
+EPT 0x000000000000..0x000000200000: 4 KiB pages (a PT each)
+EPT 0x000000200000..0x00007ea00000: 2 MiB pages, WB
+EPT 0x00007ea00000..0x00007ec00000: 4 KiB pages (a PT each)
+EPT 0x00007ec00000..0x000080000000: 2 MiB pages, WB
+EPT 0x000080000000..0x000100000000: 2 MiB pages, UC
 ```
 
 The lines above show the format on an example layout, not a Hyper-V run.
-The fixed-range lines show the first MiB in runs of one type. The
-`EPT memory type` lines show the MTRRs' type of each run of 2 MiB regions
-over the whole map; "mixed" regions are the ones mapped in 4 KiB pages. The
-data page's region has a PT of its own (counted in the first line) but is
-listed with its MTRR type.
+The fixed-range lines show the first MiB in runs of one type. The `EPT`
+lines are read back from the PD entries `Ept::build` filled, the ones the
+CPU walks, rather than worked out again from the MTRRs: runs of 2 MiB pages
+with the type in their entries, and runs of regions mapped through a PT. Here
+the first 2 MiB has a PT because the fixed ranges give it three types, and
+`0x7ea00000` is the data page's region.
 
 ## 7. What is not covered yet
 
