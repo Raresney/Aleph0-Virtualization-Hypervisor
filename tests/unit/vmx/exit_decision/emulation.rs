@@ -323,11 +323,7 @@ fn bitmap_msr_indexes() -> impl Iterator<Item = u32> {
 #[test]
 fn rdmsr_is_emulated_only_for_the_intercepted_msrs() {
     for msr in bitmap_msr_indexes() {
-        let exit = ExitInfo {
-            guest_rcx: msr.into(),
-            ..exit(EXIT_REASON_RDMSR)
-        };
-        let (event, state) = rdmsr(ExitState::default(), &exit);
+        let (event, state) = rdmsr(ExitState::default(), &msr_exit(EXIT_REASON_RDMSR, msr.into(), 0, 0));
         if INTERCEPTED_MSRS.contains(&msr) {
             assert_eq!(event, ExitEvent::Emulated(Emulation::Rdmsr { msr }), "MSR {msr:#x}");
         } else {
@@ -342,11 +338,7 @@ fn rdmsr_is_emulated_only_for_the_intercepted_msrs() {
 fn wrmsr_is_emulated_only_for_the_intercepted_msrs() {
     for msr in bitmap_msr_indexes() {
         // RAX and RDX are zero, so the value is 0, which is canonical.
-        let exit = ExitInfo {
-            guest_rcx: msr.into(),
-            ..exit(EXIT_REASON_WRMSR)
-        };
-        let (event, state) = wrmsr(ExitState::default(), &exit);
+        let (event, state) = wrmsr(ExitState::default(), &msr_exit(EXIT_REASON_WRMSR, msr.into(), 0, 0));
         if INTERCEPTED_MSRS.contains(&msr) {
             assert_eq!(
                 event,
