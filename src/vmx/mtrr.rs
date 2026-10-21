@@ -56,21 +56,45 @@ pub const MAX_VARIABLE_RANGES: usize = 32;
 /// Number of fixed-range MSRs.
 pub const FIXED_MSRS: usize = 11;
 
+// The fixed-range MSRs, each named after the first address it covers.
+/// 0x00000..0x80000 in eight 64 KiB ranges.
+pub const IA32_MTRR_FIX64K_00000: u32 = 0x250;
+/// 0x80000..0xA0000 in eight 16 KiB ranges.
+pub const IA32_MTRR_FIX16K_80000: u32 = 0x258;
+/// 0xA0000..0xC0000 in eight 16 KiB ranges.
+pub const IA32_MTRR_FIX16K_A0000: u32 = 0x259;
+/// 0xC0000..0xC8000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_C0000: u32 = 0x268;
+/// 0xC8000..0xD0000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_C8000: u32 = 0x269;
+/// 0xD0000..0xD8000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_D0000: u32 = 0x26A;
+/// 0xD8000..0xE0000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_D8000: u32 = 0x26B;
+/// 0xE0000..0xE8000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_E0000: u32 = 0x26C;
+/// 0xE8000..0xF0000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_E8000: u32 = 0x26D;
+/// 0xF0000..0xF8000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_F0000: u32 = 0x26E;
+/// 0xF8000..0x100000 in eight 4 KiB ranges.
+pub const IA32_MTRR_FIX4K_F8000: u32 = 0x26F;
+
 /// The fixed-range MSRs in address order: each one's address, the start of
 /// its first range and the size of each of its eight ranges. Byte n of the
 /// MSR is the type of range n.
 pub const FIXED_RANGES: [(u32, u64, u64); FIXED_MSRS] = [
-    (0x250, 0x0_0000, 0x1_0000), // IA32_MTRR_FIX64K_00000
-    (0x258, 0x8_0000, 0x4000),   // IA32_MTRR_FIX16K_80000
-    (0x259, 0xA_0000, 0x4000),   // IA32_MTRR_FIX16K_A0000
-    (0x268, 0xC_0000, 0x1000),   // IA32_MTRR_FIX4K_C0000
-    (0x269, 0xC_8000, 0x1000),   // IA32_MTRR_FIX4K_C8000
-    (0x26A, 0xD_0000, 0x1000),   // IA32_MTRR_FIX4K_D0000
-    (0x26B, 0xD_8000, 0x1000),   // IA32_MTRR_FIX4K_D8000
-    (0x26C, 0xE_0000, 0x1000),   // IA32_MTRR_FIX4K_E0000
-    (0x26D, 0xE_8000, 0x1000),   // IA32_MTRR_FIX4K_E8000
-    (0x26E, 0xF_0000, 0x1000),   // IA32_MTRR_FIX4K_F0000
-    (0x26F, 0xF_8000, 0x1000),   // IA32_MTRR_FIX4K_F8000
+    (IA32_MTRR_FIX64K_00000, 0x0_0000, 0x1_0000),
+    (IA32_MTRR_FIX16K_80000, 0x8_0000, 0x4000),
+    (IA32_MTRR_FIX16K_A0000, 0xA_0000, 0x4000),
+    (IA32_MTRR_FIX4K_C0000, 0xC_0000, 0x1000),
+    (IA32_MTRR_FIX4K_C8000, 0xC_8000, 0x1000),
+    (IA32_MTRR_FIX4K_D0000, 0xD_0000, 0x1000),
+    (IA32_MTRR_FIX4K_D8000, 0xD_8000, 0x1000),
+    (IA32_MTRR_FIX4K_E0000, 0xE_0000, 0x1000),
+    (IA32_MTRR_FIX4K_E8000, 0xE_8000, 0x1000),
+    (IA32_MTRR_FIX4K_F0000, 0xF_0000, 0x1000),
+    (IA32_MTRR_FIX4K_F8000, 0xF_8000, 0x1000),
 ];
 
 /// Where the fixed ranges end: they cover the first MiB.
@@ -78,8 +102,10 @@ pub const FIXED_END: u64 = 0x10_0000;
 
 /// A memory type, as the MTRRs, the PAT and EPT entries encode it. The
 /// values not listed (2, 3, 7 and up) are reserved: in an MTRR they are a
-/// firmware bug, in an EPT entry an EPT misconfiguration.
+/// firmware bug, in an EPT entry an EPT misconfiguration. `repr(u8)`: the
+/// discriminants are the hardware encodings, which [`raw`](Self::raw) returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MemoryType {
     /// UC: every access goes to memory or the device, in program order.
     /// Device registers (MMIO) need it.
@@ -291,25 +317,24 @@ impl Mtrrs {
 
     /// `[0, end)` cut into blocks of `size` bytes, with consecutive blocks of
     /// the same [`block_type`](Self::block_type) merged into one run. `end`
-    /// is a multiple of `size`.
+    /// is a multiple of `size`. Each block's type is looked up once.
     pub fn runs(&self, end: u64, size: u64) -> impl Iterator<Item = TypeRun> + '_ {
-        let mut start = 0;
+        debug_assert!(end.is_multiple_of(size));
+        let mut blocks = (0..end)
+            .step_by(size as usize)
+            .map(move |start| (start, self.block_type(start, size)))
+            .peekable();
         core::iter::from_fn(move || {
-            if start >= end {
-                return None;
-            }
-            let memory_type = self.block_type(start, size);
+            let (start, memory_type) = blocks.next()?;
             let mut run_end = start + size;
-            while run_end < end && self.block_type(run_end, size) == memory_type {
-                run_end += size;
+            while let Some((next, _)) = blocks.next_if(|&(_, next_type)| next_type == memory_type) {
+                run_end = next + size;
             }
-            let run = TypeRun {
+            Some(TypeRun {
                 start,
                 end: run_end,
                 memory_type,
-            };
-            start = run_end;
-            Some(run)
+            })
         })
     }
 }

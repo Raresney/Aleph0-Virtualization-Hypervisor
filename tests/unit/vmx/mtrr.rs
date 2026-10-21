@@ -7,9 +7,7 @@
 
 use super::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteCombining as WC, WriteThrough as WT};
 use super::*;
-
-const SIZE_2M: u64 = 1 << 21;
-const SIZE_1G: u64 = 1 << 30;
+use crate::vmx::ept::{SIZE_1G, SIZE_2M};
 
 /// IA32_MTRR_DEF_TYPE with the MTRRs enabled, fixed ranges off, and
 /// `default` as the default type.

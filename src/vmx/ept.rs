@@ -78,8 +78,10 @@ const EPTP_WALK_LENGTH_4: u64 = 3 << 3;
 
 /// Entries per table: 4096 bytes / 8 bytes per entry.
 const ENTRIES: usize = 512;
-const SIZE_2M: u64 = 1 << 21;
-const SIZE_1G: u64 = 1 << 30;
+/// What a PD entry maps: a 2 MiB page, or a PT of 512 4 KiB pages.
+pub const SIZE_2M: u64 = 1 << 21;
+/// What a PDPT entry maps: a PD of 512 2 MiB regions.
+pub const SIZE_1G: u64 = 1 << 30;
 /// How far one PDPT reaches (512 entries of 1 GiB). Aleph0 builds one PDPT,
 /// so the identity map ends here at most.
 pub const MAX_IDENTITY_MAP: u64 = ENTRIES as u64 * SIZE_1G;
@@ -465,10 +467,15 @@ struct Tables<'a> {
 /// type, so a 2 MiB page over pages of mixed types would give some of them
 /// the wrong one.
 fn large_page_type(mtrrs: &Mtrrs, region: u64, protected_page: u64) -> Option<MemoryType> {
-    if region == protected_page & !(SIZE_2M - 1) {
+    if region == region_of(protected_page) {
         return None;
     }
     mtrrs.block_type(region, SIZE_2M)
+}
+
+/// The start of the 2 MiB region holding `address`.
+fn region_of(address: u64) -> u64 {
+    address & !(SIZE_2M - 1)
 }
 
 /// How many 2 MiB regions of the first `gibs` GiB need a PT
@@ -500,7 +507,9 @@ fn fill_identity_map(tables: Tables<'_>, gibs: usize, mtrrs: &Mtrrs, protected_p
     // The PDs are back to back, one per PDPT entry, so PD entry number `i`
     // across all of them maps GPA i * 2 MiB. No PML4 index: the map ends at
     // 512 GiB at most, so every address in it uses PML4 entry 0.
-    let mut pts = tables.pts.as_chunks_mut::<ENTRIES>().0.iter_mut().enumerate();
+    let (pts, rest) = tables.pts.as_chunks_mut::<ENTRIES>();
+    debug_assert!(rest.is_empty(), "the PTs are whole tables");
+    let mut pts = pts.iter_mut().enumerate();
     let mut protected = None;
     for (i, entry) in tables.pds.iter_mut().enumerate() {
         let region = i as u64 * SIZE_2M;
@@ -514,7 +523,7 @@ fn fill_identity_map(tables: Tables<'_>, gibs: usize, mtrrs: &Mtrrs, protected_p
             let address = region + (j * PAGE_SIZE) as u64;
             *page = EptEntry::page(address, EPT_RWX, mtrrs.memory_type(address));
         }
-        if region == protected_page & !(SIZE_2M - 1) {
+        if region == region_of(protected_page) {
             let index = Pt::index(protected_page);
             pt[index] = pt[index].with_access(EPT_READ);
             protected = Some(number * ENTRIES + index);
