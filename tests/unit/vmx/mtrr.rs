@@ -2,7 +2,8 @@
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
-//! private items.
+//! private items. The helpers that build MSR values are `pub(crate)`, for
+//! the EPT tests.
 
 use super::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteCombining as WC, WriteThrough as WT};
 use super::*;
@@ -12,13 +13,19 @@ const SIZE_1G: u64 = 1 << 30;
 
 /// IA32_MTRR_DEF_TYPE with the MTRRs enabled, fixed ranges off, and
 /// `default` as the default type.
-fn enabled(default: MemoryType) -> u64 {
+pub(crate) fn enabled(default: MemoryType) -> u64 {
     DEF_TYPE_ENABLE | default.raw()
+}
+
+/// IA32_MTRR_DEF_TYPE with the MTRRs and the fixed ranges enabled, and
+/// `default` as the default type.
+pub(crate) fn enabled_with_fixed(default: MemoryType) -> u64 {
+    enabled(default) | DEF_TYPE_FIXED_ENABLE
 }
 
 /// The PHYSBASE/PHYSMASK pair of a valid range of `size` bytes (a power of
 /// two) at `base`, on a CPU with 39 physical-address bits.
-fn range(base: u64, size: u64, memory_type: MemoryType) -> (u64, u64) {
+pub(crate) fn range(base: u64, size: u64, memory_type: MemoryType) -> (u64, u64) {
     let mask = ((1 << 39) - 1) & !(size - 1);
     (base | memory_type.raw(), mask | PHYSMASK_VALID)
 }
@@ -43,7 +50,7 @@ fn fixed_all(memory_type: MemoryType) -> u64 {
 
 /// The usual first MiB: RAM (WB) up to 0xA0000, the legacy VGA window
 /// 0xA0000..0xC0000 UC, then the option ROMs and BIOS 0xC0000..0x100000 WP.
-fn pc_fixed() -> [u64; FIXED_MSRS] {
+pub(crate) fn pc_fixed() -> [u64; FIXED_MSRS] {
     let mut fixed = [fixed_all(MemoryType::WriteProtected); FIXED_MSRS];
     fixed[0] = fixed_all(WB);
     fixed[1] = fixed_all(WB);
@@ -166,6 +173,21 @@ fn an_undefined_overlap_is_uncacheable() {
 }
 
 #[test]
+fn three_overlapping_ranges_combine_the_same_in_any_order() {
+    for ([a, b, c], expected) in [
+        ([WT, WB, WB], WT),
+        ([WB, WT, UC], UC),
+        ([WC, WC, WB], UC),
+        ([WB, WB, WB], WB),
+    ] {
+        for order in [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]] {
+            let variable = order.map(|memory_type| range(0, SIZE_2M, memory_type));
+            assert_eq!(mtrrs(WB, &variable).memory_type(0x1000), expected, "{order:?}");
+        }
+    }
+}
+
+#[test]
 fn identical_overlapping_types_stay() {
     let mtrrs = mtrrs(UC, &[range(0, SIZE_1G, WC), range(0, SIZE_2M, WC)]);
     assert_eq!(mtrrs.memory_type(0x1000), WC);
@@ -173,12 +195,7 @@ fn identical_overlapping_types_stay() {
 
 #[test]
 fn the_fixed_ranges_decide_the_first_mib() {
-    let mtrrs = Mtrrs::decode(
-        enabled(UC) | DEF_TYPE_FIXED_ENABLE,
-        Some(pc_fixed()),
-        &[range(0, SIZE_1G, WB)],
-    )
-    .unwrap();
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &[range(0, SIZE_1G, WB)]).unwrap();
     assert!(as_enabled(&mtrrs).fixed_enabled());
     // The variable range covers all of these too; the fixed ranges win.
     assert_eq!(mtrrs.memory_type(0x9_F000), WB);
@@ -194,12 +211,7 @@ fn the_fixed_ranges_decide_the_first_mib() {
 fn each_fixed_range_reads_its_own_byte() {
     // Byte n of each MSR holds type 6 for n even, 0 for n odd.
     let alternating = u64::from_le_bytes([6, 0, 6, 0, 6, 0, 6, 0]);
-    let mtrrs = Mtrrs::decode(
-        enabled(UC) | DEF_TYPE_FIXED_ENABLE,
-        Some([alternating; FIXED_MSRS]),
-        &[],
-    )
-    .unwrap();
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some([alternating; FIXED_MSRS]), &[]).unwrap();
     for (msr, start, size) in FIXED_RANGES {
         for n in 0..8 {
             let expected = if n % 2 == 0 { WB } else { UC };
@@ -220,7 +232,7 @@ fn fixed_ranges_are_ignored_while_disabled_or_missing() {
     assert!(!as_enabled(&disabled).fixed_enabled());
     assert_eq!(disabled.memory_type(0xA_0000), WB);
 
-    let missing = Mtrrs::decode(enabled(WB) | DEF_TYPE_FIXED_ENABLE, None, &[]).unwrap();
+    let missing = Mtrrs::decode(enabled_with_fixed(WB), None, &[]).unwrap();
     assert!(!as_enabled(&missing).fixed_enabled());
     assert_eq!(missing.memory_type(0xA_0000), WB);
 }
@@ -238,7 +250,7 @@ fn a_reserved_type_in_use_is_refused_with_its_msr() {
     let mut fixed = [fixed_all(WB); FIXED_MSRS];
     fixed[4] = u64::from_le_bytes([6, 6, 6, 7, 6, 6, 6, 6]);
     assert_eq!(
-        Mtrrs::decode(enabled(WB) | DEF_TYPE_FIXED_ENABLE, Some(fixed), &[]),
+        Mtrrs::decode(enabled_with_fixed(WB), Some(fixed), &[]),
         Err(MtrrError::ReservedType { msr: 0x269, value: 7 })
     );
 
@@ -306,26 +318,21 @@ fn a_partial_range_of_the_same_type_leaves_a_block_uniform() {
 
 #[test]
 fn the_first_block_is_mixed_when_the_fixed_ranges_differ() {
-    let mtrrs = Mtrrs::decode(enabled(WB) | DEF_TYPE_FIXED_ENABLE, Some(pc_fixed()), &[]).unwrap();
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(WB), Some(pc_fixed()), &[]).unwrap();
     assert_eq!(mtrrs.block_type(0, SIZE_2M), None);
     assert_eq!(mtrrs.block_type(SIZE_2M, SIZE_2M), Some(WB));
 }
 
 #[test]
 fn the_first_block_is_uniform_when_the_fixed_ranges_agree() {
-    let mtrrs = Mtrrs::decode(
-        enabled(WB) | DEF_TYPE_FIXED_ENABLE,
-        Some([fixed_all(WB); FIXED_MSRS]),
-        &[],
-    )
-    .unwrap();
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(WB), Some([fixed_all(WB); FIXED_MSRS]), &[]).unwrap();
     assert_eq!(mtrrs.block_type(0, SIZE_2M), Some(WB));
 }
 
 #[test]
 fn runs_merge_blocks_of_the_same_type() {
     let mtrrs = Mtrrs::decode(
-        enabled(UC) | DEF_TYPE_FIXED_ENABLE,
+        enabled_with_fixed(UC),
         Some(pc_fixed()),
         &[range(0, 2 * SIZE_1G, WB), range(0x7FF0_0000, 0x10_0000, UC)],
     )
@@ -360,7 +367,7 @@ fn runs_merge_blocks_of_the_same_type() {
 
 #[test]
 fn runs_in_4k_blocks_show_the_fixed_ranges() {
-    let mtrrs = Mtrrs::decode(enabled(UC) | DEF_TYPE_FIXED_ENABLE, Some(pc_fixed()), &[]).unwrap();
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &[]).unwrap();
     let runs: Vec<_> = mtrrs
         .runs(FIXED_END, PAGE_SIZE as u64)
         .map(|run| (run.start, run.end, run.memory_type))

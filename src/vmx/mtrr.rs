@@ -432,4 +432,4 @@ pub fn read() -> Result<Mtrrs, MtrrError> {
 
 #[cfg(test)]
 #[path = "../../tests/unit/vmx/mtrr.rs"]
-mod tests;
+pub(crate) mod tests;

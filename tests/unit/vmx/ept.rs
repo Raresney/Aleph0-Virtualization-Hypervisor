@@ -6,7 +6,8 @@
 
 use super::level::{Pd, Pdpt, Pml4, Pt};
 use super::*;
-use crate::vmx::mtrr::MemoryType::{Uncacheable as UC, WriteBack as WB};
+use crate::vmx::mtrr::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteProtected as WP};
+use crate::vmx::mtrr::tests::{enabled, enabled_with_fixed, pc_fixed, range};
 
 /// A secondary capability MSR that allows EPT and nothing else.
 const EPT_ALLOWED: ControlCapability = ControlCapability((SECONDARY_ENABLE_EPT as u64) << 32);
@@ -159,18 +160,13 @@ fn empty_memory_map_is_refused() {
 /// 1 MiB UC hole at 0x7FF0_0000 (half of the 2 MiB region 0x7FE0_0000), and
 /// a UC 2 MiB region at 0x4000_0000. No fixed ranges.
 fn test_mtrrs() -> Mtrrs {
-    const VALID: u64 = 1 << 11;
-    /// PHYSMASK of a range of `size` bytes with 39 physical-address bits.
-    fn mask(size: u64) -> u64 {
-        (((1 << 39) - 1) & !(size - 1)) | VALID
-    }
     Mtrrs::decode(
-        (1 << 11) | UC.raw(),
+        enabled(UC),
         None,
         &[
-            (WB.raw(), mask(2 * SIZE_1G)),
-            (0x7FF0_0000 | UC.raw(), mask(0x10_0000)),
-            (0x4000_0000 | UC.raw(), mask(SIZE_2M)),
+            range(0, 2 * SIZE_1G, WB),
+            range(0x7FF0_0000, 0x10_0000, UC),
+            range(0x4000_0000, SIZE_2M, UC),
         ],
     )
     .unwrap()
@@ -184,12 +180,16 @@ type Tables4 = (
     Vec<EptEntry<Pt>>,
 );
 
-/// Fills a 2 GiB identity map with [`test_mtrrs`] and made-up table
-/// addresses (PDs at 0x2000, PTs from 0x10_0000), and returns the tables
-/// and the protected page's index in the PTs.
+/// Fills a 2 GiB identity map with [`test_mtrrs`]: see [`filled_with`].
 fn filled(protected_page: u64) -> (Tables4, usize) {
-    let mtrrs = test_mtrrs();
-    let split = split_regions(&mtrrs, 2, protected_page);
+    filled_with(&test_mtrrs(), protected_page)
+}
+
+/// Fills a 2 GiB identity map with `mtrrs` and made-up table addresses (PDs
+/// at 0x2000, PTs from 0x10_0000), and returns the tables and the protected
+/// page's index in the PTs.
+fn filled_with(mtrrs: &Mtrrs, protected_page: u64) -> (Tables4, usize) {
+    let split = split_regions(mtrrs, 2, protected_page);
     let (mut pml4, mut pdpt, mut pds, mut pts) = (
         vec![EptEntry::EMPTY; ENTRIES],
         vec![EptEntry::EMPTY; ENTRIES],
@@ -207,7 +207,7 @@ fn filled(protected_page: u64) -> (Tables4, usize) {
             pts_address: 0x10_0000,
         },
         2,
-        &mtrrs,
+        mtrrs,
         protected_page,
     );
     ((pml4, pdpt, pds, pts), protected)
@@ -275,6 +275,48 @@ fn a_mixed_region_maps_each_4k_page_with_its_own_type() {
     assert_eq!(pt[255], EptEntry::page(0x7FEF_F000, EPT_RWX, WB));
     assert_eq!(pt[256], EptEntry::page(0x7FF0_0000, EPT_RWX, UC));
     assert_eq!(pt[511], EptEntry::page(0x7FFF_F000, EPT_RWX, UC));
+}
+
+#[test]
+fn the_fixed_ranges_give_the_first_region_a_pt_of_their_types() {
+    // The usual PC layout: WB RAM, the UC VGA window, WP ROMs below 1 MiB.
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &[range(0, 2 * SIZE_1G, WB)]).unwrap();
+    assert_eq!(split_regions(&mtrrs, 2, 0x7eb1_d000), 2);
+    let ((_, _, pds, pts), protected) = filled_with(&mtrrs, 0x7eb1_d000);
+    // Region 0 comes first in address order, so it takes the first PT.
+    assert_eq!(pds[0], EptEntry::table(0x10_0000));
+    assert_eq!(pds[1], EptEntry::large_page(SIZE_2M, WB));
+    assert_eq!(pts[0x9F], EptEntry::page(0x9_F000, EPT_RWX, WB));
+    assert_eq!(pts[0xA0], EptEntry::page(0xA_0000, EPT_RWX, UC));
+    assert_eq!(pts[0xBF], EptEntry::page(0xB_F000, EPT_RWX, UC));
+    assert_eq!(pts[0xC0], EptEntry::page(0xC_0000, EPT_RWX, WP));
+    assert_eq!(pts[0xFF], EptEntry::page(0xF_F000, EPT_RWX, WP));
+    // From 1 MiB on, the variable range again.
+    assert_eq!(pts[0x100], EptEntry::page(0x10_0000, EPT_RWX, WB));
+    // The protected page's region takes the second PT.
+    assert_eq!(pds[0x3F5], EptEntry::table(0x10_1000));
+    assert_eq!(protected, ENTRIES + 0x11D);
+}
+
+#[test]
+fn without_mtrrs_the_map_is_all_write_back_with_one_pt() {
+    // As before the MTRRs were read: only the protected region has a PT.
+    assert_eq!(split_regions(&Mtrrs::Unsupported, 2, 0x7eb1_d000), 1);
+    let ((_, _, pds, pts), protected) = filled_with(&Mtrrs::Unsupported, 0x7eb1_d000);
+    for (i, entry) in pds.iter().enumerate() {
+        let expected = if i == 0x3F5 {
+            EptEntry::table(0x10_0000)
+        } else {
+            EptEntry::large_page(i as u64 * SIZE_2M, WB)
+        };
+        assert_eq!(*entry, expected, "PD entry {i:#x}");
+    }
+    assert_eq!(protected, 0x11D);
+    for (j, page) in pts.iter().enumerate() {
+        let access = if j == 0x11D { EPT_READ } else { EPT_RWX };
+        let address = 0x7ea0_0000 + (j * PAGE_SIZE) as u64;
+        assert_eq!(*page, EptEntry::page(address, access, WB), "PT entry {j:#x}");
+    }
 }
 
 #[test]
