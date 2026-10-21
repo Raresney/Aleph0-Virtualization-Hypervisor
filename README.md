@@ -12,8 +12,9 @@ the analysis the anti-cheat needs.
 It currently enters VMX root operation, fills in a complete VMCS, launches
 a minimal guest, and resumes it after its first VMCALL exit; every exit is
 reported over serial. Guest memory goes through EPT: an identity map of all
-memory with one guest page read-only, so the guest's write to it exits to
-Aleph0, which grants the write and retries it. The guest also executes CPUID,
+memory, with the memory types the MTRRs give it and one guest page
+read-only, so the guest's write to it exits to Aleph0, which grants the
+write and retries it. The guest also executes CPUID,
 RDMSR/WRMSR and IN/OUT, which Aleph0 emulates by passthrough, with MSR and I/O
 bitmaps limiting which MSRs and ports exit. An NMI that arrives while
 the guest runs is caught and reinjected into the guest's own IDT. After the
@@ -93,6 +94,7 @@ diagnostics that run before VMXON.
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT |
+| `src/vmx/mtrr.rs` | The MTRRs: reading and checking them, and the memory type of each address, which the EPT entries copy |
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
@@ -101,7 +103,7 @@ diagnostics that run before VMXON.
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
-| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation) |
+| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [MTRR.md](docs/MTRR.md) (memory types, the MTRRs and how EPT entries get them), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation) |
 
 ## Contributing
 

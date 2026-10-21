@@ -9,6 +9,10 @@ use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS}
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::msr::VmcsControlMsrs;
+use crate::vmx::mtrr::{MemoryType, Mtrrs};
+
+/// The size of an EPT large page, the unit the memory types are reported in.
+const SIZE_2M: u64 = 1 << 21;
 
 /// Prints the segmentation state that will go into the VMCS host fields.
 ///
@@ -79,14 +83,73 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     );
 }
 
-/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made.
-pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
+/// Prints the MTRRs [`vmx::mtrr::read`] decoded: whether they are on, the
+/// default type, each variable range in use, and the types the fixed ranges
+/// give the first MiB.
+pub(super) fn mtrrs(mtrrs: &Mtrrs) {
+    if !mtrrs.supported() {
+        log!("MTRRs: not supported (CPUID); all memory is treated as WB.");
+        return;
+    }
+    if !mtrrs.enabled() {
+        log!("MTRRs: disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC.");
+        return;
+    }
     log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB) with 2 MiB pages, {} table pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        "MTRRs: enabled, default type {}; fixed ranges {}; {} variable ranges, {} in use.",
+        mtrrs.default_type().name(),
+        if mtrrs.fixed_enabled() { "enabled" } else { "disabled" },
+        mtrrs.variable_count(),
+        mtrrs.variable_ranges().len(),
+    );
+    for range in mtrrs.variable_ranges() {
+        log!(
+            "MTRR variable range {}: base={:#014x} mask={:#014x} {}",
+            range.number,
+            range.base,
+            range.mask,
+            range.memory_type.name(),
+        );
+    }
+    if mtrrs.fixed_enabled() {
+        for run in mtrrs.runs(vmx::mtrr::FIXED_END, vmx::page::PAGE_SIZE as u64) {
+            log!(
+                "MTRR fixed {:#07x}..{:#07x}: {}",
+                run.start,
+                run.end,
+                type_name(run.memory_type)
+            );
+        }
+    }
+}
+
+/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made,
+/// and the memory type of each run of 2 MiB regions in it.
+pub(super) fn ept(ept: &vmx::ept::Ept, mtrrs: &Mtrrs, data_page: u64) {
+    log!(
+        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
         ept.end(),
         ept.end() >> 30,
         ept.table_pages(),
+        ept.split_regions(),
     );
+    for run in mtrrs.runs(ept.end(), SIZE_2M) {
+        log!(
+            "EPT memory type {:#014x}..{:#014x}: {}",
+            run.start,
+            run.end,
+            type_name(run.memory_type)
+        );
+    }
+}
+
+/// A run's type for the report: its name, or "mixed" for blocks whose pages
+/// differ.
+fn type_name(memory_type: Option<MemoryType>) -> &'static str {
+    match memory_type {
+        Some(memory_type) => memory_type.name(),
+        None => "mixed (4 KiB pages)",
+    }
 }
 
 /// Prints how the current page tables, which the guest will share, map the

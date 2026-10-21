@@ -6,6 +6,7 @@
 
 use super::level::{Pd, Pdpt, Pml4, Pt};
 use super::*;
+use crate::vmx::mtrr::MemoryType::{Uncacheable as UC, WriteBack as WB};
 
 /// A secondary capability MSR that allows EPT and nothing else.
 const EPT_ALLOWED: ControlCapability = ControlCapability((SECONDARY_ENABLE_EPT as u64) << 32);
@@ -52,20 +53,38 @@ fn table_entry_allows_everything() {
 }
 
 #[test]
-fn large_page_entry_is_rwx_write_back_2m() {
+fn large_page_entry_is_rwx_2m_of_its_memory_type() {
     // 0x7 RWX | 6 << 3 = 0x30 WB | 0x80 large page.
-    assert_eq!(EptEntry::large_page(0x4020_0000), EptEntry::from_raw(0x4020_00B7));
+    assert_eq!(EptEntry::large_page(0x4020_0000, WB), EptEntry::from_raw(0x4020_00B7));
+    // UC is type 0: no type bits.
+    assert_eq!(EptEntry::large_page(0xC000_0000, UC), EptEntry::from_raw(0xC000_0087));
 }
 
 #[test]
 fn read_only_page_entry_has_only_r() {
-    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_READ), EptEntry::from_raw(0x7eb1_d031));
-    assert_eq!(EptEntry::page(0x7eb1_d000, EPT_RWX), EptEntry::from_raw(0x7eb1_d037));
+    assert_eq!(
+        EptEntry::page(0x7eb1_d000, EPT_READ, WB),
+        EptEntry::from_raw(0x7eb1_d031)
+    );
+    assert_eq!(
+        EptEntry::page(0x7eb1_d000, EPT_RWX, WB),
+        EptEntry::from_raw(0x7eb1_d037)
+    );
+}
+
+#[test]
+fn page_entry_carries_its_memory_type_in_bits_5_to_3() {
+    let write_combining = crate::vmx::mtrr::MemoryType::WriteCombining;
+    assert_eq!(EptEntry::page(0xA_0000, EPT_RWX, UC), EptEntry::from_raw(0xA_0007));
+    assert_eq!(
+        EptEntry::page(0xA_0000, EPT_RWX, write_combining),
+        EptEntry::from_raw(0xA_000F)
+    );
 }
 
 #[test]
 fn with_access_replaces_only_the_permission_bits() {
-    let read_only = EptEntry::page(0x7eb1_d000, EPT_READ);
+    let read_only = EptEntry::page(0x7eb1_d000, EPT_READ, WB);
     assert_eq!(
         read_only.with_access(EPT_READ | EPT_WRITE),
         EptEntry::from_raw(0x7eb1_d033)
@@ -136,7 +155,28 @@ fn empty_memory_map_is_refused() {
     assert_eq!(identity_map_end(core::iter::empty()), Err(EptError::EmptyMemoryMap));
 }
 
-/// The PML4, PDPT, PDs and PT of an identity map.
+/// MTRRs of a 2 GiB machine: WB up to 2 GiB, UC above (the default), a
+/// 1 MiB UC hole at 0x7FF0_0000 (half of the 2 MiB region 0x7FE0_0000), and
+/// a UC 2 MiB region at 0x4000_0000. No fixed ranges.
+fn test_mtrrs() -> Mtrrs {
+    const VALID: u64 = 1 << 11;
+    /// PHYSMASK of a range of `size` bytes with 39 physical-address bits.
+    fn mask(size: u64) -> u64 {
+        (((1 << 39) - 1) & !(size - 1)) | VALID
+    }
+    Mtrrs::decode(
+        (1 << 11) | UC.raw(),
+        None,
+        &[
+            (WB.raw(), mask(2 * SIZE_1G)),
+            (0x7FF0_0000 | UC.raw(), mask(0x10_0000)),
+            (0x4000_0000 | UC.raw(), mask(SIZE_2M)),
+        ],
+    )
+    .unwrap()
+}
+
+/// The PML4, PDPT, PDs and PTs of an identity map.
 type Tables4 = (
     Vec<EptEntry<Pml4>>,
     Vec<EptEntry<Pdpt>>,
@@ -144,29 +184,33 @@ type Tables4 = (
     Vec<EptEntry<Pt>>,
 );
 
-/// Fills a 2 GiB identity map with made-up table addresses and returns the
-/// tables and the protected PT index.
+/// Fills a 2 GiB identity map with [`test_mtrrs`] and made-up table
+/// addresses (PDs at 0x2000, PTs from 0x10_0000), and returns the tables
+/// and the protected page's index in the PTs.
 fn filled(protected_page: u64) -> (Tables4, usize) {
-    let (mut pml4, mut pdpt, mut pds, mut pt) = (
+    let mtrrs = test_mtrrs();
+    let split = split_regions(&mtrrs, 2, protected_page);
+    let (mut pml4, mut pdpt, mut pds, mut pts) = (
         vec![EptEntry::EMPTY; ENTRIES],
         vec![EptEntry::EMPTY; ENTRIES],
         vec![EptEntry::EMPTY; 2 * ENTRIES],
-        vec![EptEntry::EMPTY; ENTRIES],
+        vec![EptEntry::EMPTY; split * ENTRIES],
     );
     let protected = fill_identity_map(
         Tables {
             pml4: &mut pml4,
             pdpt: &mut pdpt,
             pds: &mut pds,
-            pt: &mut pt,
+            pts: &mut pts,
             pdpt_address: 0x1000,
             pds_address: 0x2000,
-            pt_address: 0x4000,
+            pts_address: 0x10_0000,
         },
         2,
+        &mtrrs,
         protected_page,
     );
-    ((pml4, pdpt, pds, pt), protected)
+    ((pml4, pdpt, pds, pts), protected)
 }
 
 #[test]
@@ -180,23 +224,57 @@ fn identity_map_links_the_levels() {
 }
 
 #[test]
-fn identity_map_uses_2m_pages_outside_the_split_region() {
+fn regions_of_one_memory_type_are_2m_pages_of_that_type() {
     let ((_, _, pds, _), _) = filled(0x7eb1_d000);
-    assert_eq!(pds[0], EptEntry::large_page(0));
-    assert_eq!(pds[1023], EptEntry::large_page(1023 * SIZE_2M));
-    // 0x7eb1_d000 is in the 2 MiB region 0x7ea0_0000, entry 0x3F5.
-    assert_eq!(pds[0x3F5], EptEntry::table(0x4000));
-    assert_eq!(pds[0x3F4], EptEntry::large_page(0x7e80_0000));
+    assert_eq!(pds[0], EptEntry::large_page(0, WB));
+    assert_eq!(pds[0x3F4], EptEntry::large_page(0x7e80_0000, WB));
+    assert_eq!(pds[0x3FE], EptEntry::large_page(0x7FC0_0000, WB));
+    // 0x4000_0000 is entry 0x200, the UC region.
+    assert_eq!(pds[0x200], EptEntry::large_page(0x4000_0000, UC));
+    assert_eq!(pds[0x201], EptEntry::large_page(0x4020_0000, WB));
+}
+
+#[test]
+fn the_protected_region_and_mixed_regions_get_a_pt_each_in_address_order() {
+    let mtrrs = test_mtrrs();
+    assert_eq!(split_regions(&mtrrs, 2, 0x7eb1_d000), 2);
+    let ((_, _, pds, _), _) = filled(0x7eb1_d000);
+    // 0x7eb1_d000 is in the 2 MiB region 0x7ea0_0000, entry 0x3F5; the
+    // mixed region 0x7FE0_0000 is entry 0x3FF.
+    assert_eq!(pds[0x3F5], EptEntry::table(0x10_0000));
+    assert_eq!(pds[0x3FF], EptEntry::table(0x10_1000));
+}
+
+#[test]
+fn a_protected_page_in_a_mixed_region_needs_no_second_pt() {
+    let mtrrs = test_mtrrs();
+    assert_eq!(split_regions(&mtrrs, 2, 0x7FE0_0000), 1);
+    let ((_, _, pds, pts), protected) = filled(0x7FE0_0000);
+    assert_eq!(pds[0x3FF], EptEntry::table(0x10_0000));
+    assert_eq!(protected, 0);
+    assert_eq!(pts[0], EptEntry::page(0x7FE0_0000, EPT_READ, WB));
 }
 
 #[test]
 fn identity_map_makes_only_the_protected_page_read_only() {
-    let ((_, _, _, pt), protected) = filled(0x7eb1_d000);
+    let ((_, _, _, pts), protected) = filled(0x7eb1_d000);
+    // The protected region's PT is the first one.
     assert_eq!(protected, 0x11D);
-    assert_eq!(pt[0x11D], EptEntry::page(0x7eb1_d000, EPT_READ));
-    assert_eq!(pt[0x11C], EptEntry::page(0x7eb1_c000, EPT_RWX));
-    assert_eq!(pt[0], EptEntry::page(0x7ea0_0000, EPT_RWX));
-    assert_eq!(pt[511], EptEntry::page(0x7ebf_f000, EPT_RWX));
+    assert_eq!(pts[0x11D], EptEntry::page(0x7eb1_d000, EPT_READ, WB));
+    assert_eq!(pts[0x11C], EptEntry::page(0x7eb1_c000, EPT_RWX, WB));
+    assert_eq!(pts[0], EptEntry::page(0x7ea0_0000, EPT_RWX, WB));
+    assert_eq!(pts[511], EptEntry::page(0x7ebf_f000, EPT_RWX, WB));
+}
+
+#[test]
+fn a_mixed_region_maps_each_4k_page_with_its_own_type() {
+    let ((_, _, _, pts), _) = filled(0x7eb1_d000);
+    // The second PT maps 0x7FE0_0000: WB below the UC hole at 0x7FF0_0000.
+    let pt = &pts[ENTRIES..];
+    assert_eq!(pt[0], EptEntry::page(0x7FE0_0000, EPT_RWX, WB));
+    assert_eq!(pt[255], EptEntry::page(0x7FEF_F000, EPT_RWX, WB));
+    assert_eq!(pt[256], EptEntry::page(0x7FF0_0000, EPT_RWX, UC));
+    assert_eq!(pt[511], EptEntry::page(0x7FFF_F000, EPT_RWX, UC));
 }
 
 #[test]

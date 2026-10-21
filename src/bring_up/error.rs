@@ -7,6 +7,7 @@ use crate::vmx::exit_decision::ExitReason;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host_tables::{GdtError, TssError};
+use crate::vmx::mtrr::MtrrError;
 use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmexit::VmExitStackError;
 use crate::vmx::vmxon::VmxOnError;
@@ -24,6 +25,8 @@ pub enum BringUpError {
     ExitBitmaps(ExitBitmapsError),
     VmxNotSupportedByCpu,
     VmxDisabledByFirmware,
+    /// The MTRRs hold something Aleph0 cannot copy into EPT. Before VMXON.
+    Mtrr(MtrrError),
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
     /// failed. Both happen before VMXON.
     Ept(EptError),
@@ -95,6 +98,12 @@ impl From<ExitBitmapsError> for BringUpError {
     }
 }
 
+impl From<MtrrError> for BringUpError {
+    fn from(error: MtrrError) -> Self {
+        Self::Mtrr(error)
+    }
+}
+
 impl From<EptError> for BringUpError {
     fn from(error: EptError) -> Self {
         Self::Ept(error)
@@ -163,6 +172,13 @@ pub fn report_error(error: BringUpError) {
         BringUpError::ExitBitmaps(error) => log!("Exit bitmap allocation failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
+        BringUpError::Mtrr(MtrrError::ReservedType { msr, value }) => {
+            log!("MTRR setup failed: MSR {msr:#x} gives a range the reserved memory type {value}.")
+        }
+        BringUpError::Mtrr(MtrrError::TooManyVariableRanges { count }) => log!(
+            "MTRR setup failed: IA32_MTRRCAP reports {count} variable ranges, more than the {} Aleph0 keeps.",
+            vmx::mtrr::MAX_VARIABLE_RANGES,
+        ),
         BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(
             "EPT setup failed: the memory map reaches {end:#x}, past the {:#x} one PDPT maps.",
             vmx::ept::MAX_IDENTITY_MAP,

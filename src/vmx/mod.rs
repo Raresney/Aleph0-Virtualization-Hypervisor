@@ -23,6 +23,7 @@ pub mod guest_state;
 pub mod host_tables;
 pub mod instruction;
 pub mod msr;
+pub mod mtrr;
 pub mod page;
 pub mod paging;
 pub mod region;

@@ -10,8 +10,8 @@
 //! 2. Allocate the VM-exit stack, the guest's pages and the MSR and I/O
 //!    bitmaps, and check how the page tables map the guest pages.
 //! 3. Detect VMX, read its capability MSRs and check EPT support
-//!    ([`check_vmx_support`]), then build the EPT identity map with the
-//!    guest's data page read-only.
+//!    ([`check_vmx_support`]), read the MTRRs, then build the EPT identity
+//!    map with their memory types and the guest's data page read-only.
 //! 4. Enter VMX root operation and create the VMCS.
 //! 5. Fill in the VMCS: controls, EPT pointer, exit bitmaps, host state,
 //!    guest state ([`prepare_vmcs`]). Then check that none of this disturbed
@@ -193,8 +193,8 @@ struct VmxEntry {
 }
 
 /// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack, the guest's
-/// pages and the exit bitmaps, checks VMX and EPT support, builds the EPT
-/// tables, and enters VMX root operation. A failure here leaves the CPU
+/// pages and the exit bitmaps, checks VMX and EPT support, reads the MTRRs,
+/// builds the EPT tables, and enters VMX root operation. A failure here leaves the CPU
 /// outside VMX operation, so `run` only has to put the firmware's GDTR back.
 fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
     let vmexit_stack = VmExitStack::allocate()?;
@@ -225,10 +225,12 @@ fn enter_vmx(host_tables: &HostTables) -> Result<VmxEntry, BringUpError> {
 
     let (controls, invept) = check_vmx_support()?;
 
+    let mtrrs = vmx::mtrr::read()?;
+    report::mtrrs(&mtrrs);
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the data page's address its GPA.
-    let ept = unsafe { Ept::build(guest.data_page(), invept) }?;
-    report::ept(&ept, guest.data_page());
+    let ept = unsafe { Ept::build(guest.data_page(), invept, &mtrrs) }?;
+    report::ept(&ept, &mtrrs, guest.data_page());
 
     // Recorded before VMXON: once the guest runs, its VM exits clear IF, and
     // teardown turns interrupts back on only if firmware had them on.
