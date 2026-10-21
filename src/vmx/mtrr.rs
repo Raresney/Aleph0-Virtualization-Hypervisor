@@ -158,7 +158,7 @@ pub struct VariableRange {
 }
 
 impl VariableRange {
-    /// Fills the unused slots of [`Mtrrs::variable`].
+    /// Fills the unused slots of [`EnabledMtrrs::variable`].
     const UNUSED: Self = Self {
         number: 0,
         base: 0,
@@ -186,13 +186,25 @@ impl VariableRange {
 /// The MTRRs of this CPU, decoded and checked: every type in use is a valid
 /// memory type, so looking one up cannot fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mtrrs {
-    /// False when the CPU has no MTRRs at all (CPUID). Every address is then
-    /// WB, as it was for Aleph0's EPT before MTRRs were read.
-    supported: bool,
-    /// IA32_MTRR_DEF_TYPE.E. While clear, all memory is UC and nothing else
-    /// below applies.
-    enabled: bool,
+#[expect(
+    clippy::large_enum_variant,
+    reason = "built once at bring-up and passed by reference; the crate has no allocator to box it"
+)]
+pub enum Mtrrs {
+    /// The CPU has no MTRRs at all (CPUID). Every address is WB, so caching
+    /// is up to the PAT alone, as it was for Aleph0's EPT before MTRRs were
+    /// read.
+    Unsupported,
+    /// IA32_MTRR_DEF_TYPE.E is clear: all memory is UC, whatever the other
+    /// MTRRs hold.
+    Disabled,
+    /// IA32_MTRR_DEF_TYPE.E is set: the default type and the ranges apply.
+    Enabled(EnabledMtrrs),
+}
+
+/// MTRRs that are on: the default type and the ranges that override it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnabledMtrrs {
     default_type: MemoryType,
     /// The type of each fixed range, per MSR in [`FIXED_RANGES`] order, or
     /// `None` when the fixed ranges are missing or disabled.
@@ -205,20 +217,6 @@ pub struct Mtrrs {
 }
 
 impl Mtrrs {
-    /// What a CPU without MTRRs behaves like: every address WB, so caching
-    /// is up to the PAT alone.
-    pub fn unsupported() -> Self {
-        Self {
-            supported: false,
-            enabled: true,
-            default_type: MemoryType::WriteBack,
-            fixed: None,
-            variable_count: 0,
-            variable: [VariableRange::UNUSED; MAX_VARIABLE_RANGES],
-            in_use: 0,
-        }
-    }
-
     /// Decodes the MSR values: `def_type` is IA32_MTRR_DEF_TYPE, `fixed` the
     /// fixed-range MSRs in [`FIXED_RANGES`] order (`None` when IA32_MTRRCAP
     /// says they do not exist), and `variable` the (PHYSBASE, PHYSMASK) pair
@@ -231,19 +229,16 @@ impl Mtrrs {
         if variable.len() > MAX_VARIABLE_RANGES {
             return Err(MtrrError::TooManyVariableRanges { count: variable.len() });
         }
-        let mut mtrrs = Self {
-            supported: true,
-            enabled: def_type & DEF_TYPE_ENABLE != 0,
-            default_type: MemoryType::Uncacheable,
+        if def_type & DEF_TYPE_ENABLE == 0 {
+            return Ok(Self::Disabled);
+        }
+        let mut mtrrs = EnabledMtrrs {
+            default_type: decode_type(IA32_MTRR_DEF_TYPE, def_type)?,
             fixed: None,
             variable_count: variable.len(),
             variable: [VariableRange::UNUSED; MAX_VARIABLE_RANGES],
             in_use: 0,
         };
-        if !mtrrs.enabled {
-            return Ok(mtrrs);
-        }
-        mtrrs.default_type = decode_type(IA32_MTRR_DEF_TYPE, def_type)?;
 
         if def_type & DEF_TYPE_FIXED_ENABLE != 0
             && let Some(fixed) = fixed
@@ -269,78 +264,29 @@ impl Mtrrs {
             };
             mtrrs.in_use += 1;
         }
-        Ok(mtrrs)
-    }
-
-    /// Whether the CPU has MTRRs at all.
-    pub fn supported(&self) -> bool {
-        self.supported
-    }
-
-    /// Whether the MTRRs are enabled (IA32_MTRR_DEF_TYPE.E).
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// The type of memory no range covers.
-    pub fn default_type(&self) -> MemoryType {
-        self.default_type
-    }
-
-    /// Whether the fixed ranges exist and are enabled.
-    pub fn fixed_enabled(&self) -> bool {
-        self.fixed.is_some()
-    }
-
-    /// How many variable ranges the CPU has, used or not.
-    pub fn variable_count(&self) -> usize {
-        self.variable_count
-    }
-
-    /// The variable ranges in use.
-    pub fn variable_ranges(&self) -> &[VariableRange] {
-        &self.variable[..self.in_use]
+        Ok(Self::Enabled(mtrrs))
     }
 
     /// The memory type of the 4 KiB page at `address` (SDM, "MTRR
-    /// Precedences"): UC while the MTRRs are disabled; below 1 MiB the fixed
-    /// range's type, when they are enabled; otherwise the type of the
-    /// variable ranges covering it, or the default type if none does.
+    /// Precedences"): WB without MTRRs, UC while they are disabled, and
+    /// otherwise what [`EnabledMtrrs`] gives it.
     pub fn memory_type(&self, address: u64) -> MemoryType {
-        if !self.enabled {
-            return MemoryType::Uncacheable;
+        match self {
+            Self::Unsupported => MemoryType::WriteBack,
+            Self::Disabled => MemoryType::Uncacheable,
+            Self::Enabled(mtrrs) => mtrrs.memory_type(address),
         }
-        if let Some(memory_type) = self.fixed_type(address) {
-            return memory_type;
-        }
-        self.variable_ranges()
-            .iter()
-            .filter(|range| range.covers(address))
-            .map(|range| range.memory_type)
-            .reduce(MemoryType::overlap)
-            .unwrap_or(self.default_type)
     }
 
     /// The memory type of the whole `size`-byte block at `base`, or `None`
     /// when its 4 KiB pages do not all have the same type. `size` is a power
     /// of two of at least 4 KiB, and `base` a multiple of it.
-    ///
-    /// The type is the same for every page unless the fixed ranges reach
-    /// into the block or a variable range covers only part of it. Only then
-    /// are the pages looked at one by one, so a map of all memory stays
-    /// cheap to build.
     pub fn block_type(&self, base: u64, size: u64) -> Option<MemoryType> {
         debug_assert!(size.is_power_of_two() && size >= PAGE_SIZE as u64 && base.is_multiple_of(size));
-        let fixed_inside = self.enabled && self.fixed.is_some() && base < FIXED_END;
-        let split = self.enabled && self.variable_ranges().iter().any(|range| range.may_split(base, size));
-        let first = self.memory_type(base);
-        if !fixed_inside && !split {
-            return Some(first);
+        match self {
+            Self::Unsupported | Self::Disabled => Some(self.memory_type(base)),
+            Self::Enabled(mtrrs) => mtrrs.block_type(base, size),
         }
-        (base..base + size)
-            .step_by(PAGE_SIZE)
-            .all(|page| self.memory_type(page) == first)
-            .then_some(first)
     }
 
     /// `[0, end)` cut into blocks of `size` bytes, with consecutive blocks of
@@ -365,6 +311,62 @@ impl Mtrrs {
             start = run_end;
             Some(run)
         })
+    }
+}
+
+impl EnabledMtrrs {
+    /// The type of memory no range covers.
+    pub fn default_type(&self) -> MemoryType {
+        self.default_type
+    }
+
+    /// Whether the fixed ranges exist and are enabled.
+    pub fn fixed_enabled(&self) -> bool {
+        self.fixed.is_some()
+    }
+
+    /// How many variable ranges the CPU has, used or not.
+    pub fn variable_count(&self) -> usize {
+        self.variable_count
+    }
+
+    /// The variable ranges in use.
+    pub fn variable_ranges(&self) -> &[VariableRange] {
+        &self.variable[..self.in_use]
+    }
+
+    /// The memory type of the 4 KiB page at `address`: below 1 MiB the fixed
+    /// range's type, when they are enabled; otherwise the type of the
+    /// variable ranges covering it, or the default type if none does.
+    fn memory_type(&self, address: u64) -> MemoryType {
+        if let Some(memory_type) = self.fixed_type(address) {
+            return memory_type;
+        }
+        self.variable_ranges()
+            .iter()
+            .filter(|range| range.covers(address))
+            .map(|range| range.memory_type)
+            .reduce(MemoryType::overlap)
+            .unwrap_or(self.default_type)
+    }
+
+    /// See [`Mtrrs::block_type`].
+    ///
+    /// The type is the same for every page unless the fixed ranges reach
+    /// into the block or a variable range covers only part of it. Only then
+    /// are the pages looked at one by one, so a map of all memory stays
+    /// cheap to build.
+    fn block_type(&self, base: u64, size: u64) -> Option<MemoryType> {
+        let fixed_inside = self.fixed.is_some() && base < FIXED_END;
+        let split = self.variable_ranges().iter().any(|range| range.may_split(base, size));
+        let first = self.memory_type(base);
+        if !fixed_inside && !split {
+            return Some(first);
+        }
+        (base..base + size)
+            .step_by(PAGE_SIZE)
+            .all(|page| self.memory_type(page) == first)
+            .then_some(first)
     }
 
     /// The type of the fixed range holding `address`, or `None` when the
@@ -393,11 +395,11 @@ fn decode_type(msr: u32, value: u64) -> Result<MemoryType, MtrrError> {
     MemoryType::from_raw(raw).ok_or(MtrrError::ReservedType { msr, value: raw })
 }
 
-/// Reads and decodes this CPU's MTRRs, or returns [`Mtrrs::unsupported`]
+/// Reads and decodes this CPU's MTRRs, or returns [`Mtrrs::Unsupported`]
 /// when CPUID says it has none.
 pub fn read() -> Result<Mtrrs, MtrrError> {
     if !cpuid::has_mtrr() {
-        return Ok(Mtrrs::unsupported());
+        return Ok(Mtrrs::Unsupported);
     }
     // SAFETY: CPUID reports MTRRs, so IA32_MTRRCAP and IA32_MTRR_DEF_TYPE
     // exist. Reading them has no side effects.

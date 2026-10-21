@@ -28,6 +28,14 @@ fn mtrrs(default: MemoryType, variable: &[(u64, u64)]) -> Mtrrs {
     Mtrrs::decode(enabled(default), None, variable).unwrap()
 }
 
+/// The ranges of MTRRs that are on; panics if they are not.
+fn as_enabled(mtrrs: &Mtrrs) -> &EnabledMtrrs {
+    let Mtrrs::Enabled(enabled) = mtrrs else {
+        panic!("MTRRs not enabled: {mtrrs:?}");
+    };
+    enabled
+}
+
 /// Every byte of a fixed-range MSR set to `memory_type`.
 fn fixed_all(memory_type: MemoryType) -> u64 {
     u64::from_le_bytes([memory_type.raw() as u8; 8])
@@ -80,7 +88,7 @@ fn disabled_mtrrs_make_everything_uncacheable() {
         &[(7, PHYSMASK_VALID)],
     )
     .unwrap();
-    assert!(!mtrrs.enabled());
+    assert_eq!(mtrrs, Mtrrs::Disabled);
     assert_eq!(mtrrs.memory_type(0), UC);
     assert_eq!(mtrrs.memory_type(0x7eb0_1000), UC);
     assert_eq!(mtrrs.block_type(0, SIZE_2M), Some(UC));
@@ -88,8 +96,7 @@ fn disabled_mtrrs_make_everything_uncacheable() {
 
 #[test]
 fn without_mtrrs_everything_is_write_back() {
-    let mtrrs = Mtrrs::unsupported();
-    assert!(!mtrrs.supported());
+    let mtrrs = Mtrrs::Unsupported;
     assert_eq!(mtrrs.memory_type(0xA_0000), WB);
     assert_eq!(mtrrs.memory_type(0xFEE0_0000), WB);
 }
@@ -106,8 +113,8 @@ fn an_address_no_range_covers_gets_the_default_type() {
 fn a_range_without_the_valid_bit_is_ignored() {
     let (base, mask) = range(0, 2 * SIZE_1G, WB);
     let mtrrs = mtrrs(UC, &[(base, mask & !PHYSMASK_VALID)]);
-    assert_eq!(mtrrs.variable_count(), 1);
-    assert!(mtrrs.variable_ranges().is_empty());
+    assert_eq!(as_enabled(&mtrrs).variable_count(), 1);
+    assert!(as_enabled(&mtrrs).variable_ranges().is_empty());
     assert_eq!(mtrrs.memory_type(0x1000_0000), UC);
 }
 
@@ -118,7 +125,7 @@ fn ranges_keep_their_number_base_mask_and_type() {
         &[(0, 0), range(0x8000_0000, 0x1000_0000, WC), range(0, SIZE_1G, WB)],
     );
     assert_eq!(
-        mtrrs.variable_ranges(),
+        as_enabled(&mtrrs).variable_ranges(),
         [
             VariableRange {
                 number: 1,
@@ -172,7 +179,7 @@ fn the_fixed_ranges_decide_the_first_mib() {
         &[range(0, SIZE_1G, WB)],
     )
     .unwrap();
-    assert!(mtrrs.fixed_enabled());
+    assert!(as_enabled(&mtrrs).fixed_enabled());
     // The variable range covers all of these too; the fixed ranges win.
     assert_eq!(mtrrs.memory_type(0x9_F000), WB);
     assert_eq!(mtrrs.memory_type(0xA_0000), UC);
@@ -210,11 +217,11 @@ fn each_fixed_range_reads_its_own_byte() {
 #[test]
 fn fixed_ranges_are_ignored_while_disabled_or_missing() {
     let disabled = Mtrrs::decode(enabled(WB), Some([fixed_all(UC); FIXED_MSRS]), &[]).unwrap();
-    assert!(!disabled.fixed_enabled());
+    assert!(!as_enabled(&disabled).fixed_enabled());
     assert_eq!(disabled.memory_type(0xA_0000), WB);
 
     let missing = Mtrrs::decode(enabled(WB) | DEF_TYPE_FIXED_ENABLE, None, &[]).unwrap();
-    assert!(!missing.fixed_enabled());
+    assert!(!as_enabled(&missing).fixed_enabled());
     assert_eq!(missing.memory_type(0xA_0000), WB);
 }
 
@@ -285,8 +292,9 @@ fn a_small_range_elsewhere_leaves_a_block_uniform() {
     // The UC range's mask tests bits inside a 2 MiB block, but its upper
     // bits do not match this block, so it covers none of it.
     let mtrrs = mtrrs(UC, &[range(0, 2 * SIZE_1G, WB), range(0x7FF0_0000, 0x10_0000, UC)]);
-    assert!(mtrrs.variable_ranges()[1].may_split(0x7FE0_0000, SIZE_2M));
-    assert!(!mtrrs.variable_ranges()[1].may_split(0x4000_0000, SIZE_2M));
+    let small = as_enabled(&mtrrs).variable_ranges()[1];
+    assert!(small.may_split(0x7FE0_0000, SIZE_2M));
+    assert!(!small.may_split(0x4000_0000, SIZE_2M));
     assert_eq!(mtrrs.block_type(0x4000_0000, SIZE_2M), Some(WB));
 }
 

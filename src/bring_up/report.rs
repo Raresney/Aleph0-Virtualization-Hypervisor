@@ -87,22 +87,25 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
 /// default type, each variable range in use, and the types the fixed ranges
 /// give the first MiB.
 pub(super) fn mtrrs(mtrrs: &Mtrrs) {
-    if !mtrrs.supported() {
-        log!("MTRRs: not supported (CPUID); all memory is treated as WB.");
-        return;
-    }
-    if !mtrrs.enabled() {
-        log!("MTRRs: disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC.");
-        return;
-    }
+    let enabled = match mtrrs {
+        Mtrrs::Unsupported => {
+            log!("MTRRs: not supported (CPUID); all memory is treated as WB.");
+            return;
+        }
+        Mtrrs::Disabled => {
+            log!("MTRRs: disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC.");
+            return;
+        }
+        Mtrrs::Enabled(enabled) => enabled,
+    };
     log!(
         "MTRRs: enabled, default type {}; fixed ranges {}; {} variable ranges, {} in use.",
-        mtrrs.default_type().name(),
-        if mtrrs.fixed_enabled() { "enabled" } else { "disabled" },
-        mtrrs.variable_count(),
-        mtrrs.variable_ranges().len(),
+        enabled.default_type().name(),
+        if enabled.fixed_enabled() { "enabled" } else { "disabled" },
+        enabled.variable_count(),
+        enabled.variable_ranges().len(),
     );
-    for range in mtrrs.variable_ranges() {
+    for range in enabled.variable_ranges() {
         log!(
             "MTRR variable range {}: base={:#014x} mask={:#014x} {}",
             range.number,
@@ -111,7 +114,7 @@ pub(super) fn mtrrs(mtrrs: &Mtrrs) {
             range.memory_type.name(),
         );
     }
-    if mtrrs.fixed_enabled() {
+    if enabled.fixed_enabled() {
         for run in mtrrs.runs(vmx::mtrr::FIXED_END, vmx::page::PAGE_SIZE as u64) {
             log!(
                 "MTRR fixed {:#07x}..{:#07x}: {}",
