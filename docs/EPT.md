@@ -3,7 +3,8 @@
 How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 - why the guest needs a translation stage it cannot touch;
 - the EPT entries and the EPT pointer;
-- how Aleph0 checks support and builds an identity map;
+- how Aleph0 checks support and builds an identity map, with the memory
+  types of the MTRRs;
 - the guest's read-only data page and the EPT violation it causes on purpose;
 - how Aleph0 handles that violation (grant write, INVEPT, retry);
 - what the Hyper-V runs printed;
@@ -11,6 +12,7 @@ How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 
 Code:
 - `src/vmx/ept.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
+- `src/vmx/mtrr.rs`: the memory type of each address, from the MTRRs (see [MTRR.md](MTRR.md));
 - `src/vmx/guest.rs`: the data page and the guest code that writes it;
 - `src/vmx/exit_decision/`: which EPT violation is accepted (`scenario.rs`, reached from `decide` in `mod.rs`);
 - `src/vmx/vmexit/`: the handler that reports and applies it;
@@ -63,7 +65,7 @@ entry bits differ:
 | Bits | Meaning |
 |---|---|
 | 0, 1, 2 | **R, W, X**: read, write, execute allowed. No separate "present" bit: R = W = X = 0 means not present. |
-| 5:3 | memory type, in leaf entries only; 6 = write-back (WB), the type of ordinary RAM |
+| 5:3 | memory type, in leaf entries only: 0 = UC, 6 = write-back (WB), the type of ordinary RAM; Aleph0 copies it from the MTRRs ([MTRR.md](MTRR.md)) |
 | 6 | IPAT: ignore the guest's PAT. Aleph0 leaves it 0. |
 | 7 | in a PD entry: this entry maps a 2 MiB page directly (no PT below) |
 | 51:12 | physical address of the next table, or of the page |
@@ -80,8 +82,8 @@ so each constructor exists only where the entry is valid: calling
 | Function | Levels | Value | Example |
 |---|---|---|---|
 | `EptEntry::table(addr)` | PML4, PDPT, PD | `addr \| 0b111` | `0x7e00_1007` |
-| `EptEntry::large_page(addr)` | PD | `addr \| RWX \| 6 << 3 \| 1 << 7` | `0x4020_00B7` |
-| `EptEntry::page(addr, R)` | PT | `addr \| R \| 6 << 3` | `0x7eb1_d031` (read-only) |
+| `EptEntry::large_page(addr, type)` | PD | `addr \| RWX \| type << 3 \| 1 << 7` | `0x4020_00B7` (WB) |
+| `EptEntry::page(addr, R, type)` | PT | `addr \| R \| type << 3` | `0x7eb1_d031` (read-only, WB) |
 | `Eptp::new(pml4)` | — | `pml4 \| 6 \| 3 << 3` | low bits always `0x1E` |
 
 The **EPT pointer** (EPTP, VMCS field `0x201A`) tells the CPU where the
@@ -145,17 +147,21 @@ same memory. Only the permissions can now differ.
 1. Reads the UEFI memory map and takes the highest address any region
    reaches, rounded up to 1 GiB (`identity_map_end`). Every region counts,
    whatever its type. One PDPT reaches 512 GiB, so that is the limit.
-2. Allocates one PML4, one PDPT, one PD per GiB, and one PT.
-3. Points PML4 entry 0 at the PDPT and PDPT entry *i* at PD *i*.
-4. Fills every PD entry with a 2 MiB page: RWX, WB.
-5. Replaces the PD entry covering the guest's data page with a pointer to
-   the PT. The PT maps that 2 MiB region in 512 pages of 4 KiB, all RWX,
-   **except the data page, which gets R only**.
+2. Counts the 2 MiB regions that need a PT (`split_regions`): those whose
+   pages differ in memory type ([MTRR.md](MTRR.md)), and the one holding
+   the guest's data page.
+3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs.
+4. Points PML4 entry 0 at the PDPT and PDPT entry *i* at PD *i*.
+5. Fills every PD entry with a 2 MiB page, RWX, of the region's memory
+   type, except for the regions counted in step 2. Their PD entry points to
+   the next PT, which maps the region in 512 pages of 4 KiB, all RWX and
+   each of its own memory type, **except the data page, which gets R only**.
 
-2 MiB pages keep the tables small. Only the one region that needs a 4 KiB
-exception pays for a PT.
+2 MiB pages keep the tables small. Only the regions that need a 4 KiB
+exception pay for a PT.
 
-On Hyper-V (2 GiB of RAM):
+On Hyper-V (2 GiB of RAM), before the memory types came from the MTRRs
+(every page was WB, and the data page's region had the only PT):
 
 ```text
 EPT built: identity 0x0..0x80000000 (2 GiB) with 2 MiB pages, 5 table pages; data page 0x000000007eb01000 read-only (R=1 W=0 X=0).
@@ -355,13 +361,8 @@ section 10).
 
 ## 10. What is not covered yet
 
-- **Memory types from the MTRRs.** With EPT on, the MTRRs no longer apply
-  to guest accesses; the EPT entry's type does (combined with the guest's
-  PAT). Everything is WB here, including any MMIO the memory map reports.
-  An OS guest touches device memory (Local APIC, IOAPIC, PCI BARs,
-  framebuffer), where WB breaks devices. Aleph0 must read
-  `IA32_MTRR_DEF_TYPE` and the fixed and variable MTRRs, give each region
-  its type, and split 2 MiB regions of mixed type into 4 KiB pages.
+- **Following the guest's MTRR changes.** The memory types are copied
+  from the MTRRs once, at bring-up ([MTRR.md](MTRR.md), section 7).
 - **Hiding Aleph0's own pages** (section 9). Each of them must become not
   present in EPT, with the access redirected or a #PF injected, or be
   mapped to a zero-filled shadow page. Aleph0 then has to track every page
@@ -388,11 +389,11 @@ section 10).
 | `EPT_POINTER` | `0x201A`; low bits `0x1E` = WB, 4 levels |
 | `IA32_VMX_PROCBASED_CTLS2` | `0x48B` |
 | `IA32_VMX_EPT_VPID_CAP` | `0x48C`; bits 6, 14, 16, 20, 25/26 required |
-| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (6 = WB), 6 IPAT, 7 2 MiB page |
+| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs; 0 = UC, 6 = WB), 6 IPAT, 7 2 MiB page |
 | Exit reason 48 | EPT violation: `GUEST_PHYSICAL_ADDRESS` `0x2400`, `GUEST_LINEAR_ADDRESS` `0x640A` |
 | Exit reason 49 | EPT misconfiguration: never handled |
 | Qualification | 0 read, 1 write, 2 fetch, 3/4/5 R/W/X allowed, 7 linear valid, 8 translated access, 12 NMI-unblocking IRET |
 | Accepted violation | write to the protected page, `0x58a` on Hyper-V |
 | After it | W = 1, INVEPT, resume at the same RIP |
 | `GUEST_DATA_SEED` / `GUEST_EPT_VALUE` | `0xDA7A` / `0x455054` ("EPT") |
-| Hyper-V map | `0x0..0x80000000`, 5 table pages, EPTP `0x7eafc01e` |
+| Hyper-V map (before the MTRR types) | `0x0..0x80000000`, 5 table pages, EPTP `0x7eafc01e` |

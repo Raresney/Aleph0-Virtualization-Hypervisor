@@ -9,6 +9,7 @@ use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS}
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::msr::VmcsControlMsrs;
+use crate::vmx::mtrr::{MemoryType, Mtrrs};
 
 /// Prints the segmentation state that will go into the VMCS host fields.
 ///
@@ -79,14 +80,72 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     );
 }
 
-/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made.
+/// Prints the MTRRs [`vmx::mtrr::read`] decoded: whether they are on, the
+/// default type, each variable range in use, and the types the fixed ranges
+/// give the first MiB.
+pub(super) fn mtrrs(mtrrs: &Mtrrs) {
+    let enabled = match mtrrs {
+        Mtrrs::Unsupported => {
+            log!("MTRRs: not supported (CPUID); all memory is treated as WB.");
+            return;
+        }
+        Mtrrs::Disabled => {
+            log!("MTRRs: disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC.");
+            return;
+        }
+        Mtrrs::Enabled(enabled) => enabled,
+    };
+    log!(
+        "MTRRs: enabled, default type {}; fixed ranges {}; {} variable ranges, {} in use.",
+        enabled.default_type().name(),
+        if enabled.fixed_enabled() { "enabled" } else { "disabled" },
+        enabled.variable_count(),
+        enabled.variable_ranges().len(),
+    );
+    for range in enabled.variable_ranges() {
+        log!(
+            "MTRR variable range {}: base={:#014x} mask={:#014x} {}",
+            range.number,
+            range.base,
+            range.mask,
+            range.memory_type.name(),
+        );
+    }
+    if enabled.fixed_enabled() {
+        for run in mtrrs.runs(vmx::mtrr::FIXED_END, vmx::page::PAGE_SIZE as u64) {
+            log!(
+                "MTRR fixed {:#07x}..{:#07x}: {}",
+                run.start,
+                run.end,
+                type_name(run.memory_type)
+            );
+        }
+    }
+}
+
+/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made,
+/// and how its PD entries map each run of 2 MiB regions: read back from the
+/// entries, so the lines show what the CPU walks.
 pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
     log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB) with 2 MiB pages, {} table pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
         ept.end(),
         ept.end() >> 30,
         ept.table_pages(),
+        ept.split_regions(),
     );
+    for run in ept.region_runs() {
+        log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
+    }
+}
+
+/// A run's type for the report: its name, or "mixed" for blocks whose pages
+/// differ.
+fn type_name(memory_type: Option<MemoryType>) -> &'static str {
+    match memory_type {
+        Some(memory_type) => memory_type.name(),
+        None => "mixed (4 KiB pages)",
+    }
 }
 
 /// Prints how the current page tables, which the guest will share, map the
