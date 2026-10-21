@@ -27,3 +27,20 @@ fn unexpected_stops_with_the_exit_and_its_reason() {
         vmcs::encode_unexpected(1, 10)
     );
 }
+
+#[test]
+fn next_rip_adds_the_instruction_length() {
+    assert_eq!(next_rip(0x1000, 3), Some(0x1003));
+}
+
+#[test]
+fn next_rip_may_reach_the_last_address() {
+    // A 15-byte instruction at ...FFF0 ends at ...FFFE; the next RIP is then the last representable address.
+    assert_eq!(next_rip(u64::MAX - 15, 15), Some(u64::MAX));
+}
+
+#[test]
+fn next_rip_past_the_top_of_the_address_space_is_refused() {
+    assert_eq!(next_rip(u64::MAX - 14, 15), None);
+    assert_eq!(next_rip(0xFFFF_FFFF_FFFF_FFFE, 3), None);
+}

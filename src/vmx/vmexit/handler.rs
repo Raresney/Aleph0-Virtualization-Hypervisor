@@ -88,6 +88,15 @@ fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
     }
 }
 
+/// The guest RIP after an instruction of `length` bytes, or `None` when that would wrap past the top of the
+/// address space.
+///
+/// `rip` is the guest's: a guest kernel can map code in the last bytes of the address space, where the sum
+/// overflows (a panic in debug builds, a silent wrap in release). The caller stops the guest instead.
+fn next_rip(rip: u64, length: u64) -> Option<u64> {
+    rip.checked_add(length)
+}
+
 /// VM-exit handler: prints the exit over serial, decides what it is
 /// (`exit_decision::decide`), then tells the entry stub what to do. It
 /// returns [`RESUME_GUEST`] after preparing the VMCS for the guest to go on
@@ -401,15 +410,21 @@ fn prepare_resume(
         crate::serial_println!("{tag} VM exit #{number}: guest RIP unreadable; not resuming.");
         return None;
     };
-    // Checked before the emulation: with the length unreadable, a WRMSR or
-    // OUT would already have happened when the guest stops, and serial would
-    // never show it.
-    let advance_by = if advance_rip {
+    // Checked before the emulation: with the length unreadable or the new RIP
+    // wrapping, a WRMSR or OUT would already have happened when the guest
+    // stops, and serial would never show it.
+    let advance_to = if advance_rip {
         let Some(length) = length else {
             crate::serial_println!("{tag} VM exit #{number}: instruction length unreadable; not resuming.");
             return None;
         };
-        Some(length)
+        let Some(next) = next_rip(rip, length) else {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: guest RIP would wrap past the top of the address space; not resuming."
+            );
+            return None;
+        };
+        Some(next)
     } else {
         None
     };
@@ -417,14 +432,14 @@ fn prepare_resume(
     // result already in its registers.
     let emulated = emulate.map(|emulation| execute(emulation, frame));
 
-    let resume_rip = if let Some(length) = advance_by {
+    let resume_rip = if let Some(next) = advance_to {
         // SAFETY: exit context: VMX root operation, with the guest's VMCS
         // current.
-        if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, rip + length) } {
+        if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, next) } {
             crate::serial_println!("{tag} VM exit #{number}: could not advance guest RIP ({error:?}); not resuming.");
             return None;
         }
-        rip + length
+        next
     } else {
         // An NMI exit: the guest goes on at the instruction it was about to
         // run, and the injected NMI is delivered before it. An EPT
