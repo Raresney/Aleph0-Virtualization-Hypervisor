@@ -396,4 +396,4 @@ section 10).
 | Accepted violation | write to the protected page, `0x58a` on Hyper-V |
 | After it | W = 1, INVEPT, resume at the same RIP |
 | `GUEST_DATA_SEED` / `GUEST_EPT_VALUE` | `0xDA7A` / `0x455054` ("EPT") |
-| Hyper-V map | `0x0..0x80000000`, 5 table pages, EPTP `0x7eafc01e` |
+| Hyper-V map (before the MTRR types) | `0x0..0x80000000`, 5 table pages, EPTP `0x7eafc01e` |
