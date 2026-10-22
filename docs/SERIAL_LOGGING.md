@@ -332,8 +332,8 @@ ended (`src/vmx/vmexit/policy.rs`):
 
 The default build prints up to info. Build with the `trace-exits` Cargo
 feature (`run-hyperv.ps1 -Features trace-exits`) to print every exit in
-full. An NMI that arrived while Aleph0 ran is a warning and is always
-printed. A summary line looks like this:
+full. An NMI that arrived while Aleph0 ran is always printed. A summary
+line looks like this:
 
 ```text
 VM exit #40960: reason=12 (HLT), 4096 exits of this reason so far.

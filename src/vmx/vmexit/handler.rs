@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::fmt;
 
 use super::history::{self, ExitRecord};
-use super::policy::{self, COUNTERS, Level, MAX_LEVEL, exit_detail};
+use super::policy::{self, COUNTERS, MAX_LEVEL, exit_detail};
 use super::report::{ExitReport, report_exit, report_stop};
 use super::{RegisterFrame, read_field};
 use crate::port;
@@ -406,12 +406,10 @@ fn keep_nmi_window_for_host_nmi(number: u64) {
     if !host::nmi_pending() {
         return;
     }
-    if policy::enabled(Level::Warn) {
-        crate::serial_println!(
-            "{} VM exit #{number}: an NMI arrived in root operation during this exit; NMI-window exiting on.",
-            crate::TAG
-        );
-    }
+    crate::serial_println!(
+        "{} VM exit #{number}: an NMI arrived in root operation during this exit; NMI-window exiting on.",
+        crate::TAG
+    );
     // SAFETY: exit context: VMX root operation, with the guest's VMCS
     // current. `configure_controls` checked that the CPU allows NMI-window
     // exiting.

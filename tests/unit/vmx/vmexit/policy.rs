@@ -57,13 +57,6 @@ fn trace_prints_every_exit_in_full() {
 }
 
 #[test]
-fn an_errors_only_build_prints_stops_and_nothing_else() {
-    assert_eq!(exit_detail(1, false, false, Level::Error), Detail::Silent);
-    assert_eq!(exit_detail(32, false, false, Level::Error), Detail::Silent);
-    assert_eq!(exit_detail(32, true, false, Level::Error), Detail::Full);
-}
-
-#[test]
 fn the_test_guest_runs_print_every_exit_in_full() {
     // The basic reasons of the recorded runs, in order: nine emulated exits,
     // HLT, the EPT violation, then the VMCALLs; with -InjectNmi an NMI exit
@@ -113,8 +106,6 @@ fn the_histogram_names_the_shared_counter_other() {
 }
 
 #[test]
-fn warnings_print_in_the_default_build() {
-    assert!(enabled(Level::Warn));
-    assert!(enabled(Level::Info));
-    assert_eq!(enabled(Level::Trace), cfg!(feature = "trace-exits"));
+fn the_default_build_prints_up_to_info() {
+    assert_eq!(MAX_LEVEL == Level::Trace, cfg!(feature = "trace-exits"));
 }

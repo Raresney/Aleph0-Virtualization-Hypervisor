@@ -5,7 +5,7 @@
 //! the serial port, never firmware.
 
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
-use super::policy::{self, COUNTERS, Detail, Histogram, Level};
+use super::policy::{COUNTERS, Detail, Histogram};
 use super::{RegisterFrame, dump, history, read_field};
 use crate::vmx::ept::InveptType;
 use crate::vmx::exit_decision::{
@@ -188,9 +188,6 @@ fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification, gue
 /// now pending for the guest. Not "resuming the guest": that text arms
 /// `run-hyperv.ps1 -InjectNmi`.
 fn report_host_nmi(number: u64) {
-    if !policy::enabled(Level::Warn) {
-        return;
-    }
     crate::serial_println!(
         "{} VM exit #{number}: an NMI arrived while Aleph0 ran in root operation ({} so far); pending for the guest.",
         crate::TAG,

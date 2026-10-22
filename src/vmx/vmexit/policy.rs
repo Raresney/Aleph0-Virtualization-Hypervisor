@@ -15,7 +15,7 @@
 //!
 //! A build prints the levels up to [`MAX_LEVEL`]: info by default, trace
 //! with the `trace-exits` Cargo feature, which prints every exit in full.
-//! An NMI that arrived while Aleph0 ran is a warning, printed whatever the
+//! An NMI that arrived while Aleph0 ran is always printed, whatever the
 //! exit's detail. Every stop also prints how many exits of each reason there
 //! were ([`Histogram`]), so the exits left out still show in the totals.
 
@@ -28,8 +28,6 @@ use crate::vmx::exit_decision::exit_reason_name;
 pub enum Level {
     /// The guest stops, or Aleph0 could not read what it needed.
     Error,
-    /// Unusual, but handled: an NMI that arrived while Aleph0 ran.
-    Warn,
     /// What exits did, within the rate limit.
     Info,
     /// Every exit, in full.
@@ -43,11 +41,6 @@ pub const MAX_LEVEL: Level = if cfg!(feature = "trace-exits") {
 } else {
     Level::Info
 };
-
-/// Whether this build prints lines of `level`.
-pub fn enabled(level: Level) -> bool {
-    level <= MAX_LEVEL
-}
 
 /// Exits of one reason printed in full before the rate limit starts. Each
 /// reason in the test guest's run stays well under it (four I/O exits at
