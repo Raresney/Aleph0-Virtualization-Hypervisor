@@ -98,24 +98,27 @@ impl ExitRecord {
     };
 }
 
-/// A field of a record in hexadecimal, or `?` when it could not be read.
-struct Hex(Option<u64>);
-
-impl fmt::Display for Hex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(value) => write!(f, "{value:#x}"),
-            None => f.write_str("?"),
-        }
-    }
+/// A field of a record, or `?` when it could not be read.
+struct Field {
+    value: Option<u64>,
+    /// Hexadecimal; decimal otherwise, for a count.
+    hex: bool,
 }
 
-/// A count in a record, in decimal, or `?` when it could not be read.
-struct Decimal(Option<u64>);
+/// `value` in hexadecimal.
+fn hex(value: Option<u64>) -> Field {
+    Field { value, hex: true }
+}
 
-impl fmt::Display for Decimal {
+/// `value`, a count, in decimal.
+fn decimal(value: Option<u64>) -> Field {
+    Field { value, hex: false }
+}
+
+impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
+        match self.value {
+            Some(value) if self.hex => write!(f, "{value:#x}"),
             Some(value) => write!(f, "{value}"),
             None => f.write_str("?"),
         }
@@ -142,11 +145,11 @@ impl fmt::Display for ExitRecord {
         write!(
             f,
             " rip={} len={} qual={} info={} vectoring={} rax={rax:#x} rbx={rbx:#x} rcx={rcx:#x} rdx={rdx:#x} -> {:x?}",
-            Hex(self.rip),
-            Decimal(self.length),
-            Hex(self.qualification),
-            Hex(self.interruption_info.map(u64::from)),
-            Hex(self.idt_vectoring_info.map(u64::from)),
+            hex(self.rip),
+            decimal(self.length),
+            hex(self.qualification),
+            hex(self.interruption_info.map(u64::from)),
+            hex(self.idt_vectoring_info.map(u64::from)),
             self.event,
         )
     }
