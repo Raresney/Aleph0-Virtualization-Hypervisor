@@ -165,20 +165,10 @@ pub(super) fn host_environment(host: &HostEnvironment, firmware_cr3: u64) {
         host.tss_base(),
         host.idt_base(),
     );
-    let [nmi, double_fault, machine_check] =
-        InterruptStack::ALL.map(|stack| (stack.name(), stack.ist(), host.interrupt_stack_top(stack)));
-    log!(
-        "Host interrupt stacks: {} IST{} top={:#018x}, {} IST{} top={:#018x}, {} IST{} top={:#018x}.",
-        nmi.0,
-        nmi.1,
-        nmi.2,
-        double_fault.0,
-        double_fault.1,
-        double_fault.2,
-        machine_check.0,
-        machine_check.1,
-        machine_check.2,
-    );
+    for stack in InterruptStack::ALL {
+        let (name, ist, top) = (stack.name(), stack.ist(), host.interrupt_stack_top(stack));
+        log!("Host interrupt stack: {name} IST{ist} top={top:#018x}.");
+    }
 }
 
 /// A run's type for the report: its name, or "mixed" for blocks whose pages

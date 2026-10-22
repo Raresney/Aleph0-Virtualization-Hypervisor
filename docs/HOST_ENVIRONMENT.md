@@ -7,7 +7,7 @@ borrows the firmware's, and how NMIs and faults that arrive in root
 operation are handled.
 
 Code: `src/vmx/host/` (`mod.rs`, `page_tables.rs`, `gdt.rs`, `idt.rs`,
-`handlers.rs`), the TSS in `src/vmx/host_tables.rs`, the NMI fold in
+`handlers.rs`), the TSS in `src/vmx/context_tables.rs`, the NMI fold in
 `src/vmx/exit_decision/mod.rs`, and teardown in `src/bring_up/teardown.rs`.
 Issue #22.
 
@@ -32,7 +32,7 @@ and never freed:
 | HOST_IDTR_BASE | Aleph0's IDT, 256 gates (section 5) |
 
 Only VM exits load them. Bring-up and the test guest keep running on the
-firmware's page tables and IDT and on the GDT copy (`host_tables.rs`), and
+firmware's page tables and IDT and on the GDT copy (`context_tables.rs`), and
 teardown switches back to the firmware's (section 7).
 
 The pages still come from `page.rs` (`LOADER_DATA`). Moving them to memory
@@ -229,7 +229,9 @@ On Hyper-V, bring-up prints the environment before VMXON:
 ```text
 Host page tables: identity 0x0..0x80000000 (2 GiB), 1 GiB pages, 2 table pages; HOST_CR3=0x... (firmware CR3=0x4401000).
 Host GDT at 0x... (limit 0x003f): code 0x0028, data 0x0008, TSS 0x0030 at 0x...; IDT at 0x... (256 gates).
-Host interrupt stacks: NMI IST1 top=0x..., #DF IST2 top=0x..., #MC IST3 top=0x....
+Host interrupt stack: NMI IST1 top=0x....
+Host interrupt stack: #DF IST2 top=0x....
+Host interrupt stack: #MC IST3 top=0x....
 ```
 
 Two test-only Cargo features, off by default, exercise the handlers
