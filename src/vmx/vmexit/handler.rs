@@ -17,8 +17,8 @@ use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_IO_INSTRUCTION,
     Emulation, EmulationCounts, EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
-    InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, cpuid_policy, decide, exit_reason_name, is_canonical_48,
-    merge_in,
+    InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, after_skipped_instruction, cpuid_policy, decide,
+    exit_reason_name, is_canonical_48, merge_in,
 };
 use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
@@ -44,6 +44,7 @@ static EMULATED_RDMSR: AtomicU32 = AtomicU32::new(0);
 static EMULATED_WRMSR: AtomicU32 = AtomicU32::new(0);
 static EMULATED_IN: AtomicU32 = AtomicU32::new(0);
 static EMULATED_OUT: AtomicU32 = AtomicU32::new(0);
+static EMULATED_HLT: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
@@ -58,6 +59,7 @@ fn load_state() -> ExitState {
             wrmsr: EMULATED_WRMSR.load(Ordering::Relaxed),
             io_in: EMULATED_IN.load(Ordering::Relaxed),
             io_out: EMULATED_OUT.load(Ordering::Relaxed),
+            hlt: EMULATED_HLT.load(Ordering::Relaxed),
         },
     }
 }
@@ -73,6 +75,7 @@ fn store_state(state: ExitState) {
     EMULATED_WRMSR.store(state.emulated.wrmsr, Ordering::Relaxed);
     EMULATED_IN.store(state.emulated.io_in, Ordering::Relaxed);
     EMULATED_OUT.store(state.emulated.io_out, Ordering::Relaxed);
+    EMULATED_HLT.store(state.emulated.hlt, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -262,7 +265,7 @@ fn judge(exit: Option<ExitInfo>) -> (ExitEvent, ExitState) {
 /// state after the exit. Returns what the entry stub should do.
 fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut RegisterFrame) -> ExitAction {
     let action = match event.action() {
-        ExitAction::Resume(plan) => match prepare_resume(number, read.rip, read.length, plan, read.protected, frame) {
+        ExitAction::Resume(plan) => match prepare_resume(number, read, plan, frame) {
             Some(resumed) => {
                 report_event(number, event, read.exit, next, Some(resumed));
                 ExitAction::Resume(plan)
@@ -388,18 +391,19 @@ pub(super) struct Resumed {
 }
 
 /// Prepares the VMCS (and EPT) as `plan` says: executes the emulated
-/// instruction into `frame`, moves GUEST_RIP past the exiting instruction,
-/// queues an NMI or an exception for injection at the next VM entry, turns
-/// NMI-window exiting on or off, and makes `protected` writable. Returns how the guest
-/// resumes, or `None` after printing why it cannot.
-fn prepare_resume(
-    number: u64,
-    rip: Option<u64>,
-    length: Option<u64>,
-    plan: ResumePlan,
-    protected: Option<ProtectedPage>,
-    frame: &mut RegisterFrame,
-) -> Option<Resumed> {
+/// instruction into `frame`, moves GUEST_RIP past the exiting instruction
+/// and ends an STI or MOV SS shadow, queues an NMI or an exception for
+/// injection at the next VM entry, turns NMI-window exiting on or off, and
+/// makes the protected page writable. Returns how the guest resumes, or
+/// `None` after printing why it cannot.
+fn prepare_resume(number: u64, read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) -> Option<Resumed> {
+    let ExitRead {
+        rip,
+        length,
+        protected,
+        exit,
+        ..
+    } = *read;
     let ResumePlan {
         advance_rip,
         inject_nmi,
@@ -440,6 +444,21 @@ fn prepare_resume(
         // current.
         if let Err(error) = unsafe { vmcs::vmwrite(GUEST_RIP, next) } {
             crate::serial_println!("{tag} VM exit #{number}: could not advance guest RIP ({error:?}); not resuming.");
+            return None;
+        }
+        // `exit` is always read here: `decide` only plans a resume for an
+        // exit it could judge. Written only when a shadow was set, so most
+        // exits pay nothing.
+        let interruptibility = exit.map_or(0, |exit| exit.interruptibility);
+        let cleared = after_skipped_instruction(interruptibility);
+        if cleared != interruptibility
+            // SAFETY: exit context: VMX root operation, with the guest's VMCS
+            // current.
+            && let Err(error) = unsafe { vmcs::vmwrite(GUEST_INTERRUPTIBILITY_STATE, cleared.into()) }
+        {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: could not end the guest's STI/MOV SS blocking ({error:?}); not resuming."
+            );
             return None;
         }
         next

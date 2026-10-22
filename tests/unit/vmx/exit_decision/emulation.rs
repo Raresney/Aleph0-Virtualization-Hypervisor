@@ -81,8 +81,9 @@ fn counts_display_names_each_instruction() {
         wrmsr: 3,
         io_in: 4,
         io_out: 5,
+        hlt: 6,
     };
-    assert_eq!(counts.to_string(), "cpuid=1 rdmsr=2 wrmsr=3 in=4 out=5");
+    assert_eq!(counts.to_string(), "cpuid=1 rdmsr=2 wrmsr=3 in=4 out=5 hlt=6");
 }
 
 const KERNEL_GS_BASE: u32 = 0xC000_0102;

@@ -30,6 +30,8 @@ pub const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
 /// blocking, so an injected NMI blocks further ones until the guest's IRET.
 /// Requires NMI exiting.
 pub const PIN_BASED_VIRTUAL_NMIS: u32 = 1 << 5;
+/// Primary processor-based control bit 7: HLT causes a VM exit (reason 12).
+pub const CPU_BASED_HLT_EXITING: u32 = 1 << 7;
 /// Primary processor-based control bit 22: a VM exit (reason 8) as soon as
 /// the guest can take an NMI. Requires virtual NMIs.
 pub const CPU_BASED_NMI_WINDOW_EXITING: u32 = 1 << 22;
