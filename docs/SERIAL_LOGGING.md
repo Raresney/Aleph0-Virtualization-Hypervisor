@@ -223,13 +223,19 @@ can run in the VM-exit handler.**
 ### Hyper-V
 
 `scripts/run-hyperv.ps1` attaches COM1 to the named pipe `\\.\pipe\aleph0-com1`,
-starts the VM, opens the video console, and then runs `scripts/read-serial.ps1`.
-That script connects to the pipe and prints every line in your PowerShell
-window, while also saving it to `run\serial.log`. It exits when the VM turns
-off.
+starts `scripts/read-serial.ps1` as a background job, waits until it is
+waiting for the pipe, and only then starts the VM and opens the video
+console. The reader connects as soon as `Start-VM` creates the pipe, prints
+every line in your PowerShell window, and saves it to `run\serial.log`
+through one open file writer. It exits when the VM turns off.
 
 - Hyper-V drops serial output written while nothing is connected to the
-  pipe, which is why the reader connects right after `Start-VM`.
+  pipe, and `Start-VM` can return after Aleph0 has printed its first lines,
+  which is why the reader is already waiting when the VM starts. Logs used
+  to lose their first lines when the reader connected after `Start-VM`, and
+  once a line mid-run while it opened the log file for every line.
+- Ctrl+C stops the streaming in the window; the reader job itself ends when
+  the VM turns off.
 - To reattach to a VM that is already running, run `.\scripts\read-serial.ps1`.
   Lines sent before you connected are lost.
 - `-NoSerial` skips the reader (COM1 is still attached). You can also

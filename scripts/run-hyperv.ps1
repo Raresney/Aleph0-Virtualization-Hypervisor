@@ -64,6 +64,19 @@ if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
     Write-Error "Hyper-V role not installed. Run: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All"
     exit 1
 }
+# The script turns the VM off hard and replaces its disks, so it must only
+# ever touch its own VM. Its disks live in run\: the ESP, and the
+# differencing disk Hyper-V makes from it for a checkpoint.
+$existingVm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+if ($existingVm) {
+    $foreignDisks = Get-VMHardDiskDrive -VMName $VMName |
+        Where-Object { -not "$($_.Path)".StartsWith("$runDir\", [System.StringComparison]::OrdinalIgnoreCase) }
+    if ($foreignDisks) {
+        Write-Error ("VM '$VMName' has disks outside ${runDir}: $(($foreignDisks | ForEach-Object Path) -join ', '). " +
+            "Refusing to turn it off and reconfigure it; pass another -VMName.")
+        exit 1
+    }
+}
 # The NMI job triggers on a serial line; without the serial stream nothing
 # writes serial.log, so the NMI would never be injected.
 if ($InjectNmi -and $NoSerial) {
@@ -186,14 +199,34 @@ if ($InjectNmi) {
     }
 }
 
+# 6. Stream COM1, with the reader waiting before the VM starts: Hyper-V
+#    drops serial output written while no client is attached, and Start-VM
+#    can return after Aleph0 has already printed its first lines. The reader
+#    runs as a job (in its own process, with this session's elevation) and
+#    connects as soon as Start-VM creates the pipe. Ctrl+C stops the
+#    streaming here; the job itself ends when the VM turns off.
+$serialJob = $null
+if (-not $NoSerial) {
+    $serialJob = Start-Job -ArgumentList (Join-Path $PSScriptRoot "read-serial.ps1"), $PipeName -ScriptBlock {
+        param($readerScript, $pipeName)
+        & $readerScript -PipeName $pipeName
+    }
+    # Its first output is the "Waiting for" line, printed right before it
+    # starts connecting.
+    $readyDeadline = (Get-Date).AddSeconds(30)
+    while ($serialJob.ChildJobs[0].Information.Count -eq 0 -and
+           $serialJob.State -in 'NotStarted', 'Running' -and
+           (Get-Date) -lt $readyDeadline) {
+        Start-Sleep -Milliseconds 50
+    }
+}
+
 Write-Host "==> Starting $VMName" -ForegroundColor Cyan
 Start-VM -Name $VMName
 vmconnect.exe localhost $VMName
 
-# 6. Stream COM1. Connect immediately: Hyper-V drops serial output written
-#    while no client is attached, and the firmware reaches our code in seconds.
-if (-not $NoSerial) {
-    & (Join-Path $PSScriptRoot "read-serial.ps1") -PipeName $PipeName
+if ($serialJob) {
+    Receive-Job -Job $serialJob -Wait -AutoRemoveJob
 }
 
 if ($nmiJob) {
