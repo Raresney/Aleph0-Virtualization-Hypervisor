@@ -372,7 +372,8 @@ pub const fn io_bit(port: u16) -> (IoBitmap, usize, u8) {
 
 The bit of port *p* is bit `p % 8` of byte `(p & 0x7FFF) / 8` in its page.
 Aleph0 intercepts one port, `0x3FF`, the COM1 scratch register (base `0x3F8`
-+ 7): a byte with no effect on the UART that `serial.rs` never uses. It is
++ 7): a byte with no effect on the UART. COM1 is the guest's; Aleph0 prints
+on COM2. It is
 bit 7 of byte `0x7F` in page A. `write_to_vmcs` writes the pages' addresses
 to `IO_BITMAP_A` (`0x2000`) and `IO_BITMAP_B` (`0x2002`).
 
@@ -385,9 +386,10 @@ against `INTERCEPTED_PORTS`: it passes through the port and size from the
 exit qualification, as the guest would have done itself. This is a known
 property, not a bug in the test: a 4-byte access at `0x3FC` exits, and
 Aleph0 then reaches the real COM1 registers `0x3FC` to `0x3FF` (modem
-control, line status, modem status and scratch), including the ones the
-serial driver uses. The test guest never does that. It is a decision for
-the OS-guest step (section 8).
+control, line status, modem status and scratch): the guest's own UART,
+which it could reach without Aleph0 anyway. Aleph0's serial driver is on
+COM2, out of reach of this rule. The test guest never does that. It is a
+decision for the OS-guest step (section 8).
 
 ### The exit qualification
 
@@ -686,7 +688,7 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
   bitmap's ranges and every other port reaches the hardware without Aleph0
   seeing it (MSRs outside the ranges get a #GP, section 4). The
   multi-port rule (section 5) also lets a wide access that touches `0x3FF`
-  reach its neighbours, the serial driver's registers.
+  reach its neighbours, COM1's other registers, which are the guest's.
 - **The #GP and #UD paths are tested on the host only.** They are
   delivered through the guest's own IDT, which in the test guest has only
   vector 2, so they would find no gate. The test guest never triggers them.

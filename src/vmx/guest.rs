@@ -79,9 +79,9 @@ pub const GUEST_DATA_SEED: u32 = 0xDA7A;
 pub const GUEST_EPT_VALUE: u32 = 0x0045_5054;
 
 /// The I/O port the guest reads and writes through Aleph0: the COM1 scratch
-/// register (base + 7), a byte with no effect on the UART, which
-/// `serial.rs` never uses.
-pub const GUEST_SCRATCH_PORT: u16 = crate::serial::COM1 + 7;
+/// register (base + 7), a byte with no effect on the UART. COM1 is the
+/// guest's; Aleph0 prints on COM2.
+pub const GUEST_SCRATCH_PORT: u16 = crate::serial::SerialPort::COM1.base() + 7;
 
 /// Value the guest writes to IA32_KERNEL_GS_BASE through Aleph0 and reads
 /// back: canonical (bits 63:47 equal), so WRMSR accepts it. The guest puts

@@ -68,8 +68,9 @@ compiled into the `.efi`.
 ```
 
 This turns off and reconfigures the `Aleph0Test` VM and recreates its ESP disk
-under `run/`; keep nothing important there. It then streams the VM's COM1
-serial output into the PowerShell window and `run\serial.log`
+under `run/`; keep nothing important there. It then streams Aleph0's serial
+output (COM2) into the PowerShell window and `run\serial.log`, and saves the
+guest's COM1 to `run\guest-serial.log`
 (`-NoSerial` skips this; `.\scripts\read-serial.ps1` reattaches later). VM-exit
 diagnostics only appear there, not on the VM console. See
 [docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md). `-InjectNmi` sends the
@@ -89,7 +90,7 @@ diagnostics that run before VMXON.
 | `src/main.rs` | UEFI entry point and the `log!` macro |
 | `src/bring_up/` | The bring-up sequence (`mod.rs`), its errors (`error.rs`), status lines (`report.rs`) and the return to firmware (`teardown.rs`) |
 | `src/output.rs` | Output phases and the firmware-free panic handler |
-| `src/serial.rs` | COM1 serial logger usable without firmware |
+| `src/serial.rs` | Serial logger usable without firmware, on COM2 (`SerialPort`); COM1 is left to the guest |
 | `src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
 | `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |

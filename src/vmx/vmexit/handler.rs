@@ -422,8 +422,8 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome 
             // SAFETY: the guest asked for exactly this access, which it could
             // have made without Aleph0, and IN/OUT at CPL 0 in root operation
             // cannot fault. A 2- or 4-byte access at 0x3FC-0x3FE also touches
-            // 0x3FF, so it exits and passes through to the UART registers at
-            // 0x3FC-0x3FE, which serial.rs uses (docs/EMULATED_EXITS.md
+            // 0x3FF, so it exits and passes through to COM1's registers at
+            // 0x3FC-0x3FE, the guest's own UART (docs/EMULATED_EXITS.md
             // section 5).
             let value = unsafe {
                 match size {

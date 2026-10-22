@@ -42,7 +42,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         halt_forever();
     }
 
-    // Serial first: it needs no firmware, so the message is already on COM1
+    // Serial first: it needs no firmware, so the message is already on serial
     // if the console call below hangs or faults. `PanicInfo`'s `Display`
     // prints "panicked at FILE:LINE:COL:" followed by the message.
     crate::serial_println!("{} PANIC: {info}", crate::TAG);

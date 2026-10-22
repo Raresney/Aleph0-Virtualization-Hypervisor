@@ -29,6 +29,7 @@ $ovmfCode  = Join-Path $ovmfDir "OVMF_CODE.fd"
 $ovmfVarsTemplate = Join-Path $ovmfDir "OVMF_VARS.fd"
 $runDir    = Join-Path $root "run"
 $ovmfVars  = Join-Path $runDir "OVMF_VARS.fd"
+$guestSerialLog = Join-Path $runDir "guest-serial.log"
 
 # 1. Build
 Write-Host "==> cargo build $(if ($Release) { '--release' })" -ForegroundColor Cyan
@@ -88,12 +89,15 @@ if ($qemuExe) {
     }
 }
 
-# 5. Launch QEMU
-Write-Host "==> Starting QEMU ($qemuExe)" -ForegroundColor Cyan
+# 5. Launch QEMU. The first -serial is COM1, the second COM2: Aleph0's
+#    output (COM2) goes to this terminal, and COM1, where OVMF mirrors its
+#    own console, to run\guest-serial.log, so each line shows up once.
+Write-Host "==> Starting QEMU ($qemuExe); COM1 -> $guestSerialLog" -ForegroundColor Cyan
 & $qemuExe `
     -drive "if=pflash,format=raw,readonly=on,file=$ovmfCode" `
     -drive "if=pflash,format=raw,file=$ovmfVars" `
     -drive "format=raw,file=fat:rw:$espDir" `
     -net none `
+    -serial "file:$guestSerialLog" `
     -serial stdio `
     -machine q35

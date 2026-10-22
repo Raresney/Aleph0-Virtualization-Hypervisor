@@ -249,7 +249,8 @@ Then the hypervisor does what the device would have done:
 3. Advance guest RIP by `VM_EXIT_INSTRUCTION_LEN` so the guest continues
    after the `in`/`out`, then `VMRESUME`.
 
-This is exactly what Hyper-V does when Aleph0 writes to COM1; see
+This is exactly what Hyper-V does when Aleph0 writes to COM2, its serial
+port; see
 [SERIAL_LOGGING.md](SERIAL_LOGGING.md#where-this-goes-next).
 
 ### Nested: who handles the exit
@@ -268,8 +269,8 @@ handles it itself, against its own emulated devices.
 | `0x60`, `0x64` | PS/2 keyboard controller (data, status/command) |
 | `0x70`–`0x71` | CMOS / real-time clock (index, data) |
 | `0x80` | POST diagnostic code; writes are also used as a tiny delay |
-| `0x2F8`–`0x2FF` | COM2 |
-| `0x3F8`–`0x3FF` | **COM1**, Aleph0's serial log |
+| `0x2F8`–`0x2FF` | **COM2**, Aleph0's serial log |
+| `0x3F8`–`0x3FF` | **COM1**, the guest's; Aleph0 intercepts its scratch register `0x3FF` |
 | `0xCF8`, `0xCFC` | PCI configuration address and data |
 | `0xE9` | "debugcon": Bochs, and QEMU started with `-debugcon`, print any byte written here (not Hyper-V) |
 
