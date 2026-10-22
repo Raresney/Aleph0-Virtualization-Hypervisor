@@ -223,6 +223,11 @@ impl InterruptionInfo {
         self.is_valid() && (self.0 >> 8) & 0b111 == Self::TYPE_NMI && self.vector() == Some(NMI_VECTOR)
     }
 
+    /// Whether VM entry also delivers VM_ENTRY_EXCEPTION_ERROR_CODE (bit 11).
+    pub fn delivers_error_code(self) -> bool {
+        self.0 & Self::DELIVER_ERROR_CODE != 0
+    }
+
     /// The vector (bits 7:0), if the field is valid.
     pub fn vector(self) -> Option<u8> {
         self.is_valid().then_some(self.0 as u8)
@@ -337,9 +342,9 @@ pub struct ResumePlan {
     /// Execute this instruction for the guest and put its result in the
     /// guest's registers, before RIP moves past it.
     pub emulate: Option<Emulation>,
-    /// Write [`InterruptionInfo::GENERAL_PROTECTION`] (error code 0) to
-    /// VM_ENTRY_INTERRUPTION_INFO.
-    pub inject_gp: bool,
+    /// Write this exception to VM_ENTRY_INTERRUPTION_INFO, with error code 0
+    /// when it delivers one. RIP stays on the faulting instruction.
+    pub inject_exception: Option<InterruptionInfo>,
 }
 
 impl ResumePlan {
@@ -350,7 +355,7 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: false,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -362,7 +367,7 @@ impl ResumePlan {
         nmi_window: Some(false),
         grant_write: false,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -372,7 +377,7 @@ impl ResumePlan {
         nmi_window: Some(true),
         grant_write: false,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -382,7 +387,7 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: true,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Inject #GP(0); RIP stays on the faulting instruction, as for any
     /// fault.
@@ -392,7 +397,7 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: false,
         emulate: None,
-        inject_gp: true,
+        inject_exception: Some(InterruptionInfo::GENERAL_PROTECTION),
     };
 }
 

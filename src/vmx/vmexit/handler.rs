@@ -389,7 +389,7 @@ pub(super) struct Resumed {
 
 /// Prepares the VMCS (and EPT) as `plan` says: executes the emulated
 /// instruction into `frame`, moves GUEST_RIP past the exiting instruction,
-/// queues an NMI or a #GP(0) for injection at the next VM entry, turns
+/// queues an NMI or an exception for injection at the next VM entry, turns
 /// NMI-window exiting on or off, and makes `protected` writable. Returns how the guest
 /// resumes, or `None` after printing why it cannot.
 fn prepare_resume(
@@ -406,7 +406,7 @@ fn prepare_resume(
         nmi_window,
         grant_write,
         emulate,
-        inject_gp,
+        inject_exception,
     } = plan;
     let tag = crate::TAG;
     let Some(rip) = rip else {
@@ -461,12 +461,14 @@ fn prepare_resume(
         );
         return None;
     }
-    if inject_gp
+    if let Some(exception) = inject_exception
         // SAFETY: exit context: VMX root operation, with the guest's VMCS
         // current.
-        && let Err(error) = unsafe { queue_general_protection() }
+        && let Err(error) = unsafe { queue_exception(exception) }
     {
-        crate::serial_println!("{tag} VM exit #{number}: could not queue #GP for injection ({error:?}); not resuming.");
+        crate::serial_println!(
+            "{tag} VM exit #{number}: could not queue the exception for injection ({error:?}); not resuming."
+        );
         return None;
     }
     if let Some(on) = nmi_window
@@ -508,20 +510,20 @@ fn prepare_resume(
     })
 }
 
-/// Queues #GP(0) for the next VM entry, delivered through the guest's own
-/// IDT at the instruction RIP points to.
+/// Queues `exception` for the next VM entry, with error code 0 if it
+/// delivers one, through the guest's own IDT at the instruction RIP points
+/// to.
 ///
 /// # Safety
 ///
 /// VMX root operation with the guest's VMCS current.
-unsafe fn queue_general_protection() -> Result<(), VmcsError> {
+unsafe fn queue_exception(exception: InterruptionInfo) -> Result<(), VmcsError> {
     // SAFETY: the caller guarantees VMX root operation with a current VMCS.
     unsafe {
-        vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
-        vmcs::vmwrite(
-            VM_ENTRY_INTERRUPTION_INFO,
-            InterruptionInfo::GENERAL_PROTECTION.0.into(),
-        )
+        if exception.delivers_error_code() {
+            vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
+        }
+        vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, exception.0.into())
     }
 }
 

@@ -505,7 +505,7 @@ fn each_event_maps_to_its_action() {
             nmi_window,
             grant_write,
             emulate: None,
-            inject_gp: false,
+            inject_exception: None,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
