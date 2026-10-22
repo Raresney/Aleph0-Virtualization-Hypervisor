@@ -62,9 +62,10 @@ pub const GUEST_NMI_MARKER: u32 = 0x004E_4D49;
 
 /// Rounds of the guest's wait loop (test, pause, decrement) before it gives
 /// up waiting for an NMI. PAUSE takes a different number of cycles on each
-/// CPU generation, so the Hyper-V runs measure the real time: 0x20000000
-/// rounds took about 65 s, so this is about 8 s. The `-InjectNmi` NMI
-/// arrived after about 15.5 million rounds, a quarter of this.
+/// CPU, and its speed varied threefold between Hyper-V runs: 0x20000000
+/// rounds once took about 65 s, these 0x04000000 at most about 2.5 s. The
+/// `-InjectNmi` NMI arrived after 15.5 and 18.8 million rounds, under a
+/// third of this.
 pub const GUEST_WAIT_ITERATIONS: u32 = 0x0400_0000;
 
 /// Value Aleph0 writes at the start of the guest data page before launch.
