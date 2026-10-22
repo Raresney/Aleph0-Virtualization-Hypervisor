@@ -300,6 +300,23 @@ pub struct ExitState {
     pub emulated: EmulationCounts,
 }
 
+impl ExitState {
+    /// The state once an NMI that arrived while Aleph0 ran in root operation
+    /// (`arrived`) is folded in: pending for the guest, like an NMI the guest
+    /// could not take yet. The exit's own handler then decides with it, so
+    /// an NMI-window exit injects it, and every other exit keeps it waiting
+    /// for the window ([`ResumePlan::keeping_pending_nmi`]).
+    ///
+    /// At most one NMI waits, as on real hardware: an NMI arriving while one
+    /// is pending is the same pending NMI.
+    pub fn with_host_nmi(self, arrived: bool) -> Self {
+        Self {
+            nmi_pending: self.nmi_pending || arrived,
+            ..self
+        }
+    }
+}
+
 /// What an exit turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitEvent {
@@ -427,6 +444,24 @@ impl ResumePlan {
         inject_exception: Some(InterruptionInfo::INVALID_OPCODE),
         ..Self::INJECT_GP
     };
+}
+
+impl ResumePlan {
+    /// This plan, with NMI-window exiting turned on if an NMI is still
+    /// pending after the exit (`next`). Without that, an NMI folded in by
+    /// [`ExitState::with_host_nmi`] at an exit that does not handle NMIs
+    /// would wait until some unrelated exit came along. Plans that inject an
+    /// NMI leave nothing pending, so they keep turning the window off.
+    pub fn keeping_pending_nmi(self, next: ExitState) -> Self {
+        if next.nmi_pending {
+            Self {
+                nmi_window: Some(true),
+                ..self
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// GUEST_INTERRUPTIBILITY_STATE after Aleph0 skips the instruction the guest

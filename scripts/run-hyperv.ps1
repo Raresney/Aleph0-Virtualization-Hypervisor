@@ -25,6 +25,12 @@
     Gives the VM one vCPU and, as soon as serial shows the guest resumed
     after its first VMCALL, injects an NMI with Debug-VM. Tests NMI exiting
     and reinjection; the result appears on serial.
+
+.PARAMETER Features
+    Cargo features to build with, comma-separated, for the test-only
+    switches in Cargo.toml: host-fault-test (the exit handler faults on
+    purpose) or host-nmi-test (with -InjectNmi, the NMI arrives while Aleph0
+    runs in VMX root operation).
 #>
 param(
     [string]$VMName   = "Aleph0Test",
@@ -32,7 +38,8 @@ param(
     [switch]$Release,
     [string]$PipeName = "aleph0-com1",
     [switch]$NoSerial,
-    [switch]$InjectNmi
+    [switch]$InjectNmi,
+    [string]$Features = ""
 )
 
 # See run.ps1 for why $ErrorActionPreference is not set to "Stop" globally.
@@ -65,9 +72,12 @@ if ($InjectNmi -and $NoSerial) {
 }
 
 # 1. Build
-Write-Host "==> cargo build $(if ($Release) { '--release' })" -ForegroundColor Cyan
+$cargoArgs = @("build")
+if ($Release) { $cargoArgs += "--release" }
+if ($Features) { $cargoArgs += @("--features", $Features) }
+Write-Host "==> cargo $($cargoArgs -join ' ')" -ForegroundColor Cyan
 Push-Location $root
-if ($Release) { cargo build --release } else { cargo build }
+cargo @cargoArgs
 $buildExit = $LASTEXITCODE
 Pop-Location
 if ($buildExit -ne 0) {

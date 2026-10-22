@@ -1,6 +1,7 @@
 //! Access to the x86 control registers (CRx) needed for VMX host state.
 //!
 //! CR0 controls basic execution modes, including protected mode and paging.
+//! CR2 holds the linear address of the last page fault.
 //! CR3 selects the current page-table root (and can carry PCID information).
 //! CR4 enables additional CPU features, including VMX through CR4.VMXE.
 //! On VM exit, the CPU loads host CR0, CR3, and CR4 from the VMCS, so those
@@ -52,7 +53,8 @@ macro_rules! control_register {
 }
 
 control_register!(read_cr0, write_cr0, "cr0");
-control_register!(read_cr3, "cr3");
+control_register!(read_cr2, "cr2");
+control_register!(read_cr3, write_cr3, "cr3");
 control_register!(read_cr4, write_cr4, "cr4");
 
 /// Sets CR4.VMXE, leaving every other bit untouched.

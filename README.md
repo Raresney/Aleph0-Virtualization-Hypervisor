@@ -72,7 +72,10 @@ under `run/`; keep nothing important there. It then streams the VM's COM1
 serial output into the PowerShell window and `run\serial.log`
 (`-NoSerial` skips this; `.\scripts\read-serial.ps1` reattaches later). VM-exit
 diagnostics only appear there, not on the VM console. See
-[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md).
+[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md). `-InjectNmi` sends the
+guest an NMI after its first VMCALL, and `-Features` builds with the
+test-only switches in `Cargo.toml` (`host-fault-test`, `host-nmi-test`; see
+[docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8).
 
 **QEMU + OVMF (no VMX):** put `OVMF_CODE.fd` and `OVMF_VARS.fd` from
 [rust-osdev/ovmf-prebuilt](https://github.com/rust-osdev/ovmf-prebuilt) in
@@ -89,7 +92,8 @@ diagnostics that run before VMXON.
 | `src/serial.rs` | COM1 serial logger usable without firmware |
 | `src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
-| `src/vmx/host_tables.rs`, `segment.rs` | Host GDT/TSS setup and segmentation state |
+| `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
+| `src/vmx/host/` | What VMX root operation runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
@@ -103,7 +107,7 @@ diagnostics that run before VMXON.
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
-| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [MTRR.md](docs/MTRR.md) (memory types, the MTRRs and how EPT entries get them), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation) |
+| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [MTRR.md](docs/MTRR.md) (memory types, the MTRRs and how EPT entries get them), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation), [HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) (the page tables, GDT, TSS and IDT VM exits load, and NMIs in root operation) |
 
 ## Contributing
 

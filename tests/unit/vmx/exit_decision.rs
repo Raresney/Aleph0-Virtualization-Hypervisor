@@ -811,3 +811,79 @@ fn io_exit_is_dispatched_to_emulation() {
         })
     );
 }
+
+#[test]
+fn an_nmi_from_root_operation_becomes_pending() {
+    assert_eq!(START.with_host_nmi(false), START);
+    assert_eq!(
+        START.with_host_nmi(true),
+        ExitState {
+            nmi_pending: true,
+            ..START
+        }
+    );
+    // NMIs do not queue: one already pending stays the only one.
+    let pending = START.with_host_nmi(true);
+    assert_eq!(pending.with_host_nmi(true), pending);
+}
+
+#[test]
+fn a_pending_nmi_keeps_the_nmi_window_on() {
+    let pending = ExitState {
+        nmi_pending: true,
+        ..WAITING
+    };
+    assert_eq!(
+        ResumePlan::PAST_INSTRUCTION.keeping_pending_nmi(pending),
+        ResumePlan {
+            nmi_window: Some(true),
+            ..ResumePlan::PAST_INSTRUCTION
+        }
+    );
+    // An injected #GP leaves the NMI waiting for the window too.
+    assert_eq!(
+        ResumePlan::INJECT_GP.keeping_pending_nmi(pending).nmi_window,
+        Some(true)
+    );
+}
+
+#[test]
+fn without_a_pending_nmi_the_plan_is_unchanged() {
+    for plan in [
+        ResumePlan::PAST_INSTRUCTION,
+        ResumePlan::INJECT_NMI,
+        ResumePlan::RETRY_AFTER_GRANT,
+    ] {
+        assert_eq!(plan.keeping_pending_nmi(WAITING), plan);
+    }
+}
+
+#[test]
+fn an_nmi_in_root_operation_at_vmcall_1_reaches_the_guest() {
+    // Main VMCALL #1, with an NMI that arrived while Aleph0 handled the EPT
+    // violation before it.
+    let (event, state) = decide(WRITTEN.with_host_nmi(true), vmcall(MARKER));
+    assert_eq!(event, ExitEvent::MainVmcall);
+    assert!(state.nmi_pending);
+    let plan = match event.action() {
+        ExitAction::Resume(plan) => plan.keeping_pending_nmi(state),
+        action => panic!("main VMCALL #1 resumes, not {action:?}"),
+    };
+    assert_eq!(plan.nmi_window, Some(true));
+
+    // The guest can take it at once: the NMI-window exit injects it, and
+    // the run ends as one with a reinjected NMI does.
+    let mut state = state;
+    let mut event = ExitEvent::Unexpected;
+    for exit in [exit(EXIT_REASON_NMI_WINDOW), vmcall(NMI_MARKER), vmcall(MARKER + 1)] {
+        (event, state) = decide(state, exit);
+        if exit.reason.basic == EXIT_REASON_NMI_WINDOW {
+            assert_eq!(event, ExitEvent::NmiWindowInjected);
+        }
+    }
+    assert_eq!(event, ExitEvent::LastMainVmcall);
+    assert_eq!(
+        (state.nmis_injected, state.nmis_handled, state.nmi_pending),
+        (1, 1, false)
+    );
+}

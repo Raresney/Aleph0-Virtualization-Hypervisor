@@ -8,14 +8,16 @@ use crate::vmx;
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
+use crate::vmx::host::{HostEnvironment, InterruptStack};
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::mtrr::{MemoryType, Mtrrs};
 
-/// Prints the segmentation state that will go into the VMCS host fields.
+/// Prints the segmentation state of the context tables, which the guest
+/// state copies and the host GDT keeps the selectors of.
 ///
-/// TR is the one to watch: VM entry rejects a host TR selector of 0.
+/// TR is the one to watch: VM entry rejects an unusable guest TR.
 pub(super) fn segment_state() {
-    // SAFETY: the host GDT is live (activated by bring-up, never freed), and
+    // SAFETY: the context GDT is live (activated by bring-up, never freed), and
     // UEFI runs in long mode.
     let state = unsafe { vmx::segment::read_all() };
 
@@ -136,6 +138,36 @@ pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
     );
     for run in ept.region_runs() {
         log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
+    }
+}
+
+/// Prints what VMX root operation will run on: the host page tables next to
+/// the firmware's CR3 they replace, the GDT, TSS and IDT, and the interrupt
+/// stacks.
+pub(super) fn host_environment(host: &HostEnvironment, firmware_cr3: u64) {
+    let tables = host.page_tables();
+    log!(
+        "Host page tables: identity 0x0..{:#x} ({} GiB), {}, {} table pages; HOST_CR3={:#x} (firmware CR3={firmware_cr3:#x}).",
+        tables.end(),
+        tables.end() >> 30,
+        tables.page_size().name(),
+        tables.table_pages(),
+        tables.cr3(),
+    );
+    let selectors = host.selectors();
+    log!(
+        "Host GDT at {:#018x} (limit {:#06x}): code {:#06x}, data {:#06x}, TSS {:#06x} at {:#018x}; IDT at {:#018x} (256 gates).",
+        host.gdt_base(),
+        host.gdt_limit(),
+        selectors.cs,
+        selectors.ss,
+        selectors.tr,
+        host.tss_base(),
+        host.idt_base(),
+    );
+    for stack in InterruptStack::ALL {
+        let (name, ist, top) = (stack.name(), stack.ist(), host.interrupt_stack_top(stack));
+        log!("Host interrupt stack: {name} IST{ist} top={top:#018x}.");
     }
 }
 

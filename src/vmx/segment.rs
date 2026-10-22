@@ -198,6 +198,38 @@ pub fn descriptor_offset(gdt: &DescriptorTable, selector: u16, size: usize) -> O
     (selector & SELECTOR_TI == 0 && offset != 0 && fits).then_some(offset)
 }
 
+/// Size of one 64-bit IDT gate.
+pub const GATE_SIZE: usize = 16;
+/// Gate byte 5: present (bit 7), DPL 0, type 0xE (64-bit interrupt gate,
+/// which clears RFLAGS.IF on delivery).
+const INTERRUPT_GATE_PRESENT: u8 = 0x8E;
+/// Gate byte 4, bits 2:0: the IST index.
+const GATE_IST_MASK: u8 = 0b111;
+
+/// A 64-bit interrupt gate to `handler` through code segment `selector`:
+/// present, DPL 0, on interrupt stack `ist` (1-7 name the TSS's IST1-IST7;
+/// 0 keeps the stack the CPU is on). Only bits 2:0 of `ist` are encodable.
+///
+/// ```text
+/// bytes 0-1    handler bits 15:0
+/// bytes 2-3    code segment selector
+/// byte  4      bits 2:0: IST index
+/// byte  5      0x8E: present, DPL 0, type 0xE (64-bit interrupt gate)
+/// bytes 6-7    handler bits 31:16
+/// bytes 8-11   handler bits 63:32
+/// bytes 12-15  reserved, 0
+/// ```
+pub fn interrupt_gate(handler: u64, selector: u16, ist: u8) -> [u8; GATE_SIZE] {
+    let mut gate = [0u8; GATE_SIZE];
+    gate[0..2].copy_from_slice(&(handler as u16).to_le_bytes());
+    gate[2..4].copy_from_slice(&selector.to_le_bytes());
+    gate[4] = ist & GATE_IST_MASK;
+    gate[5] = INTERRUPT_GATE_PRESENT;
+    gate[6..8].copy_from_slice(&((handler >> 16) as u16).to_le_bytes());
+    gate[8..12].copy_from_slice(&((handler >> 32) as u32).to_le_bytes());
+    gate
+}
+
 /// Base address in a 16-byte system descriptor (a 64-bit TSS). Bits 31:0
 /// are scattered as in a code/data descriptor; bits 63:32 follow in bytes
 /// 8-11:

@@ -173,12 +173,12 @@ right after `launch()` returns. The order matters:
 
 | # | Step | Why here |
 |---|---|---|
-| 1 | `lgdt` / `lidt` with the firmware's GDTR and IDTR | VM exits left both limits at `0xFFFF`, and the GDT loaded was Aleph0's copy |
+| 1 | CR3, `lgdt` / `lidt` with the firmware's CR3, GDTR and IDTR | VM exits load Aleph0's own page tables, GDT and IDT ([HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md)); CR3 first, before anything can call firmware |
 | 2 | VMCLEAR the VMCS (if one was created) | writes the CPU's cached VMCS data back to memory and makes it not current |
 | 3 | VMXOFF, then CR0/CR4 as they were before VMXON | CR4.VMXE can only be cleared after VMXOFF; clearing it earlier is #GP |
 | 4 | output phase back to `BootServices` | `log!` may use the firmware console again |
 | 5 | STI, only if IF was 1 before VMXON | firmware's timer interrupts come back |
-| 6 | read CR4, GDTR, IDTR, RFLAGS and print them | the `Teardown:` line on serial and console |
+| 6 | read CR4, CR3, GDTR, IDTR, RFLAGS and print them | the `Teardown:` line on serial and console |
 
 Worked example from the Hyper-V run: the guest-state line printed
 `idtr=0x000000007ff2fcd0/0x0fff`, the firmware's IDT. After each VM exit the
@@ -262,9 +262,10 @@ The tail of `run\serial.log` from the clean-stop step, before NMI exiting was ad
 
 > This log predates EPT and the emulated exits. Since then the guest first
 > causes nine emulated exits (CPUID, four MSR, four I/O; see
-> [EMULATED_EXITS.md](EMULATED_EXITS.md)) and one EPT violation, so in a
-> current run its VMCALLs are exits #11 and #12: the numbers are ten higher.
-> The guest RIPs and addresses differ too.
+> [EMULATED_EXITS.md](EMULATED_EXITS.md)), one HLT and one EPT violation, so
+> in a current run its VMCALLs are exits #12 and #13: the numbers are eleven
+> higher. The guest RIPs and addresses differ too. Since #22 the `Teardown:`
+> line also reports `firmware CR3 restored=true`.
 
 ```text
 VM exit #1: guest rip=0x000000007eb0f005 instruction length=3

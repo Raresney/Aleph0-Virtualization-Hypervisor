@@ -13,6 +13,7 @@
 //! on a CPU that doesn't (per CPUID) risks a #GP with no exception handler
 //! installed yet.
 
+pub mod context_tables;
 pub mod cpuid;
 pub mod cr;
 pub mod ept;
@@ -20,7 +21,7 @@ pub mod exit_bitmaps;
 pub mod exit_decision;
 pub mod guest;
 pub mod guest_state;
-pub mod host_tables;
+pub mod host;
 pub mod instruction;
 pub mod msr;
 pub mod mtrr;

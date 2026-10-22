@@ -67,8 +67,9 @@
 //! now. It does not change per address: every lookup starts from the same
 //! CR3 and only takes different rows. An OS gives each process its own tree
 //! and loads that process's CR3 on a switch; VM entry/exit load GUEST_CR3 /
-//! HOST_CR3 from the VMCS. Aleph0 never writes CR3: the UEFI firmware built
-//! the (identity-mapped) tables and loaded CR3 before the `.efi` started.
+//! HOST_CR3 from the VMCS. The UEFI firmware built the (identity-mapped)
+//! tables this walk reads and loaded CR3 before the `.efi` started. VM exits
+//! load Aleph0's own tables instead (`vmx::host`).
 //!
 //! ```text
 //!  63      52 51                     12 11     5  4   3  2  0

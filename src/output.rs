@@ -58,9 +58,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// Stops this CPU permanently, with interrupts disabled.
 ///
-/// Used wherever execution must end without firmware help: today only
-/// after a panic. The VM-exit handler no longer halts; it hands the stop
-/// back to bring-up.
+/// Used wherever execution must end without firmware help: after a panic,
+/// and after an exception in VMX root operation (`vmx::host`). The VM-exit
+/// handler does not halt; it hands a stop back to bring-up.
 ///
 /// * `CLI` clears RFLAGS.IF, so maskable interrupts (timer, devices) are no
 ///   longer delivered. During boot services UEFI runs with interrupts on and
@@ -78,9 +78,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ///
 /// `-> !` ("never") tells the compiler this function does not return, which
 /// is what lets the panic handler end with a call to it.
-///
-/// Not compiled for host tests, whose `std` panic handler replaces Aleph0's.
-#[cfg(not(test))]
 pub fn halt_forever() -> ! {
     loop {
         // SAFETY: CLI and HLT only stop this CPU, which is what this

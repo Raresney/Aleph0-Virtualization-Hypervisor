@@ -44,7 +44,7 @@ use super::exit_decision::{EmulationCounts, NMI_VECTOR};
 use super::msr::IA32_KERNEL_GS_BASE;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
-use super::segment::{self, DescriptorTable};
+use super::segment::{self, DescriptorTable, GATE_SIZE};
 
 /// Value the guest loads into EAX before its first main VMCALL.
 ///
@@ -248,36 +248,12 @@ fn nmi_handler_offset() -> usize {
     unsafe { handler.offset_from(start) as usize }
 }
 
-/// Size of one 64-bit IDT gate.
-const GATE_SIZE: usize = 16;
 /// Byte offset of the NMI gate (vector 2) in the guest IDT.
 const NMI_GATE_OFFSET: usize = NMI_VECTOR as usize * GATE_SIZE;
 /// GUEST_IDTR limit: three gates, vectors 0 to 2. Only vector 2 is present.
 const GUEST_IDT_LIMIT: u16 = (3 * GATE_SIZE - 1) as u16;
 // The NMI gate must lie inside the IDT limit, or the guest would #GP on an NMI.
 const _: () = assert!(NMI_GATE_OFFSET + GATE_SIZE - 1 <= GUEST_IDT_LIMIT as usize);
-
-/// A 64-bit interrupt gate to `handler` through code segment `selector`:
-/// present, DPL 0, no IST.
-///
-/// ```text
-/// bytes 0-1    handler bits 15:0
-/// bytes 2-3    code segment selector
-/// byte  4      IST index: 0, use the current stack
-/// byte  5      0x8E: present, DPL 0, type 0xE (64-bit interrupt gate)
-/// bytes 6-7    handler bits 31:16
-/// bytes 8-11   handler bits 63:32
-/// bytes 12-15  reserved, 0
-/// ```
-fn interrupt_gate(handler: u64, selector: u16) -> [u8; GATE_SIZE] {
-    let mut gate = [0u8; GATE_SIZE];
-    gate[0..2].copy_from_slice(&(handler as u16).to_le_bytes());
-    gate[2..4].copy_from_slice(&selector.to_le_bytes());
-    gate[5] = 0x8E;
-    gate[6..8].copy_from_slice(&((handler >> 16) as u16).to_le_bytes());
-    gate[8..12].copy_from_slice(&((handler >> 32) as u32).to_le_bytes());
-    gate
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestMemoryError {
@@ -426,7 +402,8 @@ impl GuestMemory {
         // aligned.
         unsafe { (memory.data_page() as *mut u32).write_volatile(GUEST_DATA_SEED) };
 
-        let gate = interrupt_gate(memory.nmi_handler(), segment::read_cs());
+        // IST 0: the guest takes its NMI on the stack it is running on.
+        let gate = segment::interrupt_gate(memory.nmi_handler(), segment::read_cs(), 0);
         // SAFETY: `idt` is a fresh page, and the gate ends within the IDT
         // limit (asserted at compile time), far inside it.
         unsafe { core::ptr::copy_nonoverlapping(gate.as_ptr(), idt.as_ptr().add(NMI_GATE_OFFSET), GATE_SIZE) };

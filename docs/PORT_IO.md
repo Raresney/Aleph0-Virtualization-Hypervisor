@@ -164,7 +164,7 @@ then write the command" sequences safe without extra fences.
 | otherwise | `#GP` fault |
 
 Aleph0 runs at ring 0 (CPL 0), so every port is allowed. Its host TSS sets
-`iomap_base` past the end of the TSS (`src/vmx/host_tables.rs`), which means
+`iomap_base` past the end of the TSS (`src/vmx/context_tables.rs`), which means
 "no permission bitmap": if code ever ran at ring 3 with this TSS, every port
 access would fault. That is the safe default.
 

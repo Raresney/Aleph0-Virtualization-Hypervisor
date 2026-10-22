@@ -300,7 +300,8 @@ missing one would #GP in the host, so the guest gets the #GP instead.
 **WRMSR checks the value first.** Every intercepted MSR holds an address
 (only IA32_KERNEL_GS_BASE today), and a WRMSR of a non-canonical address
 faults. In the guest that is correct; in exit context it would be a #GP in
-the host, where nothing can handle it (the host IDT is the firmware's). So
+the host, which Aleph0's host fault handler can only print before it halts
+the CPU ([HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md) section 5). So
 `wrmsr` calls `is_canonical_48` and, for a non-canonical value, injects the
 guest's #GP instead of executing:
 

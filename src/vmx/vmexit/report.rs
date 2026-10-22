@@ -61,6 +61,17 @@ pub(super) fn report_ept_exit(number: u64, basic: u16, qualification: EptQualifi
     Some(guest_physical)
 }
 
+/// Prints that an NMI arrived while Aleph0 ran in root operation, and is
+/// now pending for the guest. Not "resuming the guest": that text arms
+/// `run-hyperv.ps1 -InjectNmi`.
+pub(super) fn report_host_nmi(number: u64) {
+    crate::serial_println!(
+        "{} VM exit #{number}: an NMI arrived while Aleph0 ran in root operation ({} so far); pending for the guest.",
+        crate::TAG,
+        crate::vmx::host::nmis_taken(),
+    );
+}
+
 /// Prints what exit `number` turned out to be and what Aleph0 does about
 /// it. `state` is the state after the exit; `resumed` is how the guest goes
 /// on, for events that resume it.

@@ -7,9 +7,12 @@
 //!
 //! The order matters:
 //!
-//! 1. Load the firmware's GDTR and IDTR again. A VM exit loads the host
-//!    tables with limits of 0xFFFF, and firmware never knew about Aleph0's
-//!    GDT.
+//! 1. Load the firmware's CR3, GDTR and IDTR again. A VM exit loads
+//!    Aleph0's own page tables and descriptor tables (`vmx::host`), and the
+//!    code after a stop keeps running on them until here. CR3 comes first,
+//!    before anything can call firmware. The segment selectors need no
+//!    reload: the host GDT keeps the firmware's selectors (`vmx::host`'s
+//!    `gdt.rs`).
 //! 2. VMCLEAR the VMCS, so the CPU writes any VMCS data it caches back to
 //!    memory.
 //! 3. VMXOFF, then CR0/CR4 as they were before VMXON
@@ -52,6 +55,7 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// back.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FirmwareState {
+    pub(super) cr3: u64,
     pub(super) gdtr: DescriptorTable,
     pub(super) idtr: DescriptorTable,
     pub(super) interrupts_enabled: bool,
@@ -98,9 +102,12 @@ pub(super) unsafe fn teardown(
 ) -> Result<(), TeardownError> {
     let mut result = Ok(());
 
-    // SAFETY: `firmware` holds the firmware's own tables, which boot
-    // services keep live (the caller's obligation).
+    // SAFETY: `firmware` holds the firmware's own page tables and
+    // descriptor tables, which boot services keep live (the caller's
+    // obligation). Both page tables identity-map the code and stack running
+    // here, so the CR3 switch changes no address it uses.
     unsafe {
+        cr::write_cr3(firmware.cr3);
         segment::load_gdtr(&firmware.gdtr);
         segment::load_idtr(&firmware.idtr);
     }
@@ -137,9 +144,10 @@ pub(super) unsafe fn teardown(
 /// console too: the phase is boot services again.
 fn report(firmware: &FirmwareState) {
     let vmxe = cr::read_cr4() & CR4_VMXE != 0;
+    let cr3_restored = cr::read_cr3() == firmware.cr3;
     let tables_restored = segment::read_gdtr() == firmware.gdtr && segment::read_idtr() == firmware.idtr;
     log!(
-        "Teardown: CR4.VMXE={} firmware GDTR/IDTR restored={tables_restored} IF={}.",
+        "Teardown: CR4.VMXE={} firmware CR3 restored={cr3_restored} firmware GDTR/IDTR restored={tables_restored} IF={}.",
         u8::from(vmxe),
         u8::from(interrupts_enabled()),
     );

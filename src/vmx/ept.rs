@@ -177,9 +177,11 @@ pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<
     }
 }
 
-/// The four EPT table levels, as types. [`EptEntry`] takes one as its
-/// parameter, so each constructor exists only for the level it is valid at:
-/// a PML4 entry cannot map a page, and a PT entry cannot point to a table.
+/// The four table levels, as types: EPT's, and those of Aleph0's host page
+/// tables (`vmx::host`), which have the same shape. [`EptEntry`] takes one
+/// as its parameter, so each constructor exists only for the level it is
+/// valid at: a PML4 entry cannot map a page, and a PT entry cannot point to
+/// a table.
 pub mod level {
     mod sealed {
         pub trait Sealed {}

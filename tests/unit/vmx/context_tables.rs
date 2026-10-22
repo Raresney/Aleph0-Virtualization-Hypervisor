@@ -1,4 +1,4 @@
-//! Unit tests for `src/vmx/host_tables.rs`.
+//! Unit tests for `src/vmx/context_tables.rs`.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
@@ -41,4 +41,15 @@ fn tss_descriptor_round_trips_through_gdt_decoder() {
 
     // SAFETY: `table` describes `gdt`, a live local array.
     assert_eq!(unsafe { segment_base_from_gdt(&table, 0x10) }, BASE);
+}
+
+#[test]
+fn tss_holds_its_interrupt_stacks_and_no_io_bitmap() {
+    let tss = Tss::new([0x1000, 0x2000, 0x3000, 0, 0, 0, 0x7000]);
+    // Fields of a packed struct are copied out before comparing.
+    assert_eq!(({ tss.ist1 }, { tss.ist2 }, { tss.ist3 }), (0x1000, 0x2000, 0x3000));
+    assert_eq!(({ tss.ist4 }, { tss.ist7 }), (0, 0x7000));
+    assert_eq!(({ tss.rsp0 }, { tss.rsp1 }, { tss.rsp2 }), (0, 0, 0));
+    // The I/O map starts past the limit: no I/O permission bitmap.
+    assert_eq!({ tss.iomap_base }, 0x68);
 }
