@@ -289,25 +289,19 @@ fn activate_context_tables() -> Result<ContextTables, BringUpError> {
     log!("Context GDT copied at {:#018x}.", gdt.base());
 
     let selector = gdt.append_tss_descriptor(&tss)?;
-    if !gdt.verify_tss_descriptor(&tss) {
-        return Err(GdtError::TssVerificationFailed.into());
-    }
-    let prepared = gdt
-        .prepared_gdtr()
-        .filter(|prepared| prepared.base == gdt.base() && prepared.limit == selector + 15)
-        .ok_or(GdtError::GdtrPreparationFailed)?;
-    log!(
-        "Context GDT prepared: base={:#018x} limit={:#06x} tr_selector={selector:#06x}.",
-        prepared.base,
-        prepared.limit,
-    );
 
+    // `activate` checks the TSS descriptor and the GDTR before loading them.
     // SAFETY: `ContextTables` keeps the GDT and TSS pages, which are never
     // freed; the copy keeps the firmware's descriptors, so the active
     // selectors stay usable; the firmware IDT is live; and this is the only
     // activation.
     unsafe { gdt.activate(&tss) }?;
-    log!("Context GDT and TSS activated and verified.");
+    let prepared = gdt.prepared_gdtr().ok_or(GdtError::GdtrPreparationFailed)?;
+    log!(
+        "Context GDT and TSS activated and verified: base={:#018x} limit={:#06x} tr_selector={selector:#06x}.",
+        prepared.base,
+        prepared.limit,
+    );
 
     Ok(ContextTables {
         gdtr: prepared,
