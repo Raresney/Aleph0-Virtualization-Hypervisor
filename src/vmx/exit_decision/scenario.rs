@@ -6,7 +6,7 @@
 //! waits between them for an NMI:
 //!
 //! ```text
-//! (before these: the guest's emulated exits, counted; see emulation.rs)
+//! (before these: the guest's emulated exits; see emulation.rs)
 //! EPT violation  ──▶ a write to the protected data page: make it writable,
 //!                    resume at the same RIP so the write is retried
 //! main VMCALL #1 ──▶ resume past it (only after the EPT violation, and only
@@ -16,11 +16,14 @@
 //!                                             turn on NMI-window exiting,
 //! NMI-window exit──▶                          inject when the window opens
 //! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
-//! main VMCALL #2 ──▶ finished, if every emulated exit came (EXPECTED_EMULATION)
+//! main VMCALL #2 ──▶ finished
 //! ```
+//!
+//! Whether every emulated exit came is not decided here: bring-up checks the
+//! exit statistics once the guest has finished (`guest::expected_stats`).
 
 use super::{EptQualification, ExitEvent, ExitInfo, ExitState};
-use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
+use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 
 /// How many main VMCALLs the guest makes; the last one ends the run.
 pub const PLANNED_MAIN_VMCALLS: u32 = 2;
@@ -59,14 +62,12 @@ pub fn expected_main_rax(state: ExitState) -> u64 {
     u64::from(GUEST_MARKER) + u64::from(state.main_vmcalls) + u64::from(cfg!(feature = "unexpected-exit-test"))
 }
 
-/// `state` after an NMI is injected: nothing pending, one more injected.
-/// Several NMIs never queue: a new NMI while one is pending replaces it, as
-/// on real hardware, where at most one NMI waits. The count saturates: a
-/// guest can send itself NMIs through its Local APIC as often as it likes.
+/// `state` after an NMI is injected: nothing pending. Several NMIs never
+/// queue: a new NMI while one is pending replaces it, as on real hardware,
+/// where at most one NMI waits.
 fn injected(state: ExitState) -> ExitState {
     ExitState {
         nmi_pending: false,
-        nmis_injected: state.nmis_injected.saturating_add(1),
         ..state
     }
 }
@@ -155,10 +156,6 @@ pub(super) fn vmcall(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState
     };
     if next.main_vmcalls < PLANNED_MAIN_VMCALLS {
         (ExitEvent::MainVmcall, next)
-    } else if state.emulated != EXPECTED_EMULATION {
-        // The guest emulates before its first main VMCALL; by its last one
-        // every emulated exit has to have happened, exactly once each.
-        (ExitEvent::EmulationMissing, state)
     } else {
         (ExitEvent::LastMainVmcall, next)
     }

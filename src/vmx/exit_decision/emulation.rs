@@ -3,19 +3,22 @@
 //! Some guest instructions always exit (CPUID). Others exit because the
 //! exit bitmaps ask for it (RDMSR/WRMSR through the MSR bitmap, IN/OUT through
 //! the I/O bitmaps, both in `vmx::exit_bitmaps`). A handler here decides
-//! what to execute and counts it. `vmexit::handler` then runs the real
+//! what to execute. `vmexit::handler` then runs the real
 //! instruction in root operation, writes the result into the guest's
 //! registers and moves RIP past the instruction, so the guest sees what the
 //! hardware says, except where a policy here changes it
 //! ([`cpuid_policy`]).
 //!
-//! HLT is counted with them but never executed: Aleph0 resumes past it (see
+//! HLT is decided here too, but never executed: Aleph0 resumes past it (see
 //! [`hlt`]).
+//!
+//! These handlers hold for any guest, so they read only the exit itself, never
+//! the test guest's `ExitState`. What they did is counted afterwards, in
+//! `vmexit::stats`.
 
 use core::arch::x86_64::CpuidResult;
-use core::fmt;
 
-use super::{ExitEvent, ExitInfo, ExitState};
+use super::{ExitEvent, ExitInfo};
 use crate::vmx::exit_bitmaps::{INTERCEPTED_MSRS, MsrAccess, msr_bit};
 
 /// An instruction the exit handler executes for the guest.
@@ -32,28 +35,6 @@ pub enum Emulation {
     In { port: u16, size: IoSize },
     /// OUT of `value` (`size` wide) to `port`.
     Out { port: u16, size: IoSize, value: u32 },
-}
-
-/// Emulated exits handled so far, per instruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EmulationCounts {
-    pub cpuid: u32,
-    pub rdmsr: u32,
-    pub wrmsr: u32,
-    pub io_in: u32,
-    pub io_out: u32,
-    /// HLT exits, resumed past without halting.
-    pub hlt: u32,
-}
-
-impl fmt::Display for EmulationCounts {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "cpuid={} rdmsr={} wrmsr={} in={} out={} hlt={}",
-            self.cpuid, self.rdmsr, self.wrmsr, self.io_in, self.io_out, self.hlt
-        )
-    }
 }
 
 /// CPUID.1:ECX bit 5: VMX.
@@ -79,30 +60,13 @@ pub fn cpuid_policy(leaf: u32, raw: CpuidResult) -> CpuidResult {
     }
 }
 
-/// `state` with one more emulated exit in the counter that `count` picks.
-///
-/// The guest decides how often it runs these instructions, so the counter
-/// saturates at `u32::MAX` instead of overflowing: `+= 1` would panic in
-/// debug builds, which in exit context halts the machine (`cli; hlt`), and
-/// wrap to 0 in release.
-fn counted(state: ExitState, count: impl FnOnce(&mut EmulationCounts) -> &mut u32) -> ExitState {
-    let mut next = state;
-    let counter = count(&mut next.emulated);
-    *counter = counter.saturating_add(1);
-    next
-}
-
 /// CPUID (exit reason 10), which always exits: execute it with the guest's
 /// EAX (leaf) and ECX (subleaf).
-pub(super) fn cpuid(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
-    let emulation = Emulation::Cpuid {
+pub(super) fn cpuid(exit: &ExitInfo) -> ExitEvent {
+    ExitEvent::Emulated(Emulation::Cpuid {
         leaf: exit.guest_rax as u32,
         subleaf: exit.guest_rcx as u32,
-    };
-    (
-        ExitEvent::Emulated(emulation),
-        counted(state, |counts| &mut counts.cpuid),
-    )
+    })
 }
 
 /// HLT (exit reason 12): resume past it without halting. A halted vCPU
@@ -110,8 +74,8 @@ pub(super) fn cpuid(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
 /// next runs anyway, so going on at once is a correct, if busy, wait. The
 /// HLT activity state would avoid one exit per idle loop round, but needs
 /// IA32_VMX_MISC bit 6 and a rule for NMI exits taken in that state.
-pub(super) fn hlt(state: ExitState) -> (ExitEvent, ExitState) {
-    (ExitEvent::Halted, counted(state, |counts| &mut counts.hlt))
+pub(super) fn hlt() -> ExitEvent {
+    ExitEvent::Halted
 }
 
 /// Whether `value` is a canonical 48-bit address: bits 63:47 all equal.
@@ -146,34 +110,28 @@ fn route(msr: u32) -> MsrRoute {
 }
 
 /// RDMSR (exit reason 31) of the MSR in ECX.
-pub(super) fn rdmsr(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+pub(super) fn rdmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
     match route(msr) {
-        MsrRoute::Intercepted => (
-            ExitEvent::Emulated(Emulation::Rdmsr { msr }),
-            counted(state, |counts| &mut counts.rdmsr),
-        ),
-        MsrRoute::OutOfRange => (ExitEvent::GuestGeneralProtection, state),
-        MsrRoute::NotIntercepted => (ExitEvent::Unexpected, state),
+        MsrRoute::Intercepted => ExitEvent::Emulated(Emulation::Rdmsr { msr }),
+        MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
+        MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }
 }
 
 /// WRMSR (exit reason 32) of EDX:EAX to the MSR in ECX. Like WRMSR itself,
 /// it ignores the upper halves of RDX and RAX.
-pub(super) fn wrmsr(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
     let value = (exit.guest_rdx << 32) | (exit.guest_rax & 0xFFFF_FFFF);
     match route(msr) {
         // Every intercepted MSR holds an address (only IA32_KERNEL_GS_BASE
         // today). A real WRMSR of a non-canonical one would #GP in the host,
         // in exit context, so the guest gets that #GP instead.
-        MsrRoute::Intercepted if !is_canonical_48(value) => (ExitEvent::GuestGeneralProtection, state),
-        MsrRoute::Intercepted => (
-            ExitEvent::Emulated(Emulation::Wrmsr { msr, value }),
-            counted(state, |counts| &mut counts.wrmsr),
-        ),
-        MsrRoute::OutOfRange => (ExitEvent::GuestGeneralProtection, state),
-        MsrRoute::NotIntercepted => (ExitEvent::Unexpected, state),
+        MsrRoute::Intercepted if !is_canonical_48(value) => ExitEvent::GuestGeneralProtection,
+        MsrRoute::Intercepted => ExitEvent::Emulated(Emulation::Wrmsr { msr, value }),
+        MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
+        MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }
 }
 
@@ -272,26 +230,20 @@ pub fn out_value(rax: u64, size: IoSize) -> u32 {
 /// them is intercepted (`in ax, dx` at 0x3FE covers 0x3FF), and passing
 /// that access through is what the guest would have done anyway. String
 /// and REP forms, which read or write guest memory, stop the guest.
-pub(super) fn io(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+pub(super) fn io(exit: &ExitInfo) -> ExitEvent {
     let io = IoQualification(exit.qualification);
     let Some(size) = io.size() else {
-        return (ExitEvent::Unexpected, state);
+        return ExitEvent::Unexpected;
     };
     if io.is_string() || io.is_rep() {
-        return (ExitEvent::Unexpected, state);
+        return ExitEvent::Unexpected;
     }
     let port = io.port();
     if io.is_in() {
-        (
-            ExitEvent::Emulated(Emulation::In { port, size }),
-            counted(state, |counts| &mut counts.io_in),
-        )
+        ExitEvent::Emulated(Emulation::In { port, size })
     } else {
         let value = out_value(exit.guest_rax, size);
-        (
-            ExitEvent::Emulated(Emulation::Out { port, size, value }),
-            counted(state, |counts| &mut counts.io_out),
-        )
+        ExitEvent::Emulated(Emulation::Out { port, size, value })
     }
 }
 

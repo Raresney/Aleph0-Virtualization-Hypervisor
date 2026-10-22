@@ -40,11 +40,12 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
-use super::exit_decision::{EmulationCounts, NMI_VECTOR};
+use super::exit_decision::NMI_VECTOR;
 use super::msr::IA32_KERNEL_GS_BASE;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable, GATE_SIZE};
+use super::vmexit::VcpuStats;
 
 /// Value the guest loads into EAX before its first main VMCALL.
 ///
@@ -97,16 +98,24 @@ pub const GUEST_IO_VALUE: u8 = 0xA5;
 /// this marker in RAX on serial says why.
 pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 
-/// The emulated exits the guest causes before its last main VMCALL.
-/// `exit_decision` stops the guest at that VMCALL if the counts differ.
-pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts {
-    cpuid: 1,
-    rdmsr: 2,
-    wrmsr: 2,
-    io_in: 2,
-    io_out: 2,
-    hlt: 1,
-};
+/// The exit statistics a finished run of the guest must end with, given the
+/// run's own (`actual`): one CPUID, two RDMSRs and two WRMSRs of
+/// IA32_KERNEL_GS_BASE, two INs and two OUTs of the COM1 scratch register,
+/// one HLT, and no exception injected. Bring-up compares the two once the
+/// guest has finished. The number of exits and of NMIs injected depend on
+/// whether an NMI arrived during the run, so they are taken from `actual`.
+pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
+    VcpuStats {
+        cpuid_exits: 1,
+        msr_read_exits: 2,
+        msr_write_exits: 2,
+        io_in_exits: 2,
+        io_out_exits: 2,
+        halt_exits: 1,
+        exception_injections: 0,
+        ..*actual
+    }
+}
 
 core::arch::global_asm!(
     r#"

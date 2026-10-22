@@ -6,13 +6,13 @@
 
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
 use super::policy::{COUNTERS, Detail, Histogram};
-use super::{RegisterFrame, dump, history, read_field};
+use super::{RegisterFrame, dump, history, read_field, stats};
 use crate::vmx::ept::InveptType;
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EptQualification, ExitEvent, ExitInfo, ExitState,
     InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax,
 };
-use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE};
+use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmcs::fields::GUEST_LINEAR_ADDRESS;
 
@@ -196,11 +196,16 @@ fn report_host_nmi(number: u64) {
 }
 
 /// Prints what every stop adds after the lines of exit `number`: the
-/// guest's state and registers (`frame`), how many exits of each reason there
-/// were (`exits_by_reason`), including those the print policy left out, and
-/// the last exits, oldest first.
+/// guest's state and registers (`frame`), the vCPU's exit statistics, how
+/// many exits of each reason there were (`exits_by_reason`), including those
+/// the print policy left out, and the last exits, oldest first.
 pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &[u64; COUNTERS]) {
     dump::report_guest(number, frame);
+    crate::serial_println!(
+        "{} VM exit #{number}: exit statistics: {}.",
+        crate::TAG,
+        stats::snapshot()
+    );
     crate::serial_println!(
         "{} VM exit #{number}: exits by reason: {}.",
         crate::TAG,
@@ -216,6 +221,7 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
     let tag = crate::TAG;
     let rax = exit.map_or(0, |exit| exit.guest_rax);
     let rip = resumed.map_or(0, |resumed| resumed.rip);
+    let nmis_injected = stats::snapshot().nmi_injections;
     match event {
         ExitEvent::EptWriteGranted => crate::serial_println!(
             "{tag} VM exit #{number}: write to the protected data page: write granted (W=1), INVEPT {}; retrying the write at rip={rip:#018x}.",
@@ -248,14 +254,13 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::NmiWindowInjected => crate::serial_println!(
             "{tag} VM exit #{number}: NMI window open; reinjecting the pending NMI at rip={rip:#018x}."
         ),
-        ExitEvent::LastMainVmcall if state.nmis_injected == 0 && state.nmis_handled == 0 && !state.nmi_pending => {
+        ExitEvent::LastMainVmcall if nmis_injected == 0 && state.nmis_handled == 0 && !state.nmi_pending => {
             crate::serial_println!(
                 "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; no NMI arrived."
             )
         }
         ExitEvent::LastMainVmcall => crate::serial_println!(
-            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; NMIs: {} reinjected, {} handled by the guest{}.",
-            state.nmis_injected,
+            "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); all {PLANNED_MAIN_VMCALLS} planned VMCALLs handled; NMIs: {nmis_injected} reinjected, {} handled by the guest{}.",
             state.nmis_handled,
             // An NMI deferred but never injected before the last VMCALL.
             if state.nmi_pending {
@@ -275,10 +280,6 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::GuestInvalidOpcode => crate::serial_println!(
             "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
         ),
-        ExitEvent::EmulationMissing => crate::serial_println!(
-            "{tag} VM exit #{number}: last main VMCALL (rax={rax:#x}), but the emulated exits were {} instead of {EXPECTED_EMULATION}.",
-            state.emulated,
-        ),
         ExitEvent::InterruptedDelivery => crate::serial_println!(
             "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
         ),
@@ -292,7 +293,6 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
             "{tag} VM exit #{number}: EPT: {} write violation(s) on the protected data page, write granted.",
             state.ept_writes_granted,
         );
-        crate::serial_println!("{tag} VM exit #{number}: emulated exits: {}.", state.emulated);
     }
 }
 

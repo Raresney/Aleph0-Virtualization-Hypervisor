@@ -158,12 +158,16 @@ A worked exit: the guest runs `rdmsr` (`0F 32`, 2 bytes) with
 (say) `0x0000_7A1E_0000_0000` and writes `rax = 0`, `rdx = 0x7A1E`; GUEST_RIP
 moves by 2; the guest continues after its `rdmsr`.
 
-Each emulation handler also counts its exit in `ExitState::emulated`
-(`EmulationCounts`), which section 6 uses. The guest decides how often it
-runs these instructions, so each count saturates at `u32::MAX` instead of
-overflowing: `+= 1` would panic in a debug build, which in exit context
-halts the machine, and wrap to 0 in release. The NMI counts in `ExitState`
-saturate for the same reason.
+The emulation handlers hold for any guest, so they read only the exit
+(`fn(&ExitInfo) -> ExitEvent`) and count nothing. The exit handler counts
+what it carried out in the vCPU's exit statistics (`vmexit::stats`,
+`VcpuStats`), the way KVM keeps `struct kvm_vcpu_stat`: one counter per
+instruction executed for the guest (`cpuid_exits`, `msr_read_exits`,
+`msr_write_exits`, `io_in_exits`, `io_out_exits`), plus `exits`,
+`halt_exits`, `nmi_injections` and `exception_injections`. An exit counts
+only once its resume was prepared, so a WRMSR whose next RIP was invalid,
+and which never ran, is not counted. Section 6 uses them. Each counter is a
+`u64`, which no exit rate overflows.
 
 ## 3. CPUID and its policy
 
@@ -516,24 +520,31 @@ restore either, and prints `restored=false` below.
   `0xFA11` in EAX. The #UD is an exception exit (reason 0, vector 6), which
   `exit_decision` does not handle, so the guest stops and serial shows the
   marker in RAX.
-- **Aleph0 checks the counts.** A guest that got the right value does not
-  prove the exit happened: with a broken bitmap, `rdmsr` would run directly
-  and return the same value. `ExitState::emulated` counts each emulated exit,
-  and at the last main VMCALL `scenario::vmcall` compares it with
-  `guest::EXPECTED_EMULATION`:
+- **Bring-up checks the exit statistics.** A guest that got the right
+  value does not prove the exit happened: with a broken bitmap, `rdmsr`
+  would run directly and return the same value. Once the guest has
+  finished, bring-up compares the vCPU's statistics with
+  `guest::expected_stats`, as a KVM selftest checks a vCPU's statistics
+  after its run:
 
 ```rust
-pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts {
-    cpuid: 1,
-    rdmsr: 2,
-    wrmsr: 2,
-    io_in: 2,
-    io_out: 2,
-};
+pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
+    VcpuStats {
+        cpuid_exits: 1,
+        msr_read_exits: 2,
+        msr_write_exits: 2,
+        io_in_exits: 2,
+        io_out_exits: 2,
+        halt_exits: 1,
+        exception_injections: 0,
+        // How many exits and NMIs depends on whether an NMI arrived.
+        ..*actual
+    }
+}
 ```
 
-Any other count gives `EmulationMissing` and stops the guest instead of
-ending the run.
+Any other count fails the run with `UnexpectedExitStats`, which prints both
+sets of statistics, and the application returns `ABORTED`.
 
 ### What serial shows
 
@@ -546,11 +557,11 @@ VM exit #N: RDMSR 0xc0000102 -> 0x...; resuming at rip=...
 VM exit #N: WRMSR 0xc0000102 <- 0x00007a1e00000000; resuming at rip=...
 VM exit #N: IN port 0x3ff size=1 -> 0x...; resuming at rip=...
 VM exit #N: OUT port 0x3ff size=1 value=0xa5; resuming at rip=...
-VM exit #N: emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2.
+VM exit #N: exit statistics: exits=... cpuid_exits=1 msr_read_exits=2 ...
 ```
 
-The last line comes with the final VMCALL. The EPT violation, which was
-exit #1 before this step, is now exit #10.
+The last line comes with the stop report after the final VMCALL. The EPT
+violation, which was exit #1 before this step, is now exit #10.
 
 ### What bring-up checks
 
@@ -676,6 +687,10 @@ Guest finished after 14 VM exits; VMX operation left.
 
 The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 
+> These runs predate the exit statistics. Since then the stop report
+> prints `exit statistics: ...` in place of `emulated exits: ...`, and
+> bring-up, not the last VMCALL, checks the counts.
+
 ## 8. Limits before an OS guest
 
 - **The CPUID decisions of section 3**: the hypervisor-present bit, the
@@ -715,7 +730,7 @@ requests bit 7 itself, so a guest HLT exits on any CPU.
 
 | Exit | Reason | Decision | Resume |
 |---|---|---|---|
-| HLT | 12 | `Halted`, counted as `hlt` in `EmulationCounts` | past the instruction |
+| HLT | 12 | `Halted`, counted in `halt_exits` | past the instruction |
 | MWAIT | 36 | `GuestInvalidOpcode` | inject #UD (`0x80000306`), RIP unchanged |
 | MONITOR | 39 | `GuestInvalidOpcode` | inject #UD, RIP unchanged |
 
@@ -753,8 +768,8 @@ firmware as the guest (#21).
 **The test.** The test guest runs one `hlt` after its I/O checks, with
 IF = 0, so no interrupt could end the halt; only Aleph0 moving RIP past it
 lets the guest go on. The HLT is exit #10, so the EPT violation becomes exit
-#11 and the run has 13 exits (15 with `-InjectNmi`), ending in
-`emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2 hlt=1.`. The HLT line,
+#11 and the run has 13 exits (15 with `-InjectNmi`), whose statistics
+include `halt_exits=1`. The HLT line,
 `HLT; going on at rip=...`, deliberately avoids the text `resuming the
 guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 
@@ -778,4 +793,4 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exception bitmap | all ones for the test guest, 0 for a guest with its own IDT |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
-| `EXPECTED_EMULATION` | cpuid 1, rdmsr 2, wrmsr 2, in 2, out 2, hlt 1 |
+| `guest::expected_stats` | cpuid 1, MSR reads 2, MSR writes 2, in 2, out 2, halt 1, exceptions 0 |

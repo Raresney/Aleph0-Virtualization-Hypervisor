@@ -10,7 +10,7 @@ use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host::HostError;
 use crate::vmx::mtrr::MtrrError;
 use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmexit::VmExitStackError;
+use crate::vmx::vmexit::{VcpuStats, VmExitStackError};
 use crate::vmx::vmxon::VmxOnError;
 
 use super::teardown::TeardownError;
@@ -61,6 +61,10 @@ pub enum BringUpError {
         number: u64,
         reason: ExitReason,
     },
+    /// The guest finished, but its exit statistics differ from what the
+    /// test guest does (`guest::expected_stats`): an emulated exit is
+    /// missing or came twice.
+    UnexpectedExitStats(VcpuStats),
     /// VMRESUME failed after an exit the handler resumed.
     ResumeFailed {
         error: VmcsError,
@@ -225,6 +229,10 @@ pub fn report_error(error: BringUpError) {
             reason.basic,
             vmx::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
+        ),
+        BringUpError::UnexpectedExitStats(stats) => log!(
+            "Guest finished, but its exit statistics were {stats}; expected {}.",
+            vmx::guest::expected_stats(&stats),
         ),
         BringUpError::ResumeFailed {
             error,

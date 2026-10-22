@@ -24,12 +24,13 @@ use core::fmt;
 use super::history::{self, ExitRecord};
 use super::policy::{self, COUNTERS, MAX_LEVEL, exit_detail};
 use super::report::{ExitReport, report_exit, report_stop};
+use super::stats::{self, VcpuStats};
 use super::{RegisterFrame, read_field};
 use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, Emulation, EmulationCounts,
-    ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, Emulation, ExitAction, ExitEvent,
+    ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON,
     after_skipped_instruction, cpuid_policy, decide, is_canonical_48, merge_in,
 };
 use crate::vmx::host;
@@ -42,14 +43,10 @@ use crate::vmx::vmcs::fields::{
 };
 use crate::vmx::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
-/// Exits handled so far, including the current one, so the first exit is
-/// number 1. Only the exit handler touches it, with interrupts off, on the
-/// one CPU that runs the guest; the atomic just avoids `static mut`.
-static EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// Exits so far per basic reason ([`policy::counter`]), including the
 /// current one: for the print policy and the histogram every stop prints.
-/// Only the exit handler touches them, as with `EXIT_COUNT`.
+/// Only the exit handler touches them, with interrupts off, on the one CPU
+/// that runs the guest; the atomics just avoid `static mut`.
 static EXITS_BY_REASON: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 /// Counts an exit of basic reason `basic`, and returns how many there have
@@ -64,49 +61,26 @@ fn exits_by_reason() -> [u64; COUNTERS] {
 }
 
 // The `ExitState` that `decide` carries from one exit to the next, one
-// atomic per field, for the same reason as `EXIT_COUNT`.
+// atomic per field, for the same reason as `EXITS_BY_REASON`.
 static MAIN_VMCALLS: AtomicU32 = AtomicU32::new(0);
 static NMI_PENDING: AtomicBool = AtomicBool::new(false);
-static NMIS_INJECTED: AtomicU32 = AtomicU32::new(0);
 static NMIS_HANDLED: AtomicU32 = AtomicU32::new(0);
 static EPT_WRITES_GRANTED: AtomicU32 = AtomicU32::new(0);
-static EMULATED_CPUID: AtomicU32 = AtomicU32::new(0);
-static EMULATED_RDMSR: AtomicU32 = AtomicU32::new(0);
-static EMULATED_WRMSR: AtomicU32 = AtomicU32::new(0);
-static EMULATED_IN: AtomicU32 = AtomicU32::new(0);
-static EMULATED_OUT: AtomicU32 = AtomicU32::new(0);
-static EMULATED_HLT: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
         main_vmcalls: MAIN_VMCALLS.load(Ordering::Relaxed),
         nmi_pending: NMI_PENDING.load(Ordering::Relaxed),
-        nmis_injected: NMIS_INJECTED.load(Ordering::Relaxed),
         nmis_handled: NMIS_HANDLED.load(Ordering::Relaxed),
         ept_writes_granted: EPT_WRITES_GRANTED.load(Ordering::Relaxed),
-        emulated: EmulationCounts {
-            cpuid: EMULATED_CPUID.load(Ordering::Relaxed),
-            rdmsr: EMULATED_RDMSR.load(Ordering::Relaxed),
-            wrmsr: EMULATED_WRMSR.load(Ordering::Relaxed),
-            io_in: EMULATED_IN.load(Ordering::Relaxed),
-            io_out: EMULATED_OUT.load(Ordering::Relaxed),
-            hlt: EMULATED_HLT.load(Ordering::Relaxed),
-        },
     }
 }
 
 fn store_state(state: ExitState) {
     MAIN_VMCALLS.store(state.main_vmcalls, Ordering::Relaxed);
     NMI_PENDING.store(state.nmi_pending, Ordering::Relaxed);
-    NMIS_INJECTED.store(state.nmis_injected, Ordering::Relaxed);
     NMIS_HANDLED.store(state.nmis_handled, Ordering::Relaxed);
     EPT_WRITES_GRANTED.store(state.ept_writes_granted, Ordering::Relaxed);
-    EMULATED_CPUID.store(state.emulated.cpuid, Ordering::Relaxed);
-    EMULATED_RDMSR.store(state.emulated.rdmsr, Ordering::Relaxed);
-    EMULATED_WRMSR.store(state.emulated.wrmsr, Ordering::Relaxed);
-    EMULATED_IN.store(state.emulated.io_in, Ordering::Relaxed);
-    EMULATED_OUT.store(state.emulated.io_out, Ordering::Relaxed);
-    EMULATED_HLT.store(state.emulated.hlt, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -154,7 +128,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     #[cfg(feature = "host-fault-test")]
     host::fault_on_purpose();
 
-    let number = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let number = stats::update(VcpuStats::count_exit);
     // SAFETY: the entry stub passes a pointer to the frame it just pushed on
     // the exit stack. It stays put until this returns and nothing else
     // touches it meanwhile; the stub pops it into the guest's registers
@@ -164,6 +138,9 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let host_nmi = host::take_pending_nmi();
     let (event, next) = judge(read.exit, host_nmi);
     let outcome = carry_out(event, &read, next, frame);
+    if let Outcome::Resumed { plan, .. } = outcome {
+        stats::update(|stats| stats.count_resumed(event, plan));
+    }
     // Before anything prints, so a panic while printing still shows this exit.
     history::record(read.record(number, event));
     let basic = read.reason().map_or(UNREADABLE_REASON, |reason| reason.basic);
@@ -724,7 +701,7 @@ extern "efiapi" fn vmresume_failed(rflags: u64, frame: *const RegisterFrame) -> 
     // which stays put until this returns.
     let frame = unsafe { &*frame };
     // The VMRESUME belongs to the last exit, so its number heads the report.
-    report_stop(EXIT_COUNT.load(Ordering::Relaxed), frame, &exits_by_reason());
+    report_stop(stats::snapshot().exits, frame, &exits_by_reason());
     encode_resume_failed(rflags)
 }
 

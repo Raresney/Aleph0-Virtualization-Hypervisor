@@ -193,16 +193,18 @@ their own in `emulation.rs` and are not in this table
 | VMCALL | `rax = 0xa1e1`, second main VMCALL | `LastMainVmcall` | stop: finished |
 | anything else | — | `Unexpected` | stop |
 
-Since the emulated-exits step the second main VMCALL also needs every
-emulated exit to have happened (`guest::EXPECTED_EMULATION`); otherwise the
-event is `EmulationMissing` and the guest stops.
+Once the guest has finished, bring-up also checks that every emulated exit
+happened (`guest::expected_stats`, against the vCPU's exit statistics);
+otherwise the run fails with `UnexpectedExitStats`.
 
-The state between exits counts:
+The state between exits holds:
 - main VMCALLs;
 - whether an NMI is pending;
-- NMIs injected;
 - NMIs handled by the guest (its handler's VMCALLs);
-- emulated exits, per instruction.
+- whether the protected page's write was granted.
+
+NMIs injected are counted with the other exit statistics (`nmi_injections`
+in `vmexit::stats`), not in the state, since no decision depends on them.
 
 Main VMCALLs are counted on their own, because NMI exits now interleave
 with them; exit #2 is no longer necessarily the second VMCALL.
