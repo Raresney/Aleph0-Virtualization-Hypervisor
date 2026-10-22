@@ -158,7 +158,11 @@ A worked exit: the guest runs `rdmsr` (`0F 32`, 2 bytes) with
 moves by 2; the guest continues after its `rdmsr`.
 
 Each emulation handler also counts its exit in `ExitState::emulated`
-(`EmulationCounts`), which section 6 uses.
+(`EmulationCounts`), which section 6 uses. The guest decides how often it
+runs these instructions, so each count saturates at `u32::MAX` instead of
+overflowing: `+= 1` would panic in a debug build, which in exit context
+halts the machine, and wrap to 0 in release. The NMI counts in `ExitState`
+saturate for the same reason.
 
 ## 3. CPUID and its policy
 

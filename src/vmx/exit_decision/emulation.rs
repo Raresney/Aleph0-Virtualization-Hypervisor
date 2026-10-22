@@ -79,10 +79,16 @@ pub fn cpuid_policy(leaf: u32, raw: CpuidResult) -> CpuidResult {
     }
 }
 
-/// `state` with one more emulated exit, as `count` adds it.
-fn counted(state: ExitState, count: impl FnOnce(&mut EmulationCounts)) -> ExitState {
+/// `state` with one more emulated exit in the counter that `count` picks.
+///
+/// The guest decides how often it runs these instructions, so the counter
+/// saturates at `u32::MAX` instead of overflowing: `+= 1` would panic in
+/// debug builds, which in exit context halts the machine (`cli; hlt`), and
+/// wrap to 0 in release.
+fn counted(state: ExitState, count: impl FnOnce(&mut EmulationCounts) -> &mut u32) -> ExitState {
     let mut next = state;
-    count(&mut next.emulated);
+    let counter = count(&mut next.emulated);
+    *counter = counter.saturating_add(1);
     next
 }
 
@@ -95,7 +101,7 @@ pub(super) fn cpuid(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
     };
     (
         ExitEvent::Emulated(emulation),
-        counted(state, |counts| counts.cpuid += 1),
+        counted(state, |counts| &mut counts.cpuid),
     )
 }
 
@@ -105,7 +111,7 @@ pub(super) fn cpuid(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
 /// HLT activity state would avoid one exit per idle loop round, but needs
 /// IA32_VMX_MISC bit 6 and a rule for NMI exits taken in that state.
 pub(super) fn hlt(state: ExitState) -> (ExitEvent, ExitState) {
-    (ExitEvent::Halted, counted(state, |counts| counts.hlt += 1))
+    (ExitEvent::Halted, counted(state, |counts| &mut counts.hlt))
 }
 
 /// Whether `value` is a canonical 48-bit address: bits 63:47 all equal.
@@ -145,7 +151,7 @@ pub(super) fn rdmsr(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
     match route(msr) {
         MsrRoute::Intercepted => (
             ExitEvent::Emulated(Emulation::Rdmsr { msr }),
-            counted(state, |counts| counts.rdmsr += 1),
+            counted(state, |counts| &mut counts.rdmsr),
         ),
         MsrRoute::OutOfRange => (ExitEvent::GuestGeneralProtection, state),
         MsrRoute::NotIntercepted => (ExitEvent::Unexpected, state),
@@ -164,7 +170,7 @@ pub(super) fn wrmsr(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
         MsrRoute::Intercepted if !is_canonical_48(value) => (ExitEvent::GuestGeneralProtection, state),
         MsrRoute::Intercepted => (
             ExitEvent::Emulated(Emulation::Wrmsr { msr, value }),
-            counted(state, |counts| counts.wrmsr += 1),
+            counted(state, |counts| &mut counts.wrmsr),
         ),
         MsrRoute::OutOfRange => (ExitEvent::GuestGeneralProtection, state),
         MsrRoute::NotIntercepted => (ExitEvent::Unexpected, state),
@@ -278,13 +284,13 @@ pub(super) fn io(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     if io.is_in() {
         (
             ExitEvent::Emulated(Emulation::In { port, size }),
-            counted(state, |counts| counts.io_in += 1),
+            counted(state, |counts| &mut counts.io_in),
         )
     } else {
         let value = out_value(exit.guest_rax, size);
         (
             ExitEvent::Emulated(Emulation::Out { port, size, value }),
-            counted(state, |counts| counts.io_out += 1),
+            counted(state, |counts| &mut counts.io_out),
         )
     }
 }

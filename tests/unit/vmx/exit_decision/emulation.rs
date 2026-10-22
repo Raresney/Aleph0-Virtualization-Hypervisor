@@ -297,6 +297,45 @@ fn out_is_emulated_with_the_value_from_rax() {
 }
 
 #[test]
+fn counts_saturate_instead_of_overflowing() {
+    // A guest decides how often it runs these instructions, so every counter can reach u32::MAX.
+    let full = ExitState {
+        emulated: EmulationCounts {
+            cpuid: u32::MAX,
+            rdmsr: u32::MAX,
+            wrmsr: u32::MAX,
+            io_in: u32::MAX,
+            io_out: u32::MAX,
+            hlt: u32::MAX,
+        },
+        ..ExitState::default()
+    };
+    let after = [
+        cpuid(full, &exit(EXIT_REASON_CPUID)).1,
+        hlt(full).1,
+        rdmsr(full, &msr_exit(EXIT_REASON_RDMSR, KERNEL_GS_BASE.into(), 0, 0)).1,
+        wrmsr(full, &msr_exit(EXIT_REASON_WRMSR, KERNEL_GS_BASE.into(), 0, 0)).1,
+        io(full, &io_exit(io_qualification(0x3FF, 0, true), 0)).1,
+        io(full, &io_exit(io_qualification(0x3FF, 0, false), 0)).1,
+    ];
+    for state in after {
+        assert_eq!(state, full);
+    }
+}
+
+#[test]
+fn counting_one_exit_leaves_the_other_counters_alone() {
+    let state = hlt(ExitState::default()).1;
+    assert_eq!(
+        state.emulated,
+        EmulationCounts {
+            hlt: 1,
+            ..EmulationCounts::default()
+        }
+    );
+}
+
+#[test]
 fn string_or_rep_io_stops_the_guest() {
     let string = io_qualification(0x3FF, 0, true) | (1 << 4);
     let rep = string | (1 << 5);
