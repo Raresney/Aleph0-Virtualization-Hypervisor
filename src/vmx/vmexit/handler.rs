@@ -12,14 +12,17 @@
 //!    the event's `ResumePlan` says, or stops the guest. It prints nothing
 //!    either: a step that fails says why in its [`ResumeFailure`].
 //! 4. `report.rs` prints the exit and its [`Outcome`], once everything about
-//!    the exit is known.
+//!    the exit is known, in as much detail as the print policy gives it
+//!    (`policy.rs`): whole for a stop and for the first exits of each reason,
+//!    rate-limited after that.
 
 use core::arch::x86_64::{__cpuid_count, CpuidResult};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use core::fmt;
 
-use super::report::report_exit;
+use super::policy::{self, COUNTERS, Level, MAX_LEVEL, exit_detail};
+use super::report::{ExitReport, report_exit, report_stop};
 use super::{RegisterFrame, read_field};
 use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
@@ -42,6 +45,22 @@ use crate::vmx::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, e
 /// number 1. Only the exit handler touches it, with interrupts off, on the
 /// one CPU that runs the guest; the atomic just avoids `static mut`.
 static EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Exits so far per basic reason ([`policy::counter`]), including the
+/// current one: for the print policy and the histogram every stop prints.
+/// Only the exit handler touches them, as with `EXIT_COUNT`.
+static EXITS_BY_REASON: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+/// Counts an exit of basic reason `basic`, and returns how many there have
+/// been, this one included.
+fn count_exit(basic: u16) -> u64 {
+    EXITS_BY_REASON[policy::counter(basic)].fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The counts of [`EXITS_BY_REASON`] as they stand.
+fn exits_by_reason() -> [u64; COUNTERS] {
+    core::array::from_fn(|slot| EXITS_BY_REASON[slot].load(Ordering::Relaxed))
+}
 
 // The `ExitState` that `decide` carries from one exit to the next, one
 // atomic per field, for the same reason as `EXIT_COUNT`.
@@ -144,8 +163,21 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let host_nmi = host::take_pending_nmi();
     let (event, next) = judge(read.exit, host_nmi);
     let outcome = carry_out(event, &read, next, frame);
-    report_exit(number, &read, host_nmi, event, next, outcome);
-    if let Outcome::Resumed { .. } = outcome {
+    let basic = read.reason().map_or(UNREADABLE_REASON, |reason| reason.basic);
+    let count = count_exit(basic);
+    report_exit(&ExitReport {
+        number,
+        count,
+        detail: exit_detail(count, outcome.stops(), read.unreadable(), MAX_LEVEL),
+        read: &read,
+        host_nmi,
+        event,
+        next,
+        outcome,
+    });
+    if outcome.stops() {
+        report_stop(number, &exits_by_reason());
+    } else {
         #[cfg(feature = "host-nmi-test")]
         if event == ExitEvent::MainVmcall {
             wait_for_host_nmi(number);
@@ -200,6 +232,22 @@ impl ExitRead {
     /// VM_EXIT_REASON for the stop value, or [`UNREADABLE_REASON`].
     fn raw_reason(&self) -> u32 {
         self.reason.map_or(u32::from(UNREADABLE_REASON), |raw| raw as u32)
+    }
+
+    /// Whether a VMCS field the handler read could not be read.
+    fn unreadable(&self) -> bool {
+        [
+            self.reason,
+            self.interruption_info,
+            self.qualification,
+            self.guest_physical.unwrap_or(Ok(0)),
+            self.rip,
+            self.length,
+            self.interruptibility,
+            self.idt_vectoring,
+        ]
+        .iter()
+        .any(Result::is_err)
     }
 }
 
@@ -339,10 +387,12 @@ fn keep_nmi_window_for_host_nmi(number: u64) {
     if !host::nmi_pending() {
         return;
     }
-    crate::serial_println!(
-        "{} VM exit #{number}: an NMI arrived in root operation during this exit; NMI-window exiting on.",
-        crate::TAG
-    );
+    if policy::enabled(Level::Warn) {
+        crate::serial_println!(
+            "{} VM exit #{number}: an NMI arrived in root operation during this exit; NMI-window exiting on.",
+            crate::TAG
+        );
+    }
     // SAFETY: exit context: VMX root operation, with the guest's VMCS
     // current. `configure_controls` checked that the CPU allows NMI-window
     // exiting.

@@ -311,6 +311,44 @@ rejected the guest state before running a single guest instruction. Reason 33
 (invalid guest state) is the most common one; the next step is to compare
 every guest field against Intel SDM Vol. 3C, "Checks on the Guest State Area".
 
+## How much each VM exit prints
+
+Under Hyper-V every serial byte is itself an exit to Hyper-V, and an exit
+printed in full is about five lines. The test guest's 13 exits do not
+notice, but firmware idling in HLT, or a kernel booting through thousands of
+CPUID, MSR and HLT exits, would spend most of its time printing. So the exit
+handler decides how much of each exit to print once it knows how the exit
+ended (`src/vmx/vmexit/policy.rs`):
+
+| Exit | Level | Printed (default build) |
+|---|---|---|
+| stops the guest, or a VMCS field could not be read | error | in full |
+| one of the first 16 of its basic reason | info | in full |
+| the 32nd, 64th, 128th, ... of its reason | info | one summary line |
+| any other | trace | nothing |
+
+The default build prints up to info. Build with the `trace-exits` Cargo
+feature (`run-hyperv.ps1 -Features trace-exits`) to print every exit in
+full. An NMI that arrived while Aleph0 ran is a warning and is always
+printed. A summary line looks like this:
+
+```text
+VM exit #40960: reason=12 (HLT), 4096 exits of this reason so far.
+```
+
+Every stop also prints how many exits of each reason there were, so the
+exits left out still show in the totals:
+
+```text
+VM exit #13: exits by reason: 10 (CPUID)=1, 12 (HLT)=1, 18 (VMCALL)=2, 30 (I/O instruction)=4, 31 (RDMSR)=2, 32 (WRMSR)=2, 48 (EPT violation)=1.
+```
+
+Each reason in the test guest's runs stays under 16 exits, so every exit of
+those runs prints exactly as before, including the `resuming the guest` line
+the `-InjectNmi` job waits for. The exits are counted per basic reason in a
+fixed array; reasons past 127 and an unreadable reason share one last
+counter, shown as `other`.
+
 ## Common questions
 
 **Is there a real chip?** Not under Hyper-V or QEMU: the 16550 is emulated

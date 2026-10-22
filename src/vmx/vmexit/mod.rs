@@ -26,6 +26,7 @@ use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::{self, VmcsError};
 
 mod handler;
+mod policy;
 mod report;
 
 /// VMREADs `field` of the current VMCS. For the exit handler and its

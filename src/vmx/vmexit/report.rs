@@ -5,6 +5,7 @@
 //! the serial port, never firmware.
 
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
+use super::policy::{self, COUNTERS, Detail, Histogram, Level};
 use super::read_field;
 use crate::vmx::ept::InveptType;
 use crate::vmx::exit_decision::{
@@ -15,18 +16,64 @@ use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmcs::fields::GUEST_LINEAR_ADDRESS;
 
-/// Prints exit `number`: what was read about it, an NMI that arrived in root
-/// operation meanwhile (`host_nmi`), what it turned out to be (`event`) and
-/// what came of it (`outcome`). `next` is the state after the exit.
-pub(super) fn report_exit(
-    number: u64,
-    read: &ExitRead,
-    host_nmi: bool,
-    event: ExitEvent,
-    next: ExitState,
-    outcome: Outcome,
-) {
+/// One exit, as its report needs it.
+pub(super) struct ExitReport<'a> {
+    /// The exit's number, from 1.
+    pub(super) number: u64,
+    /// How many exits of its reason there have been, this one included.
+    pub(super) count: u64,
+    /// How much of it the print policy prints.
+    pub(super) detail: Detail,
+    /// What was read about it.
+    pub(super) read: &'a ExitRead,
+    /// Whether an NMI arrived in root operation since the last exit.
+    pub(super) host_nmi: bool,
+    /// What it turned out to be.
+    pub(super) event: ExitEvent,
+    /// The state after it.
+    pub(super) next: ExitState,
+    /// What came of it.
+    pub(super) outcome: Outcome,
+}
+
+/// Prints one exit in as much detail as the print policy gives it: what was
+/// read about it, an NMI that arrived in root operation meanwhile, what it
+/// turned out to be and what came of it. The NMI is printed whatever the
+/// detail.
+pub(super) fn report_exit(report: &ExitReport<'_>) {
+    let ExitReport {
+        number,
+        count,
+        detail,
+        read,
+        host_nmi,
+        event,
+        next,
+        outcome,
+    } = *report;
     let tag = crate::TAG;
+    match detail {
+        Detail::Full => {}
+        Detail::Summary => {
+            // Only exits that resume are rate-limited, and only readable
+            // ones, so the reason is known here.
+            let basic = read.reason().map_or(0, |reason| reason.basic);
+            crate::serial_println!(
+                "{tag} VM exit #{number}: reason={basic} ({}), {count} exits of this reason so far.",
+                exit_reason_name(basic),
+            );
+            if host_nmi {
+                report_host_nmi(number);
+            }
+            return;
+        }
+        Detail::Silent => {
+            if host_nmi {
+                report_host_nmi(number);
+            }
+            return;
+        }
+    }
     report_read(number, read);
     if host_nmi {
         report_host_nmi(number);
@@ -141,10 +188,24 @@ fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification, gue
 /// now pending for the guest. Not "resuming the guest": that text arms
 /// `run-hyperv.ps1 -InjectNmi`.
 fn report_host_nmi(number: u64) {
+    if !policy::enabled(Level::Warn) {
+        return;
+    }
     crate::serial_println!(
         "{} VM exit #{number}: an NMI arrived while Aleph0 ran in root operation ({} so far); pending for the guest.",
         crate::TAG,
         crate::vmx::host::nmis_taken(),
+    );
+}
+
+/// Prints what every stop adds after its exit's lines: how many exits of
+/// each reason there were (`exits_by_reason`), including those the print
+/// policy left out.
+pub(super) fn report_stop(number: u64, exits_by_reason: &[u64; COUNTERS]) {
+    crate::serial_println!(
+        "{} VM exit #{number}: exits by reason: {}.",
+        crate::TAG,
+        Histogram(exits_by_reason)
     );
 }
 
