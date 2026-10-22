@@ -167,13 +167,61 @@ EPT 0x00007ec00000..0x000080000000: 2 MiB pages, WB
 EPT 0x000080000000..0x000100000000: 2 MiB pages, UC
 ```
 
-The lines above show the format on an example layout, not a Hyper-V run.
-The fixed-range lines show the first MiB in runs of one type. The `EPT`
+The lines above show the format on an example layout; the Hyper-V run
+follows. The fixed-range lines show the first MiB in runs of one type. The `EPT`
 lines are read back from the PD entries `Ept::build` filled, the ones the
 CPU walks, rather than worked out again from the MTRRs: runs of 2 MiB pages
 with the type in their entries, and runs of regions mapped through a PT. Here
 the first 2 MiB has a PT because the fixed ranges give it three types, and
 `0x7ea00000` is the data page's region.
+
+### On Hyper-V
+
+The plain run (`.\scripts\run-hyperv.ps1`, two vCPUs) printed:
+
+```text
+MTRRs: enabled, default type UC; fixed ranges enabled; 8 variable ranges, 1 in use.
+MTRR variable range 0: base=0x000000000000 mask=0x3fff00000000 WB
+MTRR fixed 0x00000..0xa0000: WB
+MTRR fixed 0xa0000..0x100000: UC
+EPT built: identity 0x0..0x80000000 (2 GiB), 6 table pages, 2 of them PTs for 2 MiB regions mapped in 4 KiB pages; data page 0x000000007eae2000 read-only (R=1 W=0 X=0).
+EPT 0x000000000000..0x000000200000: 4 KiB pages (a PT each)
+EPT 0x000000200000..0x00007ea00000: 2 MiB pages, WB
+EPT 0x00007ea00000..0x00007ec00000: 4 KiB pages (a PT each)
+EPT 0x00007ec00000..0x000080000000: 2 MiB pages, WB
+VMCS EPT pointer 0x000000007eada01e (WB, 4-level) written and read back.
+```
+
+The `-InjectNmi` run (one vCPU) printed the same lines. Aleph0 reads the
+MTRRs on the bootstrap processor only, and the firmware programmed them the
+same way for both VM shapes.
+
+- **Variable range 0** has mask `0x3fff00000000`: address bits 45:32 must
+  equal its base, 0, and bits 31:12 are free. So it covers
+  `0x0..0x100000000`, the first 4 GiB, as WB. The mask stops at bit 45, so
+  the VM's MAXPHYADDR is 46 bits.
+- **The fixed ranges** make `0x0..0xa0000` WB and `0xa0000..0x100000` (the
+  legacy VGA and ROM hole) UC. The first 2 MiB region therefore mixes WB and
+  UC pages and is mapped through a PT. Before the MTRR types, the same map
+  took 5 table pages; this one is 6: PML4, PDPT, two PDs, and two PTs (this
+  region, and the data page's at `0x7ea00000`).
+- **Everything else up to the end of the memory map** (`0x80000000`) is one
+  type, WB, in 2 MiB pages.
+- **The guest ran as before:** the EPT violation was exit #11 (qualification
+  `0x58a`), and VMCALL #1 (exit #12) read back `rcx=0xda7a` and
+  `rdx=0x455054` through the data page's PT, whose 4 KiB entries each carry
+  their page's type. No EPT misconfiguration exit: no entry holds a reserved
+  type. The run ended after 13 exits with `SUCCESS`, the `-InjectNmi` run
+  after 15 with `NMIs: 1 reinjected, 1 handled by the guest`.
+
+**Beyond the memory map** (for #20, which maps it): the MTRRs make
+`0x80000000..0x100000000` WB, as part of variable range 0, and everything
+above 4 GiB UC, the default type. That WB range includes the Local APIC at
+`0xFEE00000` and the IOAPIC at `0xFEC00000`. On real hardware the firmware
+usually marks the hole below 4 GiB UC with a variable range; Hyper-V's does
+not. Copying the MTRR types, as `Ept::build` does, would map those devices
+WB. Hyper-V emulates them, so their accesses are trapped whatever the type,
+but #20 should decide on purpose rather than inherit WB.
 
 ## 7. What is not covered yet
 
