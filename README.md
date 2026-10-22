@@ -1,5 +1,10 @@
 # Aleph0 Virtualization Hypervisor
 
+[![CI](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](rust-toolchain.toml)
+[![Target: x86_64-unknown-uefi](https://img.shields.io/badge/target-x86__64--unknown--uefi-informational.svg)](.cargo/config.toml)
+
 An Intel VT-x hypervisor written in Rust and booted as a UEFI application.
 Aleph0 is being built to stay resident after `ExitBootServices` and run an
 operating system as its guest, with EPT memory isolation and multiple vCPUs.
@@ -9,17 +14,53 @@ cannot reach. The project is also a study of AI-driven development in
 low-level `unsafe` Rust, and of AI-assisted reverse-engineering tooling for
 the analysis the anti-cheat needs.
 
-It currently enters VMX root operation, fills in a complete VMCS, launches
-a minimal guest, and resumes it after its first VMCALL exit; every exit is
-reported over serial. Guest memory goes through EPT: an identity map of all
-memory, with the memory types the MTRRs give it and one guest page
-read-only, so the guest's write to it exits to Aleph0, which grants the
-write and retries it. The guest also executes CPUID,
-RDMSR/WRMSR and IN/OUT, which Aleph0 emulates by passthrough, with MSR and I/O
-bitmaps limiting which MSRs and ports exit. An NMI that arrives while
-the guest runs is caught and reinjected into the guest's own IDT. After the
-last exit it leaves VMX operation and returns to firmware.
-See [ROADMAP.md](ROADMAP.md) for what has been verified and what comes next.
+## Status
+
+Verified on Hyper-V with nested virtualization:
+
+- [x] Enters VMX root operation and fills in a complete VMCS
+- [x] Runs root operation on its own page tables, GDT, TSS and IDT
+- [x] Launches a minimal guest and resumes it with VMRESUME after each exit
+- [x] EPT identity map with the memory types the MTRRs give; a read-only guest
+      page whose write exits to Aleph0, which grants the write and retries it
+- [x] Emulates CPUID, RDMSR/WRMSR and IN/OUT by passthrough, with MSR and I/O
+      bitmaps limiting which MSRs and ports exit
+- [x] Catches an NMI that arrives while the guest runs and reinjects it into
+      the guest's own IDT
+- [x] Reports every exit over serial, then leaves VMX operation and returns to
+      firmware
+- [ ] Stay resident after `ExitBootServices`
+- [ ] Hide Aleph0's own memory from the guest through EPT
+- [ ] An OS guest on multiple vCPUs
+- [ ] Anti-cheat research: guest memory introspection, EPT protection and
+      split views, watching privileged changes
+
+See [ROADMAP.md](ROADMAP.md) for the details of each step and what comes next.
+
+## What it looks like
+
+An excerpt of Aleph0's serial output (COM2) from a Hyper-V run, with the
+`[Aleph0 Virtualization Hypervisor]` prefix trimmed from each line:
+
+```text
+Entered VMX root operation.
+Launching the guest with VMLAUNCH; its VM exits are reported on serial only.
+VM exit #1: reason=10 (CPUID)
+VM exit #1: CPUID leaf=0x1 subleaf=0x0 -> eax=0x00090672 ebx=0x00020800 ecx=0xf7fa3203 edx=0x1f8bfbff (processor ecx=0xf7fa3223); resuming at rip=0x000000007ead4009.
+...
+VM exit #11: reason=48 (EPT violation)
+VM exit #11: EPT violation at GPA 0x000000007ead5000 (linear 0x000000007ead5000): write; page R=1 W=0 X=0.
+VM exit #11: write to the protected data page: write granted (W=1), INVEPT single-context; retrying the write at rip=0x000000007ead406c.
+...
+VM exit #13: reason=18 (VMCALL)
+VM exit #13: expected VMCALL (rax=0xa1e1); all 2 planned VMCALLs handled; no NMI arrived.
+VM exit #13: emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2 hlt=1.
+VM exit #13: stopping the guest; returning to bring-up.
+...
+Teardown: CR4.VMXE=0 firmware CR3 restored=true firmware GDTR/IDTR restored=true IF=1.
+Guest finished after 13 VM exits; VMX operation left.
+Returning to firmware with SUCCESS.
+```
 
 ## Requirements
 
@@ -45,7 +86,8 @@ cargo clippy           # lints for the UEFI build
 cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
 ```
 
-All four pass without warnings. `clippy::undocumented_unsafe_blocks` is on,
+All four pass without warnings, and CI runs them with `cargo build` on every
+push to `master` and every pull request. `clippy::undocumented_unsafe_blocks` is on,
 so every `unsafe` block needs a `// SAFETY:` comment saying why it is sound,
 and every `unsafe fn` has a `# Safety` section for its callers.
 
@@ -110,7 +152,22 @@ diagnostics that run before VMXON.
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
-| `docs/` | Background explanations: [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md) (serial logger, beginner walkthrough), [PORT_IO.md](docs/PORT_IO.md) (`in`/`out` and the I/O port space), [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md) (page tables and how Aleph0 walks them), [CLEAN_STOP.md](docs/CLEAN_STOP.md) (stopping the guest, leaving VMX and returning to firmware), [NMI.md](docs/NMI.md) (catching NMIs in the guest and reinjecting them), [EPT.md](docs/EPT.md) (the second translation stage, the identity map and the intentional EPT violation), [MTRR.md](docs/MTRR.md) (memory types, the MTRRs and how EPT entries get them), [EMULATED_EXITS.md](docs/EMULATED_EXITS.md) (CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation), [HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) (the page tables, GDT, TSS and IDT VM exits load, and NMIs in root operation) |
+| `docs/` | Background explanations (see [Documentation](#documentation)) |
+
+## Documentation
+
+Each page explains the mechanism the code implements, with the Intel SDM
+references it relies on:
+
+- [SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md): the serial logger, a beginner walkthrough
+- [PORT_IO.md](docs/PORT_IO.md): `in`/`out` and the I/O port space
+- [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md): page tables and how Aleph0 walks them
+- [HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md): the page tables, GDT, TSS and IDT that VM exits load, and NMIs in root operation
+- [EPT.md](docs/EPT.md): the second translation stage, the identity map and the intentional EPT violation
+- [MTRR.md](docs/MTRR.md): memory types, the MTRRs and how EPT entries get them
+- [EMULATED_EXITS.md](docs/EMULATED_EXITS.md): CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation
+- [NMI.md](docs/NMI.md): catching NMIs in the guest and reinjecting them
+- [CLEAN_STOP.md](docs/CLEAN_STOP.md): stopping the guest, leaving VMX and returning to firmware
 
 ## Contributing
 
