@@ -24,7 +24,7 @@
 //! finds what it expects. The TSS takes the first free slot above them.
 
 use super::HostError;
-use crate::vmx::host_tables::{TSS_SIZE, tss_descriptor};
+use crate::vmx::context_tables::{TSS_SIZE, tss_descriptor};
 use crate::vmx::page::PAGE_SIZE;
 use crate::vmx::segment::{self, SELECTOR_RPL_TI};
 use crate::vmx::vmcs::HostSelectors;

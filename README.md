@@ -92,7 +92,7 @@ diagnostics that run before VMXON.
 | `src/serial.rs` | COM1 serial logger usable without firmware |
 | `src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
-| `src/vmx/host_tables.rs`, `segment.rs` | The firmware context's GDT copy with a TSS, the TSS layout, gate and descriptor encoding, segmentation state |
+| `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
 | `src/vmx/host/` | What VMX root operation runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |

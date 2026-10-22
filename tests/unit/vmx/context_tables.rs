@@ -1,4 +1,4 @@
-//! Unit tests for `src/vmx/host_tables.rs`.
+//! Unit tests for `src/vmx/context_tables.rs`.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its

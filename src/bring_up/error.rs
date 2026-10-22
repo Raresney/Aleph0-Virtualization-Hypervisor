@@ -1,13 +1,13 @@
 //! Why bring-up stopped, and how that gets printed.
 
 use crate::vmx;
+use crate::vmx::context_tables::{GdtError, TssError};
 use crate::vmx::ept::EptError;
 use crate::vmx::exit_bitmaps::ExitBitmapsError;
 use crate::vmx::exit_decision::ExitReason;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
 use crate::vmx::host::HostError;
-use crate::vmx::host_tables::{GdtError, TssError};
 use crate::vmx::mtrr::MtrrError;
 use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmexit::VmExitStackError;

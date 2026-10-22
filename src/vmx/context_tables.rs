@@ -8,7 +8,8 @@
 //! test guest run on them.
 //!
 //! VMX root operation does not: every VM exit loads Aleph0's own GDT, TSS
-//! and IDT (`vmx::host`), whose TSS comes from [`TssRegion::allocate_with_interrupt_stacks`].
+//! and IDT (`vmx::host`), whose TSS comes from
+//! [`TssRegion::allocate_with_interrupt_stacks`].
 //!
 //! This TSS's stack fields (RSP0-2, IST1-7) stay 0: the firmware context
 //! never changes privilege level, and `activate` refuses an IDT with a gate
@@ -335,5 +336,5 @@ impl GdtRegion {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/host_tables.rs"]
+#[path = "../../tests/unit/vmx/context_tables.rs"]
 mod tests;

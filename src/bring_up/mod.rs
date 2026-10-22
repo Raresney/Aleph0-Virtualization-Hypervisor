@@ -46,12 +46,12 @@ pub use error::{BringUpError, report_error};
 
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
+use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::ept::{self, Ept, InveptType};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
 use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host::{FirmwareSelectors, HostEnvironment};
-use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
 use crate::vmx::segment::DescriptorTable;
 use crate::vmx::vmcs::{DesiredControls, GuestKind, GuestStop, VmcsRegion};

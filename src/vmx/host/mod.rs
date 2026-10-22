@@ -12,12 +12,12 @@
 //! |---|---|---|
 //! | HOST_CR3 | `page_tables.rs` | identity map of everything the UEFI memory map reaches |
 //! | HOST_GDTR_BASE, selectors | `gdt.rs` | code, data and TSS, at the firmware's selector indices |
-//! | HOST_TR_BASE | `host_tables::Tss` | IST1-3: the NMI, #DF and #MC stacks |
+//! | HOST_TR_BASE | `context_tables::Tss` | IST1-3: the NMI, #DF and #MC stacks |
 //! | HOST_IDTR_BASE | `idt.rs`, `handlers.rs` | 256 gates: NMI to the guest, faults printed |
 //!
 //! The firmware context does not use any of them: bring-up and the test
 //! guest keep the firmware's page tables and IDT and the GDT copy from
-//! `host_tables.rs`. Only VM exits switch to these, and teardown switches
+//! `context_tables.rs`. Only VM exits switch to these, and teardown switches
 //! back (`bring_up::teardown`).
 //!
 //! The pages come from `page.rs` like every other allocation; moving them to
@@ -38,9 +38,9 @@ pub use handlers::fault_on_purpose;
 
 use core::ptr::NonNull;
 
+use super::context_tables::{TssError, TssRegion};
 use super::cpuid;
 use super::cr::read_cr4;
-use super::host_tables::{TssError, TssRegion};
 use super::page::{PAGE_SIZE, allocate_zeroed_page, allocate_zeroed_pages};
 use super::segment::GATE_SIZE;
 use super::vmcs::{HostSelectors, HostTables};
