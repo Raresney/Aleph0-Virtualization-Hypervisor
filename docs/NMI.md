@@ -86,7 +86,7 @@ the handler is at +56 and `dec ecx` at +45.
 +0   31 DB            xor ebx, ebx            ; no NMI handled yet
 +2   B8 E0 A1 00 00   mov eax, 0xa1e0         ; GUEST_MARKER
 +7   0F 01 C1         vmcall                  ; main VMCALL #1
-+10  B9 00 00 00 20   mov ecx, 0x20000000     ; GUEST_WAIT_ITERATIONS
++10  B9 00 00 00 04   mov ecx, 0x04000000     ; GUEST_WAIT_ITERATIONS
 +15  85 DB            wait: test ebx, ebx
 +17  75 06            jnz done
 +19  F3 90            pause
@@ -244,7 +244,7 @@ Returning to firmware with SUCCESS.
 ```
 
 What the numbers prove:
-- **RCX at exit #2:** `0x1f6f2a97` means the loop had run `0x20000000 - 0x1f6f2a97 = 0x90d569` rounds (about 9.5 million) when the NMI arrived.
+- **RCX at exit #2:** `0x1f6f2a97` means the loop had run `0x20000000 - 0x1f6f2a97 = 0x90d569` rounds (about 9.5 million) when the NMI arrived. The limit was `0x20000000` then; it is `0x04000000` (about 8 s) since a plain run measured 65 s for the old one.
 - **RAX at exit #3:** `0x4e4d49` means the NMI was delivered through the guest's own IDT, to its handler.
 - **RCX at exit #4:** `0x1f6f2a96`, exactly one lower than at exit #2. `iretq` returned to the `dec ecx` at +21, which ran once. The loop then saw `ebx = 1` and went on to VMCALL #2.
 - **RBX at exit #4:** `1`; the handler's signal reached the main code.
@@ -286,7 +286,7 @@ with `rcx = 0`: the loop ran out.
 | Name | Where | What |
 |---|---|---|
 | `GUEST_NMI_MARKER` (`0x4e4d49`) | `guest.rs` | RAX of the guest NMI handler's VMCALL |
-| `GUEST_WAIT_ITERATIONS` (`0x20000000`) | `guest.rs` | rounds of the wait loop |
+| `GUEST_WAIT_ITERATIONS` (`0x04000000`) | `guest.rs` | rounds of the wait loop, about 8 s on Hyper-V |
 | `GuestMemory::idt` | `guest.rs` | guest IDTR: one gate, vector 2 |
 | `interrupt_gate` | `guest.rs` | encodes a 64-bit interrupt gate |
 | `PIN_BASED_NMI_EXITING`, `PIN_BASED_VIRTUAL_NMIS` | `vmcs/fields.rs` | pin bits 3 and 5 |
