@@ -148,9 +148,6 @@ pub(super) fn report_event(
             "{tag} VM exit #{number}: last main VMCALL (rax={rax:#x}), but the emulated exits were {} instead of {EXPECTED_EMULATION}.",
             state.emulated,
         ),
-        ExitEvent::InterruptedDelivery => crate::serial_println!(
-            "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
-        ),
         ExitEvent::Unexpected => crate::serial_println!(
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),

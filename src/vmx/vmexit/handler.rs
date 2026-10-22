@@ -18,14 +18,15 @@ use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_IO_INSTRUCTION,
     Emulation, EmulationCounts, EptQualification, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
-    InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, after_skipped_instruction, cpuid_policy, decide,
-    exit_reason_name, is_canonical_48, merge_in,
+    InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, after_skipped_instruction, cpuid_policy,
+    decide, exit_reason_name, is_canonical_48, merge_in,
 };
 use crate::vmx::host;
 use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE,
-    VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_ERROR_CODE, IDT_VECTORING_INFO,
+    VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN,
+    VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
 use crate::vmx::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
@@ -215,6 +216,10 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
     let interruption_info = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO);
     let interruptibility = read_or_report("GUEST_INTERRUPTIBILITY_STATE", GUEST_INTERRUPTIBILITY_STATE);
     let idt_vectoring = read_or_report("IDT_VECTORING_INFO", IDT_VECTORING_INFO);
+    // Meaningful only when idt_vectoring is valid and carries an error code;
+    // 0 otherwise, so an unreadable field never stops an exit that ignores it.
+    let idt_vectoring_error_code =
+        read_or_report("IDT_VECTORING_ERROR_CODE", IDT_VECTORING_ERROR_CODE).unwrap_or(0) as u32;
     let exit = match (
         reason,
         interruption_info,
@@ -232,7 +237,8 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
                 guest_rdx: frame.rdx,
                 interruptibility: blocking as u32,
                 // IDT_VECTORING_INFO has the interruption-information layout.
-                idt_vectoring_valid: InterruptionInfo(vectoring as u32).is_valid(),
+                idt_vectoring: InterruptionInfo(vectoring as u32),
+                idt_vectoring_error_code,
                 qualification,
                 guest_physical,
                 protected_page: protected.map_or(0, |page| page.gpa),
@@ -277,19 +283,39 @@ fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState, frame:
     let action = match event.action() {
         ExitAction::Resume(plan) => {
             let plan = plan.keeping_pending_nmi(next);
-            match prepare_resume(number, read, plan, frame) {
-                Some(resumed) => {
-                    report_event(number, event, read.exit, next, Some(resumed));
-                    #[cfg(feature = "host-nmi-test")]
-                    if event == ExitEvent::MainVmcall {
-                        wait_for_host_nmi(number);
+            // Re-deliver an event this exit interrupted mid-delivery. The
+            // plan refuses when it would also advance RIP or inject its own
+            // event, since only one event is injected per VM entry.
+            let plan = match read
+                .exit
+                .and_then(|exit| exit.redelivery(read.length.map(|length| length as u32)))
+            {
+                Some(redelivery) => plan.redelivering(redelivery),
+                None => Some(plan),
+            };
+            match plan {
+                Some(plan) => match prepare_resume(number, read, plan, frame) {
+                    Some(resumed) => {
+                        report_event(number, event, read.exit, next, Some(resumed));
+                        #[cfg(feature = "host-nmi-test")]
+                        if event == ExitEvent::MainVmcall {
+                            wait_for_host_nmi(number);
+                        }
+                        // Last, after every VMCS write of this exit.
+                        keep_nmi_window_for_host_nmi(number);
+                        ExitAction::Resume(plan)
                     }
-                    // Last, after every VMCS write of this exit.
-                    keep_nmi_window_for_host_nmi(number);
-                    ExitAction::Resume(plan)
+                    // Why the guest cannot go on was printed.
+                    None => ExitAction::Unexpected,
+                },
+                None => {
+                    crate::serial_println!(
+                        "{} VM exit #{number}: the exit interrupted an event's delivery, but this exit's handler advances RIP or injects its own event; not re-delivering, stopping.",
+                        crate::TAG
+                    );
+                    report_event(number, event, read.exit, next, None);
+                    ExitAction::Unexpected
                 }
-                // Why the guest cannot go on was printed.
-                None => ExitAction::Unexpected,
             }
         }
         stop => {
@@ -477,6 +503,7 @@ fn prepare_resume(number: u64, read: &ExitRead, plan: ResumePlan, frame: &mut Re
         grant_write,
         emulate,
         inject_exception,
+        redeliver,
     } = plan;
     let tag = crate::TAG;
     let Some(rip) = rip else {
@@ -556,6 +583,20 @@ fn prepare_resume(number: u64, read: &ExitRead, plan: ResumePlan, frame: &mut Re
         );
         return None;
     }
+    if let Some(redelivery) = redeliver {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: re-delivering the interrupted event (info={:#010x}); RIP stays at {resume_rip:#018x}.",
+            redelivery.info.0,
+        );
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current.
+        if let Err(error) = unsafe { write_redelivery(redelivery) } {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: could not queue the interrupted event for re-delivery ({error:?}); not resuming."
+            );
+            return None;
+        }
+    }
     if let Some(on) = nmi_window
         // SAFETY: exit context: VMX root operation, with the guest's VMCS
         // current. `configure_controls` checked that the CPU allows
@@ -609,6 +650,27 @@ unsafe fn queue_exception(exception: InterruptionInfo) -> Result<(), VmcsError> 
             vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
         }
         vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, exception.0.into())
+    }
+}
+
+/// Queues the event `redelivery` describes for the next VM entry: its
+/// interruption info, its error code when it carries one, and its
+/// instruction length for a software interrupt or exception. The
+/// interruption-information field is written last, as for an injection.
+///
+/// # Safety
+///
+/// VMX root operation with the guest's VMCS current.
+unsafe fn write_redelivery(redelivery: Redelivery) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX root operation with a current VMCS.
+    unsafe {
+        if let Some(error_code) = redelivery.error_code {
+            vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, error_code.into())?;
+        }
+        if let Some(length) = redelivery.instruction_len {
+            vmcs::vmwrite(VM_ENTRY_INSTRUCTION_LEN, length.into())?;
+        }
+        vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, redelivery.info.0.into())
     }
 }
 

@@ -30,16 +30,15 @@ Code:
 The exit handler (`vmexit/handler.rs`) reads an exit into an `ExitInfo`, calls
 `exit_decision::decide`, and applies what comes back (`docs/NMI.md`
 section 6). `decide` first handles what holds for every exit, whatever its
-reason: a failed VM entry and an exit that interrupted an event's delivery
-both stop the guest. Then it dispatches on the basic exit reason:
+reason: a failed VM entry stops the guest. An exit that interrupted an
+event's delivery (IDT-vectoring info valid) is still judged by its reason;
+the handler then re-delivers the interrupted event on top of the plan
+(`docs/NMI.md` section 8). `decide` dispatches on the basic exit reason:
 
 ```rust
 pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
-    }
-    if exit.idt_vectoring_valid {
-        return (ExitEvent::InterruptedDelivery, state);
     }
     match exit.reason.basic {
         EXIT_REASON_CPUID => emulation::cpuid(state, &exit),

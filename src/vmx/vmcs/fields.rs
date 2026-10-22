@@ -84,6 +84,10 @@ pub const VM_ENTRY_INTERRUPTION_INFO: u32 = 0x4016;
 /// VM-entry exception error code (32-bit): the error code delivered with an
 /// injected exception whose interruption info has bit 11 set.
 pub const VM_ENTRY_EXCEPTION_ERROR_CODE: u32 = 0x4018;
+/// VM-entry instruction length (32-bit): the length the CPU charges when it
+/// injects a software interrupt or software exception (interruption types 4,
+/// 5 and 6), so RIP ends past the INT/INT3/INTO that was being delivered.
+pub const VM_ENTRY_INSTRUCTION_LEN: u32 = 0x401A;
 /// Secondary processor-based VM-execution controls. The CPU reads this field
 /// only while primary bit 31 ([`CPU_BASED_ACTIVATE_SECONDARY_CONTROLS`]) is
 /// set.
@@ -121,8 +125,12 @@ pub const VM_EXIT_REASON: u32 = 0x4402;
 /// field is valid.
 pub const VM_EXIT_INTERRUPTION_INFO: u32 = 0x4404;
 /// IDT-vectoring information (32-bit): bit 31 is set when the VM exit
-/// interrupted the delivery of an event through the guest's IDT.
+/// interrupted the delivery of an event through the guest's IDT. Same layout
+/// as the interruption-information fields.
 pub const IDT_VECTORING_INFO: u32 = 0x4408;
+/// IDT-vectoring error code (32-bit): the error code of the interrupted
+/// event, valid when IDT_VECTORING_INFO has bit 11 set.
+pub const IDT_VECTORING_ERROR_CODE: u32 = 0x440A;
 /// Length in bytes of the instruction that caused the exit (32-bit), for
 /// exits caused by an instruction (VMCALL, CPUID, ...). Used to advance RIP.
 pub const VM_EXIT_INSTRUCTION_LEN: u32 = 0x440C;

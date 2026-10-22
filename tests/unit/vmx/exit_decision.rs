@@ -60,7 +60,8 @@ fn exit(basic: u16) -> ExitInfo {
         guest_rcx: GUEST_DATA_SEED.into(),
         guest_rdx: GUEST_EPT_VALUE.into(),
         interruptibility: 0,
-        idt_vectoring_valid: false,
+        idt_vectoring: InterruptionInfo(0),
+        idt_vectoring_error_code: 0,
         qualification: 0,
         guest_physical: 0,
         protected_page: PROTECTED_PAGE,
@@ -494,13 +495,113 @@ fn deferred_nmi_run_finishes_with_both_counts() {
     );
 }
 
+/// IDT-vectoring info of an NMI (type 2, vector 2) that the exit interrupted.
+const VECTORING_NMI: InterruptionInfo = InterruptionInfo(0x8000_0202);
+
 #[test]
-fn interrupted_delivery_is_never_handled() {
+fn a_vectoring_exit_is_still_judged_by_its_reason() {
+    // Before re-delivery, any valid vectoring field stopped the guest. Now
+    // the exit goes to its reason's handler, and the delivery is re-delivered
+    // on top of the plan.
     let interrupted = ExitInfo {
-        idt_vectoring_valid: true,
+        idt_vectoring: VECTORING_NMI,
         ..vmcall(MARKER)
     };
-    assert_eq!(decide(START, interrupted), (ExitEvent::InterruptedDelivery, START));
+    assert_eq!(decide(WRITTEN, interrupted).0, ExitEvent::MainVmcall);
+}
+
+#[test]
+fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
+    // The test guest's reinjected NMI faults on its read-only data page: an
+    // EPT violation whose IDT-vectoring field holds the NMI. Grant write,
+    // and re-deliver the NMI on the retried entry.
+    let interrupted = ExitInfo {
+        idt_vectoring: VECTORING_NMI,
+        ..protected_write()
+    };
+    let (event, _) = decide(START, interrupted);
+    assert_eq!(event, ExitEvent::EptWriteGranted);
+    let plan = match event.action() {
+        ExitAction::Resume(plan) => plan,
+        other => panic!("expected a resume, got {other:?}"),
+    };
+    let redelivery = interrupted.redelivery(None).expect("the NMI is re-delivered");
+    assert_eq!(redelivery.info, VECTORING_NMI);
+    assert_eq!(
+        plan.redelivering(redelivery),
+        Some(ResumePlan {
+            redeliver: Some(redelivery),
+            ..ResumePlan::RETRY_AFTER_GRANT
+        })
+    );
+}
+
+#[test]
+fn no_vectoring_means_no_redelivery() {
+    assert_eq!(vmcall(MARKER).redelivery(None), None);
+}
+
+#[test]
+fn redelivery_clears_bits_30_to_12_and_keeps_the_event() {
+    // Bit 12 (NMI unblocking due to IRET) is exit-only; it must not reach the
+    // VM-entry field.
+    let interrupted = ExitInfo {
+        idt_vectoring: InterruptionInfo(0x8000_1202),
+        ..vmcall(MARKER)
+    };
+    assert_eq!(
+        interrupted.redelivery(None).unwrap().info,
+        InterruptionInfo(0x8000_0202)
+    );
+}
+
+#[test]
+fn redelivery_keeps_an_exception_error_code() {
+    // A hardware exception (type 3) with the error-code bit (#PF, vector 14).
+    let page_fault = ExitInfo {
+        idt_vectoring: InterruptionInfo(0x8000_0B0E),
+        idt_vectoring_error_code: 0x2,
+        ..vmcall(MARKER)
+    };
+    let redelivery = page_fault.redelivery(None).unwrap();
+    assert_eq!(redelivery.error_code, Some(0x2));
+    assert_eq!(redelivery.instruction_len, None);
+    // An exception without the bit (#UD, vector 6) carries no error code.
+    let invalid_opcode = ExitInfo {
+        idt_vectoring: InterruptionInfo(0x8000_0306),
+        idt_vectoring_error_code: 0x2,
+        ..vmcall(MARKER)
+    };
+    assert_eq!(invalid_opcode.redelivery(None).unwrap().error_code, None);
+}
+
+#[test]
+fn a_software_interrupt_re_delivers_with_its_length() {
+    // A software interrupt (type 4), e.g. INT 0x80.
+    let software = ExitInfo {
+        idt_vectoring: InterruptionInfo(0x8000_0480),
+        ..vmcall(MARKER)
+    };
+    assert_eq!(software.redelivery(Some(2)).unwrap().instruction_len, Some(2));
+    // With the length unreadable, it cannot be re-delivered: the plan stops.
+    let redelivery = software.redelivery(None).unwrap();
+    assert_eq!(redelivery.instruction_len, None);
+    assert_eq!(ResumePlan::RETRY_AFTER_GRANT.redelivering(redelivery), None);
+}
+
+#[test]
+fn redelivery_conflicts_with_an_advance_or_injection() {
+    let redelivery = ExitInfo {
+        idt_vectoring: VECTORING_NMI,
+        ..vmcall(MARKER)
+    }
+    .redelivery(None)
+    .unwrap();
+    // A plan that advances RIP, injects an NMI, or injects an exception
+    // already uses the single VM-entry injection, so it cannot re-deliver.
+    assert_eq!(ResumePlan::PAST_INSTRUCTION.redelivering(redelivery), None);
+    assert_eq!(ResumePlan::INJECT_NMI.redelivering(redelivery), None);
+    assert_eq!(ResumePlan::INJECT_GP.redelivering(redelivery), None);
 }
 
 #[test]
@@ -534,6 +635,7 @@ fn each_event_maps_to_its_action() {
             grant_write,
             emulate: None,
             inject_exception: None,
+            redeliver: None,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
@@ -547,7 +649,6 @@ fn each_event_maps_to_its_action() {
     // RIP not advanced: the write runs again once the page is writable.
     assert_eq!(ExitEvent::EptWriteGranted.action(), resume(false, false, None, true));
     assert_eq!(ExitEvent::LastMainVmcall.action(), ExitAction::Finished);
-    assert_eq!(ExitEvent::InterruptedDelivery.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::EptWriteMissing.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::DataPageMismatch.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::Unexpected.action(), ExitAction::Unexpected);
