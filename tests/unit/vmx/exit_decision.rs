@@ -411,6 +411,34 @@ fn guest_nmi_handler_vmcall_resumes() {
 }
 
 #[test]
+fn nmi_handler_vmcalls_saturate_their_count() {
+    // Any guest code can make this VMCALL, as often as it likes.
+    let full = ExitState {
+        nmis_handled: u32::MAX,
+        ..WAITING
+    };
+    assert_eq!(decide(full, vmcall(NMI_MARKER)), (ExitEvent::GuestNmiHandler, full));
+}
+
+#[test]
+fn injected_nmis_saturate_their_count() {
+    // A guest can send itself NMIs through its Local APIC, as often as it likes.
+    let full = ExitState {
+        nmis_injected: u32::MAX,
+        ..WAITING
+    };
+    assert_eq!(decide(full, nmi(0)), (ExitEvent::NmiInjected, full));
+    let pending = ExitState {
+        nmi_pending: true,
+        ..full
+    };
+    assert_eq!(
+        decide(pending, exit(EXIT_REASON_NMI_WINDOW)),
+        (ExitEvent::NmiWindowInjected, full)
+    );
+}
+
+#[test]
 fn full_nmi_run_finishes_with_both_counts() {
     let mut state = START;
     let mut event = ExitEvent::Unexpected;

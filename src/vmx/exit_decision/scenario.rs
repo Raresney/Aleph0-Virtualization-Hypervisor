@@ -57,11 +57,12 @@ pub fn expected_main_rax(state: ExitState) -> u64 {
 
 /// `state` after an NMI is injected: nothing pending, one more injected.
 /// Several NMIs never queue: a new NMI while one is pending replaces it, as
-/// on real hardware, where at most one NMI waits.
+/// on real hardware, where at most one NMI waits. The count saturates: a
+/// guest can send itself NMIs through its Local APIC as often as it likes.
 fn injected(state: ExitState) -> ExitState {
     ExitState {
         nmi_pending: false,
-        nmis_injected: state.nmis_injected + 1,
+        nmis_injected: state.nmis_injected.saturating_add(1),
         ..state
     }
 }
@@ -126,10 +127,11 @@ pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, Ex
 /// data page read back as planned.
 pub(super) fn vmcall(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     if exit.guest_rax == u64::from(GUEST_NMI_MARKER) {
+        // Saturates: any guest code can make this VMCALL, any number of times.
         return (
             ExitEvent::GuestNmiHandler,
             ExitState {
-                nmis_handled: state.nmis_handled + 1,
+                nmis_handled: state.nmis_handled.saturating_add(1),
                 ..state
             },
         );
