@@ -11,7 +11,7 @@ use crate::vmx::exit_decision::{
     PLANNED_MAIN_VMCALLS, expected_main_rax,
 };
 use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE};
-use crate::vmx::vmcs::fields::{GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS, VM_EXIT_INTERRUPTION_INFO};
+use crate::vmx::vmcs::fields::{GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS};
 use crate::vmx::vmcs::{self, VmcsError};
 
 /// Reads one VMCS field for the diagnostic, printing instead of failing.
@@ -200,22 +200,20 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
     }
 }
 
-/// Prints the vector of an exception exit. Exit qualification, printed by
-/// the caller, holds the faulting address for a page fault (#PF, vector 14).
-/// NMI exits share reason 0 but are not exceptions; the event line printed
-/// later reports them.
-pub(super) fn report_exception(number: u64) {
+/// Prints the vector of an exception exit, from its VM_EXIT_INTERRUPTION_INFO
+/// `info`. Exit qualification, printed by the caller, holds the faulting
+/// address for a page fault (#PF, vector 14). NMI exits share reason 0 but
+/// are not exceptions; the event line printed later reports them.
+pub(super) fn report_exception(number: u64, info: InterruptionInfo) {
     let tag = crate::TAG;
-    if let Some(info) = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO) {
-        let interruption = InterruptionInfo(info as u32);
-        if interruption.is_nmi() {
-            return;
-        }
-        match interruption.vector() {
-            Some(vector) => crate::serial_println!(
-                "{tag} VM exit #{number}: guest exception vector={vector} (interruption info={info:#010x})"
-            ),
-            None => crate::serial_println!("{tag} VM exit #{number}: interruption info not valid ({info:#010x})"),
-        }
+    if info.is_nmi() {
+        return;
+    }
+    let raw = info.0;
+    match info.vector() {
+        Some(vector) => crate::serial_println!(
+            "{tag} VM exit #{number}: guest exception vector={vector} (interruption info={raw:#010x})"
+        ),
+        None => crate::serial_println!("{tag} VM exit #{number}: interruption info not valid ({raw:#010x})"),
     }
 }
