@@ -18,7 +18,9 @@
 //! RDMSR/WRMSR of IA32_KERNEL_GS_BASE, IN/OUT of the COM1 scratch register)
 //! and checks each result itself. A wrong one ends in `ud2` with
 //! [`GUEST_EMULATION_FAIL_MARKER`] in EAX. MSRs and ports it writes are real
-//! hardware, so it saves each one first and restores it afterwards.
+//! hardware, so it saves each one first and restores it afterwards. Then it
+//! runs one `hlt` with IF = 0: only Aleph0 moving RIP past it lets the guest
+//! go on.
 //!
 //! Guest RIP is [`GuestMemory::code_base`], guest RSP
 //! [`GuestMemory::stack_top`], and guest IDTR [`GuestMemory::idt`];
@@ -101,6 +103,7 @@ pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts {
     wrmsr: 2,
     io_in: 2,
     io_out: 2,
+    hlt: 1,
 };
 
 core::arch::global_asm!(
@@ -150,6 +153,9 @@ guest_code_start:
     jne guest_emulation_failed
     mov al, sil
     out dx, al
+    // HLT exits (HLT exiting is on). IF = 0, so no interrupt could ever end
+    // the halt: the guest goes on only because Aleph0 resumes past it.
+    hlt
     // No NMI handled yet. General-purpose registers are not VMCS fields, so
     // without this EBX would hold whatever the host had at VMLAUNCH.
     xor ebx, ebx

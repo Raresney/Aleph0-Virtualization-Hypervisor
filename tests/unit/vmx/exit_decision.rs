@@ -505,7 +505,7 @@ fn each_event_maps_to_its_action() {
             nmi_window,
             grant_write,
             emulate: None,
-            inject_gp: false,
+            inject_exception: None,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
@@ -538,6 +538,86 @@ fn each_event_maps_to_its_action() {
     );
     // A fault: RIP stays on the instruction. A constant, so checked at compile time.
     const { assert!(!ResumePlan::INJECT_GP.advance_rip) };
+    assert_eq!(
+        ExitEvent::Halted.action(),
+        ExitAction::Resume(ResumePlan::PAST_INSTRUCTION)
+    );
+    assert_eq!(
+        ExitEvent::GuestInvalidOpcode.action(),
+        ExitAction::Resume(ResumePlan::INJECT_UD)
+    );
+    const { assert!(!ResumePlan::INJECT_UD.advance_rip) };
+}
+
+#[test]
+fn hlt_resumes_past_the_instruction_and_is_counted() {
+    let (event, state) = decide(START, exit(EXIT_REASON_HLT));
+    assert_eq!(event, ExitEvent::Halted);
+    assert_eq!(state.emulated.hlt, START.emulated.hlt + 1);
+    assert_eq!(
+        ExitState {
+            emulated: START.emulated,
+            ..state
+        },
+        START
+    );
+}
+
+#[test]
+fn hlt_in_an_sti_shadow_is_decided_the_same() {
+    // `sti; hlt`: the exit reports blocking by STI; the decision does not
+    // depend on it, the RIP advance ends it.
+    let in_shadow = ExitInfo {
+        interruptibility: BLOCKING_BY_STI,
+        ..exit(EXIT_REASON_HLT)
+    };
+    assert_eq!(decide(START, in_shadow).0, ExitEvent::Halted);
+}
+
+#[test]
+fn skipping_an_instruction_ends_sti_and_mov_ss_blocking_only() {
+    assert_eq!(after_skipped_instruction(BLOCKING_BY_STI), 0);
+    assert_eq!(after_skipped_instruction(BLOCKING_BY_MOV_SS), 0);
+    // Blocking by SMI (bit 2) and by NMI (bit 3) outlast the instruction.
+    assert_eq!(after_skipped_instruction(0b1111), 0b1100);
+    assert_eq!(after_skipped_instruction(BLOCKING_BY_NMI), BLOCKING_BY_NMI);
+}
+
+#[test]
+fn mwait_and_monitor_inject_invalid_opcode() {
+    for basic in [EXIT_REASON_MWAIT, EXIT_REASON_MONITOR] {
+        assert_eq!(decide(START, exit(basic)), (ExitEvent::GuestInvalidOpcode, START));
+    }
+}
+
+#[test]
+fn injected_invalid_opcode_is_a_hardware_exception_without_error_code() {
+    // Valid (bit 31), hardware exception (type 3), vector 6, no bit 11.
+    assert_eq!(InterruptionInfo::INVALID_OPCODE, InterruptionInfo(0x8000_0306));
+    assert!(!InterruptionInfo::INVALID_OPCODE.delivers_error_code());
+    assert!(InterruptionInfo::GENERAL_PROTECTION.delivers_error_code());
+}
+
+#[test]
+fn last_main_vmcall_without_the_hlt_is_emulation_missing() {
+    let no_hlt = ExitState {
+        emulated: EmulationCounts {
+            hlt: 0,
+            ..EXPECTED_EMULATION
+        },
+        ..WAITING
+    };
+    assert_eq!(
+        decide(no_hlt, vmcall(MARKER + 1)),
+        (ExitEvent::EmulationMissing, no_hlt)
+    );
+}
+
+#[test]
+fn idle_exits_have_names() {
+    assert_eq!(exit_reason_name(EXIT_REASON_HLT), "HLT");
+    assert_eq!(exit_reason_name(EXIT_REASON_MWAIT), "MWAIT");
+    assert_eq!(exit_reason_name(EXIT_REASON_MONITOR), "MONITOR");
 }
 
 #[test]
@@ -639,6 +719,7 @@ fn emulated_exits() -> Vec<ExitInfo> {
         io(false, GUEST_IO_VALUE.into()),
         io(true, 0),
         io(false, 0),
+        exit(EXIT_REASON_HLT),
     ]
 }
 

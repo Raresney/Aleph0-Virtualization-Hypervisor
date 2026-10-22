@@ -14,7 +14,8 @@
 //! separate pure function with one signature, and the handled reasons are
 //! listed in one place:
 //!
-//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR, IN, OUT).
+//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR, IN, OUT), HLT, which it
+//!   skips, and MWAIT and MONITOR, which get #UD.
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
 //!   NMI reinjection).
 //!
@@ -65,6 +66,8 @@ pub fn exit_reason_name(basic: u16) -> &'static str {
         32 => "WRMSR",
         33 => "VM-entry failure: invalid guest state",
         34 => "VM-entry failure: MSR loading",
+        36 => "MWAIT",
+        39 => "MONITOR",
         41 => "VM-entry failure: machine-check event",
         48 => "EPT violation",
         49 => "EPT misconfiguration",
@@ -83,6 +86,8 @@ pub const EXIT_REASON_EXCEPTION_OR_NMI: u16 = 0;
 pub const EXIT_REASON_NMI_WINDOW: u16 = 8;
 /// Basic exit reason of CPUID, which always exits.
 pub const EXIT_REASON_CPUID: u16 = 10;
+/// Basic exit reason of HLT, with HLT exiting on.
+pub const EXIT_REASON_HLT: u16 = 12;
 /// Basic exit reason of a VMCALL exit.
 pub const EXIT_REASON_VMCALL: u16 = 18;
 /// Basic exit reason of IN/OUT (and INS/OUTS) to a port the I/O bitmaps
@@ -93,6 +98,10 @@ pub const EXIT_REASON_IO_INSTRUCTION: u16 = 30;
 pub const EXIT_REASON_RDMSR: u16 = 31;
 /// Basic exit reason of WRMSR, which exits for the same MSRs as RDMSR.
 pub const EXIT_REASON_WRMSR: u16 = 32;
+/// Basic exit reason of MWAIT, with MWAIT exiting on (Hyper-V forces it).
+pub const EXIT_REASON_MWAIT: u16 = 36;
+/// Basic exit reason of MONITOR, with MONITOR exiting on (Hyper-V forces it).
+pub const EXIT_REASON_MONITOR: u16 = 39;
 /// Basic exit reason of an EPT violation: an access the EPT entries do not
 /// allow.
 pub const EXIT_REASON_EPT_VIOLATION: u16 = 48;
@@ -198,6 +207,8 @@ impl InterruptionInfo {
     const TYPE_HARDWARE_EXCEPTION: u32 = 3;
     /// Bit 11: deliver an error code (VM_ENTRY_EXCEPTION_ERROR_CODE).
     const DELIVER_ERROR_CODE: u32 = 1 << 11;
+    /// IDT vector of #UD.
+    const UD_VECTOR: u32 = 6;
     /// IDT vector of #GP.
     const GP_VECTOR: u32 = 13;
 
@@ -212,6 +223,10 @@ impl InterruptionInfo {
     pub const GENERAL_PROTECTION: Self =
         Self(Self::VALID | (Self::TYPE_HARDWARE_EXCEPTION << 8) | Self::DELIVER_ERROR_CODE | Self::GP_VECTOR);
 
+    /// The VM_ENTRY_INTERRUPTION_INFO value that injects #UD, which has no
+    /// error code, at the next VM entry.
+    pub const INVALID_OPCODE: Self = Self(Self::VALID | (Self::TYPE_HARDWARE_EXCEPTION << 8) | Self::UD_VECTOR);
+
     /// Whether the field describes an event at all (bit 31).
     pub fn is_valid(self) -> bool {
         self.0 & Self::VALID != 0
@@ -221,6 +236,11 @@ impl InterruptionInfo {
     /// unblocking due to IRET) is ignored.
     pub fn is_nmi(self) -> bool {
         self.is_valid() && (self.0 >> 8) & 0b111 == Self::TYPE_NMI && self.vector() == Some(NMI_VECTOR)
+    }
+
+    /// Whether VM entry also delivers VM_ENTRY_EXCEPTION_ERROR_CODE (bit 11).
+    pub fn delivers_error_code(self) -> bool {
+        self.0 & Self::DELIVER_ERROR_CODE != 0
     }
 
     /// The vector (bits 7:0), if the field is valid.
@@ -314,8 +334,15 @@ pub enum ExitEvent {
     /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
     /// bitmap, or a non-canonical value for an intercepted one.
     GuestGeneralProtection,
-    /// The last main VMCALL arrived, but the guest's emulated exits do not
-    /// match `guest::EXPECTED_EMULATION`.
+    /// HLT: resume past it at once. The guest's next instruction runs as if
+    /// an interrupt had woken it.
+    Halted,
+    /// MWAIT or MONITOR, which the guest gets #UD for, as on a CPU without
+    /// them: the guest's CPUID.1:ECX bit 3 (MONITOR/MWAIT) is clear under
+    /// Hyper-V, and `cpuid_policy` passes it through.
+    GuestInvalidOpcode,
+    /// The last main VMCALL arrived, but the guest's emulated exits
+    /// (HLT included) do not match `guest::EXPECTED_EMULATION`.
     EmulationMissing,
     /// Anything else.
     Unexpected,
@@ -324,7 +351,8 @@ pub enum ExitEvent {
 /// How the handler prepares the VMCS (and EPT) before resuming the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumePlan {
-    /// Move GUEST_RIP past the exiting instruction (a VMCALL).
+    /// Move GUEST_RIP past the exiting instruction, which also ends blocking
+    /// by STI and by MOV SS ([`after_skipped_instruction`]).
     pub advance_rip: bool,
     /// Write [`InterruptionInfo::NMI`] to VM_ENTRY_INTERRUPTION_INFO.
     pub inject_nmi: bool,
@@ -337,9 +365,9 @@ pub struct ResumePlan {
     /// Execute this instruction for the guest and put its result in the
     /// guest's registers, before RIP moves past it.
     pub emulate: Option<Emulation>,
-    /// Write [`InterruptionInfo::GENERAL_PROTECTION`] (error code 0) to
-    /// VM_ENTRY_INTERRUPTION_INFO.
-    pub inject_gp: bool,
+    /// Write this exception to VM_ENTRY_INTERRUPTION_INFO, with error code 0
+    /// when it delivers one. RIP stays on the faulting instruction.
+    pub inject_exception: Option<InterruptionInfo>,
 }
 
 impl ResumePlan {
@@ -350,7 +378,7 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: false,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -362,7 +390,7 @@ impl ResumePlan {
         nmi_window: Some(false),
         grant_write: false,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -372,7 +400,7 @@ impl ResumePlan {
         nmi_window: Some(true),
         grant_write: false,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -382,7 +410,7 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: true,
         emulate: None,
-        inject_gp: false,
+        inject_exception: None,
     };
     /// Inject #GP(0); RIP stays on the faulting instruction, as for any
     /// fault.
@@ -392,8 +420,26 @@ impl ResumePlan {
         nmi_window: None,
         grant_write: false,
         emulate: None,
-        inject_gp: true,
+        inject_exception: Some(InterruptionInfo::GENERAL_PROTECTION),
     };
+    /// Inject #UD; RIP stays on the faulting instruction.
+    pub const INJECT_UD: Self = Self {
+        inject_exception: Some(InterruptionInfo::INVALID_OPCODE),
+        ..Self::INJECT_GP
+    };
+}
+
+/// GUEST_INTERRUPTIBILITY_STATE after Aleph0 skips the instruction the guest
+/// exited on: blocking by STI and by MOV SS cleared, the rest kept.
+///
+/// Both last until the end of the instruction after STI or MOV SS. When
+/// that instruction is the one skipped, the CPU never ends them, so the
+/// handler must, as KVM does whenever it skips an instruction. Example: an
+/// idle loop's `sti; hlt` exits on the HLT with interruptibility 0x1.
+/// Resumed past it with bit 0 still set, the guest would keep interrupts
+/// blocked through one more instruction it never asked to protect.
+pub fn after_skipped_instruction(interruptibility: u32) -> u32 {
+    interruptibility & !(scenario::BLOCKING_BY_STI | scenario::BLOCKING_BY_MOV_SS)
 }
 
 /// What the handler does after an exit.
@@ -420,6 +466,8 @@ impl ExitEvent {
                 ..ResumePlan::PAST_INSTRUCTION
             }),
             Self::GuestGeneralProtection => ExitAction::Resume(ResumePlan::INJECT_GP),
+            Self::Halted => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
+            Self::GuestInvalidOpcode => ExitAction::Resume(ResumePlan::INJECT_UD),
             Self::LastMainVmcall => ExitAction::Finished,
             Self::InterruptedDelivery
             | Self::EptWriteMissing
@@ -447,6 +495,8 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         EXIT_REASON_RDMSR => emulation::rdmsr(state, &exit),
         EXIT_REASON_WRMSR => emulation::wrmsr(state, &exit),
         EXIT_REASON_IO_INSTRUCTION => emulation::io(state, &exit),
+        EXIT_REASON_HLT => emulation::hlt(state),
+        EXIT_REASON_MWAIT | EXIT_REASON_MONITOR => (ExitEvent::GuestInvalidOpcode, state),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
         EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),

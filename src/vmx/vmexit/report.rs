@@ -127,6 +127,12 @@ pub(super) fn report_event(
             "{tag} VM exit #{number}: MSR {:#x} is outside the MSR bitmap, or the WRMSR value is not canonical; injecting #GP(0) at rip={rip:#018x}.",
             exit.map_or(0, |exit| exit.guest_rcx as u32),
         ),
+        // Not "resuming the guest": `run-hyperv.ps1 -InjectNmi` waits for
+        // that text after main VMCALL #1, and this exit comes before it.
+        ExitEvent::Halted => crate::serial_println!("{tag} VM exit #{number}: HLT; going on at rip={rip:#018x}."),
+        ExitEvent::GuestInvalidOpcode => crate::serial_println!(
+            "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
+        ),
         ExitEvent::EmulationMissing => crate::serial_println!(
             "{tag} VM exit #{number}: last main VMCALL (rax={rax:#x}), but the emulated exits were {} instead of {EXPECTED_EMULATION}.",
             state.emulated,

@@ -50,7 +50,7 @@ use crate::vmx::guest_state::GuestState;
 use crate::vmx::host_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
 use crate::vmx::segment::DescriptorTable;
-use crate::vmx::vmcs::{DesiredControls, GuestStop, VmcsRegion};
+use crate::vmx::vmcs::{DesiredControls, GuestKind, GuestStop, VmcsRegion};
 use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
 use crate::vmx::vmxon::VmxOperation;
 
@@ -366,7 +366,7 @@ fn prepare_vmcs(
 
     // SAFETY: VMX root operation with the VMCS `run` created and made
     // current.
-    unsafe { vmx::vmcs::configure_controls(controls, DesiredControls::minimal_64_bit_guest()) }
+    unsafe { vmx::vmcs::configure_controls(controls, DesiredControls::minimal_64_bit_guest(GuestKind::BuiltInTest)) }
         .map_err(vmcs_step("control setup"))?;
     log!("VMCS controls written and read back successfully.");
 

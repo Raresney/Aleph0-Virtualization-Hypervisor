@@ -8,6 +8,9 @@
 //! registers and moves RIP past the instruction, so the guest sees what the
 //! hardware says, except where a policy here changes it
 //! ([`cpuid_policy`]).
+//!
+//! HLT is counted with them but never executed: Aleph0 resumes past it (see
+//! [`hlt`]).
 
 use core::arch::x86_64::CpuidResult;
 use core::fmt;
@@ -39,14 +42,16 @@ pub struct EmulationCounts {
     pub wrmsr: u32,
     pub io_in: u32,
     pub io_out: u32,
+    /// HLT exits, resumed past without halting.
+    pub hlt: u32,
 }
 
 impl fmt::Display for EmulationCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "cpuid={} rdmsr={} wrmsr={} in={} out={}",
-            self.cpuid, self.rdmsr, self.wrmsr, self.io_in, self.io_out
+            "cpuid={} rdmsr={} wrmsr={} in={} out={} hlt={}",
+            self.cpuid, self.rdmsr, self.wrmsr, self.io_in, self.io_out, self.hlt
         )
     }
 }
@@ -92,6 +97,15 @@ pub(super) fn cpuid(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState)
         ExitEvent::Emulated(emulation),
         counted(state, |counts| counts.cpuid += 1),
     )
+}
+
+/// HLT (exit reason 12): resume past it without halting. A halted vCPU
+/// waits for an interrupt, and the guest's interrupts are delivered when it
+/// next runs anyway, so going on at once is a correct, if busy, wait. The
+/// HLT activity state would avoid one exit per idle loop round, but needs
+/// IA32_VMX_MISC bit 6 and a rule for NMI exits taken in that state.
+pub(super) fn hlt(state: ExitState) -> (ExitEvent, ExitState) {
+    (ExitEvent::Halted, counted(state, |counts| counts.hlt += 1))
 }
 
 /// Whether `value` is a canonical 48-bit address: bits 63:47 all equal.

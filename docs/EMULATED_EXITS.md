@@ -682,16 +682,73 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
   seeing it (MSRs outside the ranges get a #GP, section 4). The
   multi-port rule (section 5) also lets a wide access that touches `0x3FF`
   reach its neighbours, the serial driver's registers.
-- **The #GP path is tested on the host only.** It is delivered through the
-  guest's own IDT, which in the test guest has only vector 2, so a #GP would
-  find no gate. The test guest never triggers it. The decisions
-  (`GuestGeneralProtection`) and the encoding (`0x80000B0D`) are host tests;
-  delivery needs an OS guest with an IDT of its own.
+- **The #GP and #UD paths are tested on the host only.** They are
+  delivered through the guest's own IDT, which in the test guest has only
+  vector 2, so they would find no gate. The test guest never triggers them.
+  The decisions (`GuestGeneralProtection`, `GuestInvalidOpcode`) and the
+  encodings (`0x80000B0D`, `0x80000306`) are host tests; delivery needs a
+  guest with an IDT of its own (section 9).
 - **MSRs held in the VMCS cannot be intercepted.** They would need an
   emulation path that reads and writes the VMCS guest-state field
   (VMREAD/VMWRITE) instead of using RDMSR/WRMSR. `VMCS_HELD_MSRS` lists ten;
   newer CPUs have more fields (IA32_RTIT_CTL, IA32_S_CET and IA32_PKRS, for
   example), which belong on the list before Aleph0 intercepts them.
+
+## 9. Idle and exceptions: HLT, MWAIT, MONITOR and the exception bitmap
+
+Two VMCS settings would stop a real guest at its first idle and its first
+fault (issue #19).
+
+**HLT, MWAIT and MONITOR always exit under Hyper-V.** The primary-control
+capability Hyper-V reports, `required=0x240065f2`, has bits 7 (HLT exiting),
+10 (MWAIT exiting) and 29 (MONITOR exiting) among its must-be-1 bits, so
+`ControlCapability::choose` sets them whatever Aleph0 asks for. Aleph0 also
+requests bit 7 itself, so a guest HLT exits on any CPU.
+
+| Exit | Reason | Decision | Resume |
+|---|---|---|---|
+| HLT | 12 | `Halted`, counted as `hlt` in `EmulationCounts` | past the instruction |
+| MWAIT | 36 | `GuestInvalidOpcode` | inject #UD (`0x80000306`), RIP unchanged |
+| MONITOR | 39 | `GuestInvalidOpcode` | inject #UD, RIP unchanged |
+
+HLT is resumed at once rather than parked in the HLT activity state: a
+halted vCPU waits for an interrupt, and the guest gets its interrupts when it
+next runs anyway. The cost is one exit per round of an idle loop. The HLT
+activity state would avoid it, but needs `IA32_VMX_MISC` bit 6 and a rule
+for NMI exits taken in that state.
+
+MWAIT and MONITOR get #UD, as on a CPU without them: Hyper-V reports
+CPUID.1:ECX bit 3 (MONITOR/MWAIT) clear (`0xf7fa3223`), and `cpuid_policy`
+passes that through, so a guest that checks CPUID never runs them.
+
+**Ending the interrupt shadow.** STI and MOV SS block interrupts until the
+end of the next instruction (interruptibility bits 0 and 1). An idle loop
+runs `sti; hlt`, so the HLT exit reports blocking by STI. The CPU never
+completes that HLT, so it never ends the shadow; Aleph0 must. Whenever it
+moves RIP past an instruction, the handler clears both bits
+(`after_skipped_instruction`), as KVM does when it skips an instruction. It
+writes `GUEST_INTERRUPTIBILITY_STATE` only when one of them was set, so exits
+outside a shadow cost no extra VMWRITE.
+
+**The exception bitmap depends on the guest** (`vmcs::exception_bitmap`):
+
+| `GuestKind` | Bitmap | Why |
+|---|---|---|
+| `BuiltInTest` | all ones | its IDT has only the NMI gate; its `ud2` paths rely on the #UD exit |
+| `OwnIdt` | 0 | the guest takes its own faults (Linux builds its early page tables from #PF) |
+
+With a bitmap of 0, NMIs still exit (the NMI-exiting pin control, not the
+bitmap), and a fault the guest cannot handle ends in a triple fault (reason
+2), which stops it. Bring-up selects `BuiltInTest`; `OwnIdt` is for the
+firmware as the guest (#21).
+
+**The test.** The test guest runs one `hlt` after its I/O checks, with
+IF = 0, so no interrupt could end the halt; only Aleph0 moving RIP past it
+lets the guest go on. The HLT is exit #10, so the EPT violation becomes exit
+#11 and the run has 13 exits (15 with `-InjectNmi`), ending in
+`emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2 hlt=1.`. The HLT line,
+`HLT; going on at rip=...`, deliberately avoids the text `resuming the
+guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 
 ## Cheat sheet
 
@@ -708,6 +765,9 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 | I/O qualification | 2:0 size − 1, 3 IN, 4 string, 5 REP, 6 immediate, 31:16 port |
 | CPUID policy | CPUID.1:ECX bit 5 (VMX) cleared |
 | Injected #GP | `0x80000B0D`, error code 0, RIP unchanged |
+| Injected #UD (MWAIT, MONITOR) | `0x80000306`, no error code, RIP unchanged |
+| Exit reason 12 / 36 / 39 | HLT / MWAIT / MONITOR |
+| Exception bitmap | all ones for the test guest, 0 for a guest with its own IDT |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
-| `EXPECTED_EMULATION` | cpuid 1, rdmsr 2, wrmsr 2, in 2, out 2 |
+| `EXPECTED_EMULATION` | cpuid 1, rdmsr 2, wrmsr 2, in 2, out 2, hlt 1 |

@@ -58,22 +58,63 @@ pub struct DesiredControls {
     pub secondary: u32,
     pub exit: u32,
     pub entry: u32,
+    /// EXCEPTION_BITMAP: the guest exception vectors that exit instead of
+    /// going through the guest's IDT ([`exception_bitmap`]).
+    pub exception_bitmap: u32,
 }
 
 impl DesiredControls {
     /// Minimal requests for a 64-bit guest on this 64-bit host, plus NMI
     /// exiting with virtual NMIs, so Aleph0 sees the guest's NMIs and can
-    /// reinject them, EPT, so guest memory goes through Aleph0's tables, and
-    /// the MSR and I/O bitmaps, so only the MSRs and ports Aleph0 chooses
-    /// exit (`vmx::exit_bitmaps`).
-    pub const fn minimal_64_bit_guest() -> Self {
+    /// reinject them, EPT, so guest memory goes through Aleph0's tables, the
+    /// MSR and I/O bitmaps, so only the MSRs and ports Aleph0 chooses exit
+    /// (`vmx::exit_bitmaps`), and HLT exiting. Hyper-V forces HLT exiting
+    /// anyway; requesting it means a guest HLT with IF = 0 exits on every
+    /// CPU instead of halting it for good. The exception bitmap depends on
+    /// `kind`.
+    pub const fn minimal_64_bit_guest(kind: GuestKind) -> Self {
         Self {
             pin: PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS,
-            primary: CPU_BASED_USE_IO_BITMAPS | CPU_BASED_USE_MSR_BITMAPS,
+            primary: CPU_BASED_HLT_EXITING | CPU_BASED_USE_IO_BITMAPS | CPU_BASED_USE_MSR_BITMAPS,
             secondary: SECONDARY_ENABLE_EPT,
             exit: VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
             entry: VM_ENTRY_IA32E_MODE_GUEST,
+            exception_bitmap: exception_bitmap(kind),
         }
+    }
+}
+
+/// Which guest the VMCS is set up for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestKind {
+    /// Aleph0's built-in test guest (`vmx::guest`): its IDT has only the NMI
+    /// gate.
+    BuiltInTest,
+    /// A guest with its own full IDT, such as the firmware or an OS, which
+    /// handles its own faults.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "selected once the firmware runs as the guest (#21)")
+    )]
+    OwnIdt,
+}
+
+/// The exception bitmap for `kind`.
+///
+/// The built-in test guest's IDT has only vector 2 (NMI). Without an exit, a
+/// fault there would hit a missing gate (#GP, then #DF, then a triple
+/// fault), so the host would see nothing useful. All ones makes every
+/// exception arrive as exit reason 0, where the handler prints the vector;
+/// its `ud2` paths rely on that.
+///
+/// A guest with its own IDT takes its own faults (Linux builds its early
+/// page tables from #PF), so nothing exits. NMIs still exit, through the
+/// NMI-exiting pin control, not this bitmap; a fault the guest cannot handle
+/// ends in a triple fault (reason 2), which stops it.
+pub const fn exception_bitmap(kind: GuestKind) -> u32 {
+    match kind {
+        GuestKind::BuiltInTest => u32::MAX,
+        GuestKind::OwnIdt => 0,
     }
 }
 
@@ -86,14 +127,6 @@ fn primary_request(desired: DesiredControls) -> u32 {
         desired.primary
     }
 }
-
-/// Exception bitmap value: every exception vector (0-31) causes a VM exit.
-///
-/// The guest has its own IDT with only vector 2 (NMI) present. Without an
-/// exit, a guest fault would hit a missing gate (#GP, then #DF, then a triple
-/// fault), so the host would see nothing useful. With all bits set, every
-/// exception arrives as exit reason 0 and the handler prints the vector.
-const EXCEPTION_BITMAP_ALL: u32 = u32::MAX;
 
 /// Why a VMCS operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,8 +344,8 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 /// When `desired.secondary` is nonzero, the secondary controls are chosen,
 /// written and verified the same way, and primary bit 31 activates them.
 /// Always request 64-bit host mode on VM exit, regardless of `desired.exit`.
-/// Also zeroes the counts and fields VM entry checks, and makes every guest
-/// exception exit ([`EXCEPTION_BITMAP_ALL`]). It also checks that the CPU
+/// Also zeroes the counts and fields VM entry checks, and writes
+/// `desired.exception_bitmap`. It also checks that the CPU
 /// allows NMI-window exiting (`VmcsError::NmiWindowExitingUnsupported`
 /// otherwise), which the exit handler switches on at run time.
 ///
@@ -364,7 +397,7 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
             write_verified(field, 0)?;
         }
 
-        write_verified(EXCEPTION_BITMAP, EXCEPTION_BITMAP_ALL.into())?;
+        write_verified(EXCEPTION_BITMAP, desired.exception_bitmap.into())?;
     }
 
     Ok(())

@@ -66,7 +66,7 @@ fn only_vm_fail_valid_has_an_instruction_error_to_read() {
 
 #[test]
 fn secondary_controls_activate_primary_bit_31() {
-    let desired = DesiredControls::minimal_64_bit_guest();
+    let desired = DesiredControls::minimal_64_bit_guest(GuestKind::BuiltInTest);
     assert_eq!(desired.secondary, SECONDARY_ENABLE_EPT);
     assert_eq!(primary_request(desired), desired.primary | (1 << 31));
 }
@@ -76,7 +76,7 @@ fn no_secondary_controls_leave_the_primary_request_alone() {
     let desired = DesiredControls {
         primary: 0x10,
         secondary: 0,
-        ..DesiredControls::minimal_64_bit_guest()
+        ..DesiredControls::minimal_64_bit_guest(GuestKind::BuiltInTest)
     };
     assert_eq!(primary_request(desired), 0x10);
 }
@@ -92,7 +92,25 @@ fn nmi_window_off_clears_only_bit_22() {
 }
 
 #[test]
-fn the_guest_requests_msr_and_io_bitmaps() {
-    let desired = DesiredControls::minimal_64_bit_guest();
-    assert_eq!(desired.primary, (1 << 25) | (1 << 28));
+fn the_guest_requests_hlt_exiting_and_the_msr_and_io_bitmaps() {
+    let desired = DesiredControls::minimal_64_bit_guest(GuestKind::BuiltInTest);
+    assert_eq!(desired.primary, (1 << 7) | (1 << 25) | (1 << 28));
+}
+
+#[test]
+fn every_exception_of_the_built_in_test_guest_exits() {
+    assert_eq!(exception_bitmap(GuestKind::BuiltInTest), u32::MAX);
+    assert_eq!(
+        DesiredControls::minimal_64_bit_guest(GuestKind::BuiltInTest).exception_bitmap,
+        u32::MAX
+    );
+}
+
+#[test]
+fn a_guest_with_its_own_idt_takes_its_own_exceptions() {
+    assert_eq!(exception_bitmap(GuestKind::OwnIdt), 0);
+    assert_eq!(
+        DesiredControls::minimal_64_bit_guest(GuestKind::OwnIdt).exception_bitmap,
+        0
+    );
 }
