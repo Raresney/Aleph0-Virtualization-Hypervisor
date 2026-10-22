@@ -349,6 +349,47 @@ the `-InjectNmi` job waits for. The exits are counted per basic reason in a
 fixed array; reasons past 127 and an unreadable reason share one last
 counter, shown as `other`.
 
+## What a stop prints
+
+An exit that stops the guest prints its usual lines, then `stopping the
+guest; returning to bring-up.`, then everything needed to read the stop
+without another run (`src/vmx/vmexit/dump.rs`, `history.rs`):
+
+1. **The guest state as the CPU saved it**, read back from the VMCS in the
+   same format bring-up prints before VMLAUNCH, so the two can be compared
+   line by line (`VM exit #13: guest rip=...`, the segments, GDTR and IDTR,
+   the SYSENTER MSRs).
+2. **The 15 general-purpose registers**, four to a line.
+3. **DR7, PAT and EFER**, from wherever the controls leave them: the VMCS
+   when an exit control saves them, the MSR when nothing switches it, and
+   `not saved` otherwise. Every exit sets DR7 to `0x400`, so under Hyper-V's
+   controls DR7 is `not saved`, and PAT and EFER come from their MSRs.
+4. **The VMCS fields that explain an exit**, one line per group: pending
+   events (interruptibility, activity, pending debug exceptions), an
+   injection Aleph0 queued, the exit's event and an interrupted delivery
+   with their error codes, the guest linear and physical addresses, and the
+   five controls with the exception bitmap. A field that cannot be read
+   prints as `unreadable`, and the dump goes on.
+5. **The exit counts by reason** (the histogram above).
+6. **The last 64 exits, oldest first**, one line each: number, reason, RIP,
+   instruction length, qualification, interruption and IDT-vectoring info,
+   RAX to RDX, and what `decide` made of it:
+
+   ```text
+   VM exit #13: the last 13 exits, oldest first (0 older not kept):
+   VM exit #13:   #1 reason=10 (CPUID) rip=0x7eae1007 len=2 qual=0x0 info=0x0 vectoring=0x0 rax=0x1 ... -> Emulated(Cpuid { leaf: 1, subleaf: 0 })
+   ```
+
+The exit handler records every exit in that ring, including the ones the
+print policy leaves out, from the fields it reads anyway. A failed VMRESUME
+prints the same report, and a panic prints the ring after its message.
+
+The test guest's planned stop prints all of this too, so every run
+exercises it. To see a stop nobody planned, build with the
+`unexpected-exit-test` feature (`run-hyperv.ps1 -Features
+unexpected-exit-test`): main VMCALL #1 is then judged unexpected, and the
+run stops there and returns `ABORTED`.
+
 ## Common questions
 
 **Is there a real chip?** Not under Hyper-V or QEMU: the 16550 is emulated

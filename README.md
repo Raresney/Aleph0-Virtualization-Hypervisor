@@ -75,8 +75,10 @@ guest's COM1 to `run\guest-serial.log`
 diagnostics only appear there, not on the VM console. See
 [docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md). `-InjectNmi` sends the
 guest an NMI after its first VMCALL, and `-Features` builds with the
-test-only switches in `Cargo.toml` (`host-fault-test`, `host-nmi-test`; see
-[docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8).
+test-only switches in `Cargo.toml`: `host-fault-test` and `host-nmi-test` (see
+[docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8),
+`unexpected-exit-test` and `trace-exits` (see
+[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)).
 
 **QEMU + OVMF (no VMX):** put `OVMF_CODE.fd` and `OVMF_VARS.fd` from
 [rust-osdev/ovmf-prebuilt](https://github.com/rust-osdev/ovmf-prebuilt) in
@@ -103,7 +105,7 @@ diagnostics that run before VMXON.
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
-| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); its report lines (`report.rs`) |
+| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
 | `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |

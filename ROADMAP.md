@@ -61,9 +61,14 @@ Before the first `VMLAUNCH` (section 3):
 - [x] Replace the `uefi` panic handler with Aleph0's own and drop the crate's `panic_handler` feature. Always print the panic over serial, print on the console only in ordinary boot-services context, then halt with `cli; hlt`. No `stall`, no `runtime::reset`, no other firmware calls. Done in `src/output.rs`; a recursion guard halts on a nested panic. On Hyper-V a test panic in `main` printed on the console and in `run\serial.log`, and the VM stayed halted instead of resetting.
 - [x] Track the output phase in one global (boot services, inside the VM-exit handler, runtime after `ExitBootServices`). `log!` writes to the console only in the boot-services phase and to serial in every phase. `output::Phase`; `vmexit_handler` sets `VmExit` first. On Hyper-V a panic after setting `VmExit` from `main` reached `run\serial.log` only, not the console, and the VM stayed halted. A panic in a real exit is first exercised at `VMLAUNCH`.
 
+Before the firmware runs as the guest (issue #18, ahead of #21 in section 5), since exits become frequent then:
+
+- [ ] Make the serial port base a parameter instead of the fixed `COM1`. Send hypervisor output to COM2 (`0x2F8`) and leave COM1 to the guest OS, without interception at first. `serial::init` takes a `SerialPort` (`COM1`, `COM2`) and keeps its base for `write_byte` and the panic handler; a failed loopback test leaves output off, with no fallback to COM1. `scripts/run-hyperv.ps1` attaches COM2 to `\\.\pipe\aleph0-com2` (`run\serial.log`, on the console) and COM1 to `\\.\pipe\aleph0-com1` (`run\guest-serial.log`), with one reader each started before `Start-VM`; `scripts/run.ps1` sends COM2 to the terminal and COM1 to a file. Implemented and host-tested; the readers tested against local pipe servers. Still to do: the Hyper-V run, which should print `Serial output enabled on COM2 (0x2f8).`.
+- [ ] Add log levels (error, warn, info, trace; trace off by default) and rate-limit repeated messages. `vmexit::policy` decides how much each exit prints once it knows how the exit ended: a stop or an unreadable field in full (error), the first 16 exits of each basic reason in full (info), then one summary line at each power of two (info), nothing else (trace). The `trace-exits` Cargo feature prints every exit in full; NMIs that arrived in root operation are warnings. Exits are counted per reason in a fixed array (reasons past 127 and an unreadable one share a last counter), and every stop prints the counts as one histogram line. Host-tested, including that every exit of the test guest's runs still prints in full. Still to do: the Hyper-V run; the rate limit itself first runs on real VMX with #21.
+- [ ] Keep an in-memory ring buffer of the last 64 exits (what the handler read, and the event `decide` returned), printed oldest first at every stop and by the panic handler. Every stop also dumps the guest state read back from the VMCS (in the pre-launch format), the 15 general-purpose registers, DR7, PAT and EFER from wherever the controls leave them, and the VMCS fields that explain an exit (pending events, a queued injection, the exit's event and an interrupted delivery with their error codes, guest addresses, controls); a failed VMRESUME prints the same. Host-tested: the ring, the dump's field table, the choice of source for DR7, PAT and EFER, and the formatting. Still to do: the Hyper-V runs, plain, `-InjectNmi`, and `-Features unexpected-exit-test`, the first real-VMX run of a stop other than the planned one.
+
 At the `ExitBootServices` milestone (section 5):
 
-- [ ] Make the serial port base a parameter instead of the fixed `COM1`. Send hypervisor output to COM2 (`0x2F8`) and leave COM1 to the guest OS, without interception at first. In `scripts/run-hyperv.ps1`, attach COM2 to `\\.\pipe\aleph0-com2` and point `scripts/read-serial.ps1` at it.
 - [ ] Switch the phase to runtime immediately after `ExitBootServices`. Ideally make the console unreachable from runtime code, so a mistake fails to compile rather than silently printing nothing.
 - [ ] Keep the logging code and its state (`serial.rs` statics such as `READY`) in memory the OS will not reclaim. This is part of the persistence item in section 5, not a separate mechanism.
 
@@ -73,8 +78,7 @@ At multiple vCPUs (section 5):
 
 When guest exits become frequent (OS guest):
 
-- [ ] Add log levels (error, warn, info, trace; trace off by default) and rate-limit repeated messages, for example "CPUID exit x1000".
-- [ ] Optionally keep an in-memory ring buffer of recent events and send it over serial only on panic or when a guest tool asks for it with `VMCALL`.
+- [ ] Let a guest tool ask for the exit history with a `VMCALL`. Guest VMCALLs also carry Hyper-V hypercalls, so this waits for how those are routed (#27).
 
 At the virtual-device milestone (section 5):
 

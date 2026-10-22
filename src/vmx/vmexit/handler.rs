@@ -21,6 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use core::fmt;
 
+use super::history::{self, ExitRecord};
 use super::policy::{self, COUNTERS, Level, MAX_LEVEL, exit_detail};
 use super::report::{ExitReport, report_exit, report_stop};
 use super::{RegisterFrame, read_field};
@@ -163,6 +164,8 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let host_nmi = host::take_pending_nmi();
     let (event, next) = judge(read.exit, host_nmi);
     let outcome = carry_out(event, &read, next, frame);
+    // Before anything prints, so a panic while printing still shows this exit.
+    history::record(read.record(number, event));
     let basic = read.reason().map_or(UNREADABLE_REASON, |reason| reason.basic);
     let count = count_exit(basic);
     report_exit(&ExitReport {
@@ -176,7 +179,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
         outcome,
     });
     if outcome.stops() {
-        report_stop(number, &exits_by_reason());
+        report_stop(number, frame, &exits_by_reason());
     } else {
         #[cfg(feature = "host-nmi-test")]
         if event == ExitEvent::MainVmcall {
@@ -232,6 +235,22 @@ impl ExitRead {
     /// VM_EXIT_REASON for the stop value, or [`UNREADABLE_REASON`].
     fn raw_reason(&self) -> u32 {
         self.reason.map_or(u32::from(UNREADABLE_REASON), |raw| raw as u32)
+    }
+
+    /// This exit, number `number`, as the history keeps it, with what
+    /// `decide` made of it (`event`).
+    fn record(&self, number: u64, event: ExitEvent) -> ExitRecord {
+        ExitRecord {
+            number,
+            reason: self.reason.ok().map(|raw| raw as u32),
+            qualification: self.qualification.ok(),
+            rip: self.rip.ok(),
+            length: self.length.ok(),
+            interruption_info: self.interruption_info.ok().map(|info| info as u32),
+            idt_vectoring_info: self.idt_vectoring.ok().map(|info| info as u32),
+            registers: self.registers,
+            event,
+        }
     }
 
     /// Whether a VMCS field the handler read could not be read.
@@ -683,10 +702,12 @@ unsafe fn queue_exception(exception: InterruptionInfo) -> Result<(), VmcsError> 
 }
 
 /// Called by the entry stub when VMRESUME falls through instead of entering
-/// the guest; `rflags` is RFLAGS right after it. Prints why, then returns
-/// the stop value the stub hands back to bring-up.
+/// the guest; `rflags` is RFLAGS right after it, and `frame` the guest's
+/// registers, which the stub pushed again. Prints why, then the same stop
+/// report as an exit that stops the guest, and returns the stop value the
+/// stub hands back to bring-up.
 #[unsafe(no_mangle)]
-extern "efiapi" fn vmresume_failed(rflags: u64) -> u64 {
+extern "efiapi" fn vmresume_failed(rflags: u64, frame: *const RegisterFrame) -> u64 {
     let tag = crate::TAG;
     match vmcs::resume_failure(rflags) {
         // SAFETY: a VmFailValid implies VMX operation with a current VMCS,
@@ -701,6 +722,11 @@ extern "efiapi" fn vmresume_failed(rflags: u64) -> u64 {
         error => crate::serial_println!("{tag} VMRESUME failed: {error:?}"),
     }
     crate::serial_println!("{tag} VMRESUME failed; stopping the guest; returning to bring-up.");
+    // SAFETY: the stub passes the frame it just pushed on the exit stack,
+    // which stays put until this returns.
+    let frame = unsafe { &*frame };
+    // The VMRESUME belongs to the last exit, so its number heads the report.
+    report_stop(EXIT_COUNT.load(Ordering::Relaxed), frame, &exits_by_reason());
     encode_resume_failed(rflags)
 }
 

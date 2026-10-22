@@ -18,3 +18,6 @@ host-fault-test = []
 host-nmi-test = []
 # Print every VM exit in full, with no rate limit (vmexit/policy.rs).
 trace-exits = []
+# Expect the wrong RAX at main VMCALL #1, so the guest stops there as an
+# unexpected exit: the stop report and teardown of a stop nobody planned.
+unexpected-exit-test = []

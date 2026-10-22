@@ -18,16 +18,26 @@
 //! handler updates the VMCS and returns 0, and the stub executes VMRESUME. To
 //! stop, it returns a stop value, and the stub jumps back into
 //! `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`). The
-//! lines that only print live in `report.rs`.
+//! lines that only print live in `report.rs`; how much of each exit they
+//! print is `policy.rs`'s decision. Every stop adds the guest's state and
+//! registers (`dump.rs`) and the last exits (`history.rs`).
 
 use core::ptr::NonNull;
 
 use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::{self, VmcsError};
 
+mod dump;
 mod handler;
+mod history;
 mod policy;
 mod report;
+
+/// Prints the last VM exits, oldest first, each line after `context`: for
+/// the panic handler, so a panic in exit context shows what led to it. Like
+/// the panic handler, left out of host tests.
+#[cfg(not(test))]
+pub use history::report as report_exit_history;
 
 /// VMREADs `field` of the current VMCS. For the exit handler and its
 /// reports, which run in exit context only.
@@ -103,8 +113,8 @@ const _: () = {
 // Stack alignment (Microsoft x64 ABI: RSP is a multiple of 16 at each
 // `call`): HOST_RSP is 16-aligned; 15 pushes take 120 bytes, and 40 more
 // (32 bytes of shadow space plus 8 of padding) make 160, a multiple of 16.
-// After the 15 pops RSP is HOST_RSP again, so the failure path needs only
-// the 32 bytes of shadow space.
+// After the 15 pops RSP is HOST_RSP again, and the failure path pushes the
+// same 15 registers, so the same 40 bytes align its call too.
 //
 // Only the 15 general-purpose registers are saved, because nothing here
 // touches vector state: the x86_64-unknown-uefi target is soft-float with
@@ -164,11 +174,30 @@ vmexit_entry:
     pop r15
     vmresume
 
-    // Reached only if VMRESUME failed; RFLAGS say how. vmresume_failed
-    // returns the stop value in RAX.
+    // Reached only if VMRESUME failed; RFLAGS say how. The guest's
+    // registers are still live: push them again as a RegisterFrame for the
+    // stop's dump. PUSH leaves RFLAGS alone, so PUSHFQ still reads what
+    // VMRESUME left. vmresume_failed(rflags = RCX, frame = RDX) returns the
+    // stop value in RAX.
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
     pushfq
     pop rcx
-    sub rsp, 32
+    mov rdx, rsp
+    sub rsp, 40
     call vmresume_failed
     jmp vmx_return_to_launcher
 "#

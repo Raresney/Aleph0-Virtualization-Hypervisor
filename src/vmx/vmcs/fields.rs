@@ -101,6 +101,14 @@ pub const EPT_POINTER: u32 = 0x201A;
 
 /// VM-exit control bit 9: the host runs in 64-bit mode after a VM exit.
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
+/// VM-exit control bit 2: save the guest's DR7 and IA32_DEBUGCTL into the
+/// VMCS (GUEST_DR7, GUEST_IA32_DEBUGCTL). Every exit sets DR7 to 0x400, so
+/// without it the guest's DR7 is gone after the exit.
+pub const VM_EXIT_SAVE_DEBUG_CONTROLS: u64 = 1 << 2;
+/// VM-exit control bits 18 and 20: save the guest's PAT and EFER into
+/// GUEST_IA32_PAT and GUEST_IA32_EFER.
+pub const VM_EXIT_SAVE_IA32_PAT: u64 = 1 << 18;
+pub const VM_EXIT_SAVE_IA32_EFER: u64 = 1 << 20;
 /// VM-exit control bits that load host PAT and EFER from the VMCS.
 pub const VM_EXIT_LOAD_IA32_PAT: u64 = 1 << 19;
 pub const VM_EXIT_LOAD_IA32_EFER: u64 = 1 << 21;
@@ -120,9 +128,16 @@ pub const VM_EXIT_REASON: u32 = 0x4402;
 /// bits 7:0 vector, bits 10:8 event type, bit 11 error code valid, bit 31 the
 /// field is valid.
 pub const VM_EXIT_INTERRUPTION_INFO: u32 = 0x4404;
+/// VM-exit interruption error code (32-bit): the error code of the exception
+/// that caused the exit, when VM_EXIT_INTERRUPTION_INFO bit 11 says it has one.
+pub const VM_EXIT_INTERRUPTION_ERROR_CODE: u32 = 0x4406;
 /// IDT-vectoring information (32-bit): bit 31 is set when the VM exit
 /// interrupted the delivery of an event through the guest's IDT.
 pub const IDT_VECTORING_INFO: u32 = 0x4408;
+/// IDT-vectoring error code (32-bit): the error code of the event whose
+/// delivery the exit interrupted, when IDT_VECTORING_INFO bit 11 says it has
+/// one.
+pub const IDT_VECTORING_ERROR_CODE: u32 = 0x440A;
 /// Length in bytes of the instruction that caused the exit (32-bit), for
 /// exits caused by an instruction (VMCALL, CPUID, ...). Used to advance RIP.
 pub const VM_EXIT_INSTRUCTION_LEN: u32 = 0x440C;

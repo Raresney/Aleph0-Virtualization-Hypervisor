@@ -51,8 +51,12 @@ fn data_page_read_back(exit: &ExitInfo) -> bool {
 
 /// The guest's RAX at its next main VMCALL: the marker, plus one for each
 /// main VMCALL already handled (the guest runs `inc eax` before #2).
+///
+/// The test-only `unexpected-exit-test` Cargo feature expects one more than
+/// the guest loads, so main VMCALL #1 is unexpected: a stop other than the
+/// planned one, on purpose, to show its report on real VMX.
 pub fn expected_main_rax(state: ExitState) -> u64 {
-    u64::from(GUEST_MARKER) + u64::from(state.main_vmcalls)
+    u64::from(GUEST_MARKER) + u64::from(state.main_vmcalls) + u64::from(cfg!(feature = "unexpected-exit-test"))
 }
 
 /// `state` after an NMI is injected: nothing pending, one more injected.

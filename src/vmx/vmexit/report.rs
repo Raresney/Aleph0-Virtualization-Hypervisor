@@ -6,7 +6,7 @@
 
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
 use super::policy::{self, COUNTERS, Detail, Histogram, Level};
-use super::read_field;
+use super::{RegisterFrame, dump, history, read_field};
 use crate::vmx::ept::InveptType;
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EptQualification, ExitEvent, ExitInfo, ExitState,
@@ -198,15 +198,18 @@ fn report_host_nmi(number: u64) {
     );
 }
 
-/// Prints what every stop adds after its exit's lines: how many exits of
-/// each reason there were (`exits_by_reason`), including those the print
-/// policy left out.
-pub(super) fn report_stop(number: u64, exits_by_reason: &[u64; COUNTERS]) {
+/// Prints what every stop adds after the lines of exit `number`: the
+/// guest's state and registers (`frame`), how many exits of each reason there
+/// were (`exits_by_reason`), including those the print policy left out, and
+/// the last exits, oldest first.
+pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &[u64; COUNTERS]) {
+    dump::report_guest(number, frame);
     crate::serial_println!(
         "{} VM exit #{number}: exits by reason: {}.",
         crate::TAG,
         Histogram(exits_by_reason)
     );
+    history::report(format_args!("VM exit #{number}"));
 }
 
 /// Prints what exit `number` turned out to be and what Aleph0 does about

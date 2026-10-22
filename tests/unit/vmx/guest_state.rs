@@ -72,3 +72,37 @@ fn unusable_tr_is_refused() {
         Err(GuestStateError::TrNotBusyTss { .. })
     ));
 }
+
+#[test]
+fn the_segment_table_lists_the_registers_in_the_sdm_order() {
+    // The SDM numbers each kind of segment field ES, CS, SS, DS, FS, GS, LDTR,
+    // TR, two apart; `GuestState::segments` lists the registers the same way.
+    for (index, fields) in SEGMENT_FIELDS.iter().enumerate() {
+        let step = 2 * index as u32;
+        assert_eq!(fields.selector, fields::GUEST_ES_SELECTOR + step, "register {index}");
+        assert_eq!(fields.base, fields::GUEST_ES_BASE + step, "register {index}");
+        assert_eq!(fields.limit, fields::GUEST_ES_LIMIT + step, "register {index}");
+        assert_eq!(
+            fields.access_rights,
+            fields::GUEST_ES_ACCESS_RIGHTS + step,
+            "register {index}"
+        );
+    }
+    assert_eq!(SEGMENT_FIELDS[1].selector, fields::GUEST_CS_SELECTOR);
+    assert_eq!(SEGMENT_FIELDS[7].access_rights, fields::GUEST_TR_ACCESS_RIGHTS);
+}
+
+#[test]
+fn a_segment_prints_as_the_guest_state_line_shows_it() {
+    // The Hyper-V firmware's CS.
+    let cs = GuestSegment {
+        selector: 0x28,
+        base: 0,
+        limit: 0xffff_ffff,
+        access_rights: 0xa09b,
+    };
+    assert_eq!(
+        cs.to_string(),
+        "selector=0x0028 base=0x0000000000000000 limit=0xffffffff access=0x0a09b"
+    );
+}

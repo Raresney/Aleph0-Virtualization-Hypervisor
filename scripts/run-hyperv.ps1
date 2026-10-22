@@ -34,8 +34,10 @@
 .PARAMETER Features
     Cargo features to build with, comma-separated, for the test-only
     switches in Cargo.toml: host-fault-test (the exit handler faults on
-    purpose) or host-nmi-test (with -InjectNmi, the NMI arrives while Aleph0
-    runs in VMX root operation).
+    purpose), host-nmi-test (with -InjectNmi, the NMI arrives while Aleph0
+    runs in VMX root operation), unexpected-exit-test (the guest stops at
+    main VMCALL #1 as an unexpected exit), or trace-exits (every VM exit
+    printed in full).
 #>
 param(
     [string]$VMName   = "Aleph0Test",
