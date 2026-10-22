@@ -38,13 +38,16 @@ $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
     ".", $PipeName, [System.IO.Pipes.PipeDirection]::InOut)
 
 # The pipe only exists while the VM is running, so retry until it appears.
+# run-hyperv.ps1 waits for this line before it starts the VM.
+Write-Host "==> Waiting for \\.\pipe\$PipeName" -ForegroundColor Cyan
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while (-not $pipe.IsConnected) {
     try {
-        # Waits up to 1 s for the pipe to appear; throws TimeoutException if not.
+        # Waits up to 1 s for the pipe to appear; throws TimeoutException if
+        # not. No sleep after it: the VM may start printing at once.
         $pipe.Connect(1000)
     } catch {
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Milliseconds 20
     }
     if (-not $pipe.IsConnected -and (Get-Date) -gt $deadline) {
         Write-Error "Could not connect to \\.\pipe\$PipeName within $TimeoutSeconds s. Is the VM running with COM1 attached?"
@@ -54,17 +57,23 @@ while (-not $pipe.IsConnected) {
 }
 
 Write-Host "==> Connected to \\.\pipe\$PipeName; logging to $logPath" -ForegroundColor Cyan
-Set-Content -Path $logPath -Value $null
 
+# One writer for the whole session. Add-Content opened and closed the file
+# for every line, slow enough to fall behind a burst of output. AutoFlush
+# keeps the file current for the -InjectNmi job, which reads it meanwhile
+# (the writer shares the file for reading).
+$writer = [System.IO.StreamWriter]::new($logPath, $false, [System.Text.Encoding]::ASCII)
+$writer.AutoFlush = $true
 $reader = [System.IO.StreamReader]::new($pipe, [System.Text.Encoding]::ASCII)
 try {
     # ReadLine returns $null when Hyper-V closes the pipe (VM turned off).
     while ($null -ne ($line = $reader.ReadLine())) {
         Write-Host $line
-        Add-Content -Path $logPath -Value $line
+        $writer.WriteLine($line)
     }
     Write-Host "==> Serial pipe closed (VM stopped)." -ForegroundColor Cyan
 } finally {
     $reader.Dispose()
+    $writer.Dispose()
     $pipe.Dispose()
 }

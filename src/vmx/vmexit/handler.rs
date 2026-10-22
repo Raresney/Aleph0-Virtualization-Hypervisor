@@ -156,6 +156,8 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
     let tag = crate::TAG;
     let raw_reason = read_or_report("VM_EXIT_REASON", VM_EXIT_REASON).map(|raw| raw as u32);
     let reason = raw_reason.map(ExitReason::from_raw);
+    // Read once, here: the exception line below and `decide` both use it.
+    let interruption_info = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO);
     if let Some(reason) = reason {
         crate::serial_println!(
             "{tag} VM exit #{number}: reason={} ({}){}",
@@ -167,8 +169,11 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
                 ""
             },
         );
-        if reason.basic == EXIT_REASON_EXCEPTION_OR_NMI && !reason.entry_failure {
-            report_exception(number);
+        if reason.basic == EXIT_REASON_EXCEPTION_OR_NMI
+            && !reason.entry_failure
+            && let Some(info) = interruption_info
+        {
+            report_exception(number, InterruptionInfo(info as u32));
         }
     }
     let qualification = read_or_report("EXIT_QUALIFICATION", EXIT_QUALIFICATION);
@@ -212,7 +217,6 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
     );
 
     let protected = ept::protected_page();
-    let interruption_info = read_or_report("VM_EXIT_INTERRUPTION_INFO", VM_EXIT_INTERRUPTION_INFO);
     let interruptibility = read_or_report("GUEST_INTERRUPTIBILITY_STATE", GUEST_INTERRUPTIBILITY_STATE);
     let idt_vectoring = read_or_report("IDT_VECTORING_INFO", IDT_VECTORING_INFO);
     let exit = match (
