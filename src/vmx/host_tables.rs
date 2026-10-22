@@ -1,13 +1,18 @@
-//! The host's own GDT and TSS, which every VM exit loads.
+//! The GDT and TSS the firmware context runs on, and the TSS layout both
+//! TSSs share.
 //!
-//! VM entry rejects a host TR selector of 0, and firmware may leave TR unset
-//! (Hyper-V's does). So Aleph0 copies the firmware's GDT into a page of its
-//! own, appends a 64-bit TSS descriptor, and loads both
-//! ([`GdtRegion::activate`]).
+//! Firmware may leave TR unset (Hyper-V's does), but the guest state copies
+//! TR, and VM entry refuses a guest TR that is not usable. So Aleph0 copies
+//! the firmware's GDT into a page of its own, appends a 64-bit TSS
+//! descriptor, and loads both ([`GdtRegion::activate`]). Bring-up and the
+//! test guest run on them.
 //!
-//! The TSS stack fields (RSP0-2, IST1-7) stay 0: the host never changes
-//! privilege level, and `activate` refuses an IDT with a gate that would
-//! switch to an IST stack.
+//! VMX root operation does not: every VM exit loads Aleph0's own GDT, TSS
+//! and IDT (`vmx::host`), whose TSS comes from [`TssRegion::allocate_with_interrupt_stacks`].
+//!
+//! This TSS's stack fields (RSP0-2, IST1-7) stay 0: the firmware context
+//! never changes privilege level, and `activate` refuses an IDT with a gate
+//! that would switch to an IST stack.
 
 use crate::vmx::segment::{
     self, DescriptorTable, SegmentDescriptor, descriptor_offset, read_cs, read_gdtr, read_idtr, read_ss, read_tr,
@@ -15,13 +20,15 @@ use crate::vmx::segment::{
 };
 use core::{
     arch::asm,
-    ptr::{self, NonNull, copy_nonoverlapping},
+    ptr::{NonNull, copy_nonoverlapping},
 };
 use uefi::boot;
 
 use super::page::{PAGE_SIZE, allocate_zeroed_page};
+/// The 64-bit TSS. In long mode it holds only stack pointers: RSP0-2 for a
+/// change of privilege level, and IST1-7, the stacks an IDT gate can name.
 #[repr(C, packed)]
-struct Tss {
+pub(crate) struct Tss {
     reserved1: u32,
     rsp0: u64,
     rsp1: u64,
@@ -39,14 +46,43 @@ struct Tss {
     iomap_base: u16,
 }
 
+/// Bytes of a [`Tss`]; its descriptor's limit is one less (0x67).
+pub(crate) const TSS_SIZE: usize = core::mem::size_of::<Tss>();
+
 const _: () = {
-    assert!(core::mem::size_of::<Tss>() == 0x68);
+    assert!(TSS_SIZE == 0x68);
     assert!(core::mem::offset_of!(Tss, rsp0) == 0x04);
     assert!(core::mem::offset_of!(Tss, ist1) == 0x24);
     assert!(core::mem::offset_of!(Tss, iomap_base) == 0x66);
 };
 
-/// Why setting up the host TSS failed.
+impl Tss {
+    /// A TSS whose IST1-IST7 fields hold `interrupt_stacks` (0 for an unused
+    /// one), with RSP0-2 at 0, and the I/O-map base past the limit, so it has
+    /// no I/O permission bitmap.
+    pub(crate) fn new(interrupt_stacks: [u64; 7]) -> Self {
+        let [ist1, ist2, ist3, ist4, ist5, ist6, ist7] = interrupt_stacks;
+        Self {
+            reserved1: 0,
+            rsp0: 0,
+            rsp1: 0,
+            rsp2: 0,
+            reserved2: 0,
+            ist1,
+            ist2,
+            ist3,
+            ist4,
+            ist5,
+            ist6,
+            ist7,
+            reserved3: 0,
+            reserved4: 0,
+            iomap_base: TSS_SIZE as u16,
+        }
+    }
+}
+
+/// Why setting up a TSS failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TssError {
     /// UEFI could not allocate the TSS page.
@@ -58,17 +94,20 @@ pub struct TssRegion {
 }
 
 impl TssRegion {
-    /// Allocate a page that stays live while the CPU may use this TSS.
-    /// Initialize the TSS to zero and set its I/O-map base past the TSS limit.
+    /// Allocate a page that stays live while the CPU may use this TSS, and
+    /// write a TSS with no stacks in it ([`Tss::new`]).
     /// Return `TssError::AllocationFailed` if UEFI cannot provide a page.
     pub fn allocate() -> Result<Self, TssError> {
+        Self::allocate_with_interrupt_stacks([0; 7])
+    }
+
+    /// Like [`allocate`](Self::allocate), with IST1-IST7 set to
+    /// `interrupt_stacks`.
+    pub fn allocate_with_interrupt_stacks(interrupt_stacks: [u64; 7]) -> Result<Self, TssError> {
         let page = allocate_zeroed_page(TssError::AllocationFailed)?;
-        let tss = page.cast::<Tss>().as_ptr();
-        // SAFETY: `page` is a fresh, zeroed page, larger than a `Tss`. The
-        // write is unaligned because `Tss` is packed.
-        unsafe {
-            ptr::addr_of_mut!((*tss).iomap_base).write_unaligned(core::mem::size_of::<Tss>() as u16);
-        }
+        // SAFETY: `page` is a fresh page, larger than a `Tss`, which nothing
+        // else refers to yet. The write is unaligned because `Tss` is packed.
+        unsafe { page.cast::<Tss>().as_ptr().write_unaligned(Tss::new(interrupt_stacks)) };
         Ok(Self { page })
     }
 
@@ -113,7 +152,7 @@ const GATE_IST_MASK: u8 = 0x07;
 
 /// Encode a present, available 64-bit TSS descriptor (type 0x9, DPL 0)
 /// with byte granularity. Only the low 20 bits of `limit` are encodable.
-fn tss_descriptor(base: u64, limit: u32) -> [u8; SYSTEM_DESCRIPTOR_SIZE] {
+pub(crate) fn tss_descriptor(base: u64, limit: u32) -> [u8; SYSTEM_DESCRIPTOR_SIZE] {
     let mut descriptor = [0u8; SYSTEM_DESCRIPTOR_SIZE];
     descriptor[0..2].copy_from_slice(&(limit as u16).to_le_bytes());
     descriptor[2..4].copy_from_slice(&(base as u16).to_le_bytes());
@@ -191,7 +230,7 @@ impl GdtRegion {
             return Err(GdtError::TooLarge);
         }
 
-        let descriptor = tss_descriptor(tss_region.base(), (core::mem::size_of::<Tss>() - 1) as u32);
+        let descriptor = tss_descriptor(tss_region.base(), (TSS_SIZE - 1) as u32);
 
         // SAFETY: the 16 bytes at `offset` lie within the GDT page (checked
         // above), which this region owns; the CPU does not use the copy yet.
@@ -220,7 +259,7 @@ impl GdtRegion {
         // G is 0 in a TSS descriptor Aleph0 writes, so this is the raw limit.
         let low = SegmentDescriptor(u64::from_le_bytes(descriptor[..8].try_into().expect("8 bytes")));
 
-        low.limit() == (core::mem::size_of::<Tss>() - 1) as u32
+        low.limit() == (TSS_SIZE - 1) as u32
             && system_descriptor_base(descriptor) == tss_region.base()
             && descriptor[5] == TSS_AVAILABLE_PRESENT
             && descriptor[6] & 0xF0 == 0

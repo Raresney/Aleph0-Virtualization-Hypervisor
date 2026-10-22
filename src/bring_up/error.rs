@@ -6,6 +6,7 @@ use crate::vmx::exit_bitmaps::ExitBitmapsError;
 use crate::vmx::exit_decision::ExitReason;
 use crate::vmx::guest::GuestMemoryError;
 use crate::vmx::guest_state::GuestStateError;
+use crate::vmx::host::HostError;
 use crate::vmx::host_tables::{GdtError, TssError};
 use crate::vmx::mtrr::MtrrError;
 use crate::vmx::vmcs::VmcsError;
@@ -30,6 +31,9 @@ pub enum BringUpError {
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
     /// failed. Both happen before VMXON.
     Ept(EptError),
+    /// Building the page tables, GDT, TSS or IDT that VMX root operation
+    /// runs on failed. Before VMXON.
+    Host(HostError),
     VmxOn(VmxOnError),
     /// A VMCS step failed; `operation` names the step for the report.
     /// `instruction_error` is the VM-instruction error number of a
@@ -46,10 +50,10 @@ pub enum BringUpError {
         error: GuestStateError,
         instruction_error: Option<u32>,
     },
-    /// GDTR, TR, the TSS base or IDTR changed between activation and the
-    /// launch. The VMCS host fields were written from the activated tables,
-    /// so a VM exit would load stale ones.
-    HostTablesChanged,
+    /// GDTR, TR, the TSS base or IDTR of the context tables changed between
+    /// activation and the launch. The VMCS guest fields were copied from the
+    /// activated tables, so the guest would start on stale ones.
+    ContextTablesChanged,
     /// The guest stopped at exit `number`, which the exit handler did not
     /// resume: it does not handle that exit, or it is an expected VMCALL the
     /// handler could not step past. Its lines on serial say which.
@@ -110,6 +114,12 @@ impl From<EptError> for BringUpError {
     }
 }
 
+impl From<HostError> for BringUpError {
+    fn from(error: HostError) -> Self {
+        Self::Host(error)
+    }
+}
+
 impl From<VmxOnError> for BringUpError {
     fn from(error: VmxOnError) -> Self {
         Self::VmxOn(error)
@@ -154,13 +164,13 @@ pub(super) fn vmcs_step(operation: &'static str) -> impl FnOnce(VmcsError) -> Br
 /// Prints why bring-up stopped.
 pub fn report_error(error: BringUpError) {
     match error {
-        BringUpError::Tss(error) => log!("Host TSS allocation failed: {error:?}"),
+        BringUpError::Tss(error) => log!("Context TSS allocation failed: {error:?}"),
         // Only this variant comes after LGDT/LTR; every other GdtError is
         // returned before the CPU's tables are touched.
         BringUpError::Gdt(GdtError::ActivationVerificationFailed) => {
-            log!("Host GDT/TSS activation failed verification; the CPU may already use the new tables.")
+            log!("Context GDT/TSS activation failed verification; the CPU may already use the new tables.")
         }
-        BringUpError::Gdt(error) => log!("Host GDT/TSS setup failed: {error:?}; GDTR/TR unchanged."),
+        BringUpError::Gdt(error) => log!("Context GDT/TSS setup failed: {error:?}; GDTR/TR unchanged."),
         BringUpError::VmExitStack(error) => log!("VM-exit stack allocation failed: {error:?}"),
         BringUpError::GuestMemory(GuestMemoryError::NotIdentityMapped {
             virtual_address,
@@ -184,6 +194,7 @@ pub fn report_error(error: BringUpError) {
             vmx::ept::MAX_IDENTITY_MAP,
         ),
         BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
+        BringUpError::Host(error) => log!("Host environment setup failed: {error:?}"),
         BringUpError::VmxOn(error) => log!("VMXON failed: {error:?}"),
         BringUpError::Vmcs {
             operation,
@@ -206,8 +217,8 @@ pub fn report_error(error: BringUpError) {
             report_vmcs_error("guest-state write", error, instruction_error);
         }
         BringUpError::GuestState { error, .. } => log!("Guest state invalid: {error:x?}"),
-        BringUpError::HostTablesChanged => {
-            log!("Host descriptor tables changed after VMX/UEFI calls; the guest was not launched.")
+        BringUpError::ContextTablesChanged => {
+            log!("Context descriptor tables changed after VMX/UEFI calls; the guest was not launched.")
         }
         BringUpError::UnexpectedExit { number, reason } => log!(
             "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",

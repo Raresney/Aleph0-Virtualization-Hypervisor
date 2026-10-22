@@ -198,9 +198,12 @@ CR3 holds the physical address of the PML4 table, the root of the tree.
   it.
 - **VM entry and exit swap it.** The CPU loads GUEST_CR3 from the VMCS on
   entry and HOST_CR3 on exit.
-- **Aleph0 never writes CR3.** The UEFI firmware built the tables and loaded
-  CR3 before `aleph0hypervisor.efi` started. Aleph0 only reads it: for
-  HOST_CR3, for GUEST_CR3 (the same value), and for the walk.
+- **Aleph0 runs on two trees.** The UEFI firmware built its tables and
+  loaded CR3 before `aleph0hypervisor.efi` started; bring-up, the walk and
+  GUEST_CR3 use that one. HOST_CR3 is Aleph0's own identity map
+  (`vmx::host`, [HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md) section 2), which
+  every VM exit loads. Teardown is the one place Aleph0 writes CR3: it loads
+  the firmware's back.
 
 ## 6. The entry format
 
@@ -547,8 +550,9 @@ true.
   starts at the guest's CR3, and it must handle buffers that cross a page
   boundary: two pages, two walks, possibly far apart.
 - **Leaving the firmware's tables.** After `ExitBootServices` the OS may
-  reuse the memory holding them. Aleph0 then needs its own host page tables,
-  and will write CR3 for the first time (ROADMAP section 5).
+  reuse the memory holding them. VM exits already run on Aleph0's own host
+  page tables ([HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md)); their pages
+  still have to move to memory the OS keeps (ROADMAP section 5).
 - **EPT.** A second, hypervisor-owned translation under the guest's: guest
   virtual → (guest page tables) → guest physical → (EPT) → host physical.
   EPT entries have a similar shape, with their own read, write and execute

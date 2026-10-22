@@ -6,3 +6,13 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 uefi = "0.40"
+
+# Test-only switches for the Hyper-V runner (`-Features`); both are off by
+# default and change nothing in a normal build.
+[features]
+# The exit handler reads a non-canonical address at the first exit, so the
+# host IDT's #GP handler prints the fault and halts.
+host-fault-test = []
+# The exit handler waits in root operation after main VMCALL #1, so the
+# `-InjectNmi` NMI reaches the host NMI handler instead of the guest.
+host-nmi-test = []

@@ -403,21 +403,47 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
     Ok(())
 }
 
-/// Capture the active host state and write it to the current VMCS.
+/// The selectors a VM exit loads into the host's segment registers and TR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSelectors {
+    pub cs: u16,
+    pub ss: u16,
+    pub ds: u16,
+    pub es: u16,
+    pub fs: u16,
+    pub gs: u16,
+    pub tr: u16,
+}
+
+/// The host state Aleph0 builds itself (`vmx::host`) instead of taking it
+/// from the running firmware: page tables, descriptor tables, and the
+/// selectors that index them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTables {
+    pub cr3: u64,
+    pub gdtr_base: u64,
+    pub idtr_base: u64,
+    pub tr_base: u64,
+    pub selectors: HostSelectors,
+}
+
+/// Write the host state to the current VMCS: `tables` for CR3, the
+/// descriptor tables and the selectors; the running CPU for CR0, CR4, the FS
+/// and GS bases and the SYSENTER MSRs, which VM exits restore as they are now.
 /// Do not use this as evidence that VM entry is ready until all host fields
 /// required by the selected VM-exit controls have been populated.
 ///
 /// # Safety
 ///
-/// VMX operation must be active, a VMCS must be current on this CPU, and the
-/// host GDT and TSS must already be active and remain valid on VM exit.
-pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
-    // SAFETY: the caller guarantees the host GDT is active and live, and UEFI
-    // runs in long mode.
-    let segments = unsafe { segment::read_all() };
+/// VMX operation must be active and a VMCS current on this CPU. `tables`
+/// must describe page tables, a GDT, a TSS and an IDT that stay live and
+/// usable for as long as a VM exit can load them.
+pub unsafe fn configure_host_state(tables: &HostTables) -> Result<(), VmcsError> {
+    let selectors = tables.selectors;
     let cr0 = cr::read_cr0();
-    let cr3 = cr::read_cr3();
     let cr4 = cr::read_cr4();
+    // SAFETY: UEFI runs in long mode, which has both MSRs.
+    let (fs_base, gs_base) = unsafe { (segment::read_fs_base(), segment::read_gs_base()) };
     // SAFETY: the SYSENTER MSRs exist on every x86_64 CPU, and reading
     // them has no side effects.
     let (sysenter_cs, sysenter_esp, sysenter_eip) = unsafe {
@@ -432,13 +458,13 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     // CS and TR to be non-null.
     {
         let selectors = [
-            segments.es,
-            segments.cs,
-            segments.ss,
-            segments.ds,
-            segments.fs,
-            segments.gs,
-            segments.tr,
+            selectors.es,
+            selectors.cs,
+            selectors.ss,
+            selectors.ds,
+            selectors.fs,
+            selectors.gs,
+            selectors.tr,
         ];
 
         if selectors
@@ -449,7 +475,7 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
         }
     }
 
-    if segments.cs == 0 || segments.tr == 0 {
+    if selectors.cs == 0 || selectors.tr == 0 {
         return Err(VmcsError::HostStateValidation);
     }
     // SAFETY: the caller guarantees VMX operation with a current VMCS.
@@ -461,23 +487,23 @@ pub unsafe fn configure_host_state() -> Result<(), VmcsError> {
     // Host PAT and EFER are written only when the exit controls load them.
     // HOST_RSP and HOST_RIP come later, from `configure_host_entry`.
     unsafe {
-        write_verified(HOST_ES_SELECTOR, segments.es as u64)?;
-        write_verified(HOST_CS_SELECTOR, segments.cs as u64)?;
-        write_verified(HOST_SS_SELECTOR, segments.ss as u64)?;
-        write_verified(HOST_DS_SELECTOR, segments.ds as u64)?;
-        write_verified(HOST_FS_SELECTOR, segments.fs as u64)?;
-        write_verified(HOST_GS_SELECTOR, segments.gs as u64)?;
-        write_verified(HOST_TR_SELECTOR, segments.tr as u64)?;
+        write_verified(HOST_ES_SELECTOR, selectors.es.into())?;
+        write_verified(HOST_CS_SELECTOR, selectors.cs.into())?;
+        write_verified(HOST_SS_SELECTOR, selectors.ss.into())?;
+        write_verified(HOST_DS_SELECTOR, selectors.ds.into())?;
+        write_verified(HOST_FS_SELECTOR, selectors.fs.into())?;
+        write_verified(HOST_GS_SELECTOR, selectors.gs.into())?;
+        write_verified(HOST_TR_SELECTOR, selectors.tr.into())?;
 
         write_verified(HOST_CR0, cr0)?;
-        write_verified(HOST_CR3, cr3)?;
+        write_verified(HOST_CR3, tables.cr3)?;
         write_verified(HOST_CR4, cr4)?;
 
-        write_verified(HOST_FS_BASE, segments.fs_base)?;
-        write_verified(HOST_GS_BASE, segments.gs_base)?;
-        write_verified(HOST_TR_BASE, segments.tr_base)?;
-        write_verified(HOST_GDTR_BASE, segments.gdtr.base)?;
-        write_verified(HOST_IDTR_BASE, segments.idtr.base)?;
+        write_verified(HOST_FS_BASE, fs_base)?;
+        write_verified(HOST_GS_BASE, gs_base)?;
+        write_verified(HOST_TR_BASE, tables.tr_base)?;
+        write_verified(HOST_GDTR_BASE, tables.gdtr_base)?;
+        write_verified(HOST_IDTR_BASE, tables.idtr_base)?;
 
         write_verified(HOST_IA32_SYSENTER_CS, sysenter_cs)?;
         write_verified(HOST_IA32_SYSENTER_ESP, sysenter_esp)?;

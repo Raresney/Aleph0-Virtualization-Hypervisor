@@ -2,7 +2,8 @@
 //! on it.
 //!
 //! [`vmexit_handler`] runs three steps. [`read_exit`] reads the exit's VMCS
-//! fields and the guest registers and prints them; [`judge`] passes them to
+//! fields and the guest registers and prints them; [`judge`] folds in an NMI
+//! that arrived while Aleph0 ran (`vmx::host`) and passes them to
 //! `exit_decision::decide` with the state kept between exits; [`apply`]
 //! executes an emulated instruction, prepares the VMCS as the event's
 //! `ResumePlan` says, or stops, and prints the outcome.
@@ -11,7 +12,7 @@ use core::arch::x86_64::{__cpuid_count, CpuidResult};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::RegisterFrame;
-use super::report::{read_or_report, report_ept_exit, report_event, report_exception};
+use super::report::{read_or_report, report_ept_exit, report_event, report_exception, report_host_nmi};
 use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
@@ -20,6 +21,7 @@ use crate::vmx::exit_decision::{
     InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON, after_skipped_instruction, cpuid_policy, decide,
     exit_reason_name, is_canonical_48, merge_in,
 };
+use crate::vmx::host;
 use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
     EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_RIP, IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE,
@@ -120,6 +122,8 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     // First, so every line below (and any panic) skips the firmware console.
     // Bring-up switches it back once it has left VMX operation.
     crate::output::set_phase(crate::output::Phase::VmExit);
+    #[cfg(feature = "host-fault-test")]
+    host::fault_on_purpose();
 
     let number = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     // SAFETY: the entry stub passes a pointer to the frame it just pushed on
@@ -128,7 +132,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     // afterwards, so writes here reach the guest.
     let frame = unsafe { &mut *frame };
     let read = read_exit(number, frame);
-    let (event, next) = judge(read.exit);
+    let (event, next) = judge(number, read.exit);
     let action = apply(number, event, &read, next, frame);
     stub_return(action, number, read.raw_reason.unwrap_or(u32::from(UNREADABLE_REASON)))
 }
@@ -249,9 +253,15 @@ fn read_exit(number: u64, frame: &RegisterFrame) -> ExitRead {
 }
 
 /// Decides what `exit` is with the state kept between exits, and keeps the
-/// state for the next one. An exit that could not be read is unexpected.
-fn judge(exit: Option<ExitInfo>) -> (ExitEvent, ExitState) {
-    let state = load_state();
+/// state for the next one. An NMI that arrived in root operation since the
+/// last exit is pending for the guest first. An exit that could not be read
+/// is unexpected.
+fn judge(number: u64, exit: Option<ExitInfo>) -> (ExitEvent, ExitState) {
+    let host_nmi = host::take_pending_nmi();
+    if host_nmi {
+        report_host_nmi(number);
+    }
+    let state = load_state().with_host_nmi(host_nmi);
     let (event, next) = match exit {
         Some(exit) => decide(state, exit),
         None => (ExitEvent::Unexpected, state),
@@ -265,14 +275,23 @@ fn judge(exit: Option<ExitInfo>) -> (ExitEvent, ExitState) {
 /// state after the exit. Returns what the entry stub should do.
 fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut RegisterFrame) -> ExitAction {
     let action = match event.action() {
-        ExitAction::Resume(plan) => match prepare_resume(number, read, plan, frame) {
-            Some(resumed) => {
-                report_event(number, event, read.exit, next, Some(resumed));
-                ExitAction::Resume(plan)
+        ExitAction::Resume(plan) => {
+            let plan = plan.keeping_pending_nmi(next);
+            match prepare_resume(number, read, plan, frame) {
+                Some(resumed) => {
+                    report_event(number, event, read.exit, next, Some(resumed));
+                    #[cfg(feature = "host-nmi-test")]
+                    if event == ExitEvent::MainVmcall {
+                        wait_for_host_nmi(number);
+                    }
+                    // Last, after every VMCS write of this exit.
+                    keep_nmi_window_for_host_nmi(number);
+                    ExitAction::Resume(plan)
+                }
+                // Why the guest cannot go on was printed.
+                None => ExitAction::Unexpected,
             }
-            // Why the guest cannot go on was printed.
-            None => ExitAction::Unexpected,
-        },
+        }
         stop => {
             report_event(number, event, read.exit, next, None);
             stop
@@ -286,6 +305,53 @@ fn apply(number: u64, event: ExitEvent, read: &ExitRead, next: ExitState, frame:
         );
     }
     action
+}
+
+/// Turns NMI-window exiting on if an NMI arrived in root operation after
+/// [`judge`] looked. The host NMI handler turns it on itself, but a write
+/// of the primary controls in [`prepare_resume`] may have replaced its
+/// write; nothing writes them after this, so the guest exits to take the
+/// NMI as soon as it can.
+fn keep_nmi_window_for_host_nmi(number: u64) {
+    if !host::nmi_pending() {
+        return;
+    }
+    crate::serial_println!(
+        "{} VM exit #{number}: an NMI arrived in root operation during this exit; NMI-window exiting on.",
+        crate::TAG
+    );
+    // SAFETY: exit context: VMX root operation, with the guest's VMCS
+    // current. `configure_controls` checked that the CPU allows NMI-window
+    // exiting.
+    if let Err(error) = unsafe { vmcs::set_nmi_window_exiting(true) } {
+        crate::serial_println!(
+            "{} VM exit #{number}: could not turn NMI-window exiting on ({error:?}); the NMI waits for the next exit.",
+            crate::TAG
+        );
+    }
+}
+
+/// Waits in root operation, after main VMCALL #1, until an NMI arrives or
+/// the guest's own wait would have given up. `run-hyperv.ps1 -InjectNmi`
+/// sends its NMI once serial shows the resume line printed just before, so
+/// the NMI reaches the host NMI handler instead of the guest.
+#[cfg(feature = "host-nmi-test")]
+fn wait_for_host_nmi(number: u64) {
+    let tag = crate::TAG;
+    crate::serial_println!("{tag} VM exit #{number}: host-nmi-test: waiting in VMX root operation for an NMI.");
+    let mut rounds = crate::vmx::guest::GUEST_WAIT_ITERATIONS;
+    while !host::nmi_pending() && rounds > 0 {
+        core::hint::spin_loop();
+        rounds -= 1;
+    }
+    if host::nmi_pending() {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: host-nmi-test: the host NMI handler ran ({} NMI(s) in root operation so far).",
+            host::nmis_taken()
+        );
+    } else {
+        crate::serial_println!("{tag} VM exit #{number}: host-nmi-test: no NMI arrived; going on.");
+    }
 }
 
 /// What an emulated instruction did, for the report.

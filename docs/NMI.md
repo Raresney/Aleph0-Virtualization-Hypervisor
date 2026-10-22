@@ -257,15 +257,19 @@ with `rcx = 0`: the loop ran out.
 
 ## 8. What is not covered yet
 
-- **NMIs while Aleph0 itself runs.** During the exit handler or teardown, an
-  NMI goes through the firmware's IDT, the host IDT. A host IDT with its own
-  NMI handler belongs to the resident-hypervisor work (ROADMAP section 5).
-- **Physical NMI blocking after an NMI exit.** An NMI-caused VM exit leaves
-  NMIs blocked in VMX root operation until the host executes an `IRET`, and
-  Aleph0's exit path never does. If the guest stops right after an NMI exit,
+- **NMIs while Aleph0 itself runs** are now handled: a VM exit loads
+  Aleph0's own IDT, whose NMI handler marks the NMI pending for the guest
+  and turns NMI-window exiting on, so the guest gets it through the
+  NMI-window path. See [HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md) section 6.
+  NMIs that arrive after the guest stopped, before teardown loads the
+  firmware's IDT, reach no guest.
+- **Physical NMI blocking after an NMI exit.** An NMI-caused VM exit blocks
+  NMIs until the next IRET or VM entry (Intel SDM Vol. 3C, "Architectural
+  State Before a VM Exit"). Aleph0's exit path executes no IRET, so the next
+  VMRESUME unblocks them, and an NMI that arrives in between is held and
+  exits right after the entry. If the guest stops right after an NMI exit,
   the CPU returns to firmware with NMIs blocked until the firmware's first
-  interrupt handler runs `IRET`. It is harmless here, but the host NMI design
-  must account for it.
+  interrupt handler runs `IRET`.
 - **The STI window loop.** If a CPU reported an NMI-window exit while STI
   blocking still held, Aleph0 would keep deferring. No guest instruction
   would run to end the STI shadow, so it would loop. Today's guest never
