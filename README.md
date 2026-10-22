@@ -103,7 +103,7 @@ diagnostics that run before VMXON.
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
-| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge and apply (`handler.rs`); its report lines (`report.rs`) |
+| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); its report lines (`report.rs`) |
 | `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |

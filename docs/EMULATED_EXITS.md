@@ -19,7 +19,7 @@ Code:
 - `src/vmx/exit_decision/emulation.rs`: the handlers for CPUID, RDMSR, WRMSR and IN/OUT, and `cpuid_policy`;
 - `src/vmx/exit_decision/scenario.rs`: the test guest's own exits (EPT write, VMCALLs, NMI);
 - `src/vmx/exit_bitmaps.rs`: the MSR bitmap and the two I/O bitmaps;
-- `src/vmx/vmexit/handler.rs`: `execute`, `prepare_resume`, `queue_general_protection`;
+- `src/vmx/vmexit/handler.rs`: `execute`, `prepare_resume`, `queue_exception`;
 - `src/vmx/vmexit/report.rs`: the report lines;
 - `src/port.rs`: `in`/`out` of 1, 2 and 4 bytes;
 - `src/vmx/guest.rs`: the guest code that causes the exits, and its checks;
@@ -85,14 +85,15 @@ guest: cpuid / rdmsr / wrmsr / in / out
 vmexit_entry (stub)    push the 15 general-purpose registers = RegisterFrame
   ▼
 vmexit_handler(frame)
-  ├─ read_exit   VMCS fields + frame                 ─▶ ExitInfo
-  ├─ judge       decide(state, exit)                 ─▶ ExitEvent::Emulated(Emulation), next state
-  └─ apply       event.action()
-                   = Resume(ResumePlan { emulate: Some(emulation), advance_rip: true, .. })
-       └─ prepare_resume
-            1. execute(emulation, frame)   the real instruction, in root operation;
-                                           result into frame.rax .. frame.rdx
-            2. GUEST_RIP = RIP + VM_EXIT_INSTRUCTION_LEN
+  ├─ read_exit    VMCS fields + frame (prints nothing) ─▶ ExitRead, with its ExitInfo
+  ├─ judge        decide(state, exit)                  ─▶ ExitEvent::Emulated(Emulation), next state
+  ├─ carry_out    event.action()
+  │                 = Resume(ResumePlan { emulate: Some(emulation), advance_rip: true, .. })
+  │    └─ prepare_resume
+  │         1. execute(emulation, frame)   the real instruction, in root operation;
+  │                                        result into frame.rax .. frame.rdx
+  │         2. GUEST_RIP = RIP + VM_EXIT_INSTRUCTION_LEN
+  └─ report_exit  the exit's lines, once its outcome is known
      returns RESUME_GUEST (0)
   ▼
 vmexit_entry (stub)    pop the frame into the guest's registers, VMRESUME

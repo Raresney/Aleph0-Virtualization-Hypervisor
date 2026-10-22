@@ -23,9 +23,18 @@
 use core::ptr::NonNull;
 
 use super::page::{PAGE_SIZE, allocate_zeroed_pages};
+use super::vmcs::{self, VmcsError};
 
 mod handler;
 mod report;
+
+/// VMREADs `field` of the current VMCS. For the exit handler and its
+/// reports, which run in exit context only.
+fn read_field(field: u32) -> Result<u64, VmcsError> {
+    // SAFETY: exit context: VMX root operation, with the guest's VMCS
+    // current.
+    unsafe { vmcs::vmread(field) }
+}
 
 pub const VM_EXIT_STACK_PAGES: usize = 4;
 pub const VM_EXIT_STACK_SIZE: usize = VM_EXIT_STACK_PAGES * PAGE_SIZE;
