@@ -19,8 +19,9 @@
 //! stop, it returns a stop value, and the stub jumps back into
 //! `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`). The
 //! lines that only print live in `report.rs`; how much of each exit they
-//! print is `policy.rs`'s decision. Every stop adds the guest's state and
-//! registers (`dump.rs`) and the last exits (`history.rs`).
+//! print is `policy.rs`'s decision. Every exit is counted in the vCPU's
+//! statistics (`stats.rs`). Every stop adds the guest's state and registers
+//! (`dump.rs`), the statistics, and the last exits (`history.rs`).
 
 use core::ptr::NonNull;
 
@@ -32,6 +33,9 @@ mod handler;
 mod history;
 mod policy;
 mod report;
+mod stats;
+
+pub use stats::{VcpuStats, snapshot as vcpu_stats};
 
 /// Prints the last VM exits, oldest first, each line after `context`: for
 /// the panic handler, so a panic in exit context shows what led to it. Like

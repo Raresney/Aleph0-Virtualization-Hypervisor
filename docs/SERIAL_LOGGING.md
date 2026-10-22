@@ -373,8 +373,18 @@ without another run (`src/vmx/vmexit/dump.rs`, `history.rs`):
    with their error codes, the guest linear and physical addresses, and the
    five controls with the exception bitmap. A field that cannot be read
    prints as `unreadable`, and the dump goes on.
-5. **The exit counts by reason** (the histogram above).
-6. **The last 64 exits, oldest first**, one line each: number, reason, RIP,
+5. **The vCPU's exit statistics** (`src/vmx/vmexit/stats.rs`), named
+   after KVM's `struct kvm_vcpu_stat`: every exit, then what Aleph0 did for
+   the guest, per kind:
+
+   ```text
+   VM exit #13: exit statistics: exits=13 cpuid_exits=1 msr_read_exits=2 msr_write_exits=2 io_in_exits=2 io_out_exits=2 halt_exits=1 nmi_injections=0 exception_injections=0.
+   ```
+
+   Bring-up compares them with `guest::expected_stats` once the test guest
+   has finished.
+6. **The exit counts by reason** (the histogram above).
+7. **The last 64 exits, oldest first**, one line each: number, reason, RIP,
    instruction length, qualification, interruption and IDT-vectoring info,
    RAX to RDX, and what `decide` made of it:
 

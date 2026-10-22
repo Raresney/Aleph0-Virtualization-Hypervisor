@@ -361,7 +361,13 @@ fn launch_guest(
     // exit bitmaps are never freed.
     let stop = unsafe { vmx::vmcs::launch() };
     report::passthrough_state(before, PassthroughState::read());
-    guest_result(stop)
+    let run = guest_result(stop)?;
+    // The guest has stopped, so no exit handler is counting any more.
+    let stats = vmx::vmexit::vcpu_stats();
+    if stats != vmx::guest::expected_stats(&stats) {
+        return Err(BringUpError::UnexpectedExitStats(stats));
+    }
+    Ok(run)
 }
 
 /// Fills in the current VMCS: controls, EPT pointer, exit bitmaps, host state,
