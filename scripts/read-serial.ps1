@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Streams the test VM's COM1 output to this console and to run\serial.log.
+    Streams one of the test VM's COM ports to this console and to a log in
+    run\: by default COM2, Aleph0's output, into run\serial.log.
 
 .DESCRIPTION
     Hyper-V exposes a VM's COM port as a named pipe (configured by
@@ -16,14 +17,26 @@
     once the next line arrives.
 
 .PARAMETER PipeName
-    Pipe name without the \\.\pipe\ prefix. Must match run-hyperv.ps1.
+    Pipe name without the \\.\pipe\ prefix. Must match run-hyperv.ps1:
+    aleph0-com2 for Aleph0's output (the default), aleph0-com1 for the
+    guest's COM1.
+
+.PARAMETER LogName
+    File in run\ the lines are saved to: serial.log by default; run-hyperv.ps1
+    saves the guest's COM1 to guest-serial.log.
+
+.PARAMETER Quiet
+    Save the lines without printing them. run-hyperv.ps1 reads COM1 this way,
+    so the console shows Aleph0's lines only.
 
 .PARAMETER TimeoutSeconds
     How long to keep retrying while the VM is starting and the pipe does
     not exist yet.
 #>
 param(
-    [string]$PipeName      = "aleph0-com1",
+    [string]$PipeName      = "aleph0-com2",
+    [string]$LogName       = "serial.log",
+    [switch]$Quiet,
     [int]$TimeoutSeconds   = 30
 )
 
@@ -31,7 +44,7 @@ param(
 
 $root    = Split-Path -Parent $PSScriptRoot   # this script lives in scripts/
 $runDir  = Join-Path $root "run"
-$logPath = Join-Path $runDir "serial.log"
+$logPath = Join-Path $runDir $LogName
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 
 $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(
@@ -68,7 +81,7 @@ $reader = [System.IO.StreamReader]::new($pipe, [System.Text.Encoding]::ASCII)
 try {
     # ReadLine returns $null when Hyper-V closes the pipe (VM turned off).
     while ($null -ne ($line = $reader.ReadLine())) {
-        Write-Host $line
+        if (-not $Quiet) { Write-Host $line }
         $writer.WriteLine($line)
     }
     Write-Host "==> Serial pipe closed (VM stopped)." -ForegroundColor Cyan

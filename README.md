@@ -68,14 +68,17 @@ compiled into the `.efi`.
 ```
 
 This turns off and reconfigures the `Aleph0Test` VM and recreates its ESP disk
-under `run/`; keep nothing important there. It then streams the VM's COM1
-serial output into the PowerShell window and `run\serial.log`
+under `run/`; keep nothing important there. It then streams Aleph0's serial
+output (COM2) into the PowerShell window and `run\serial.log`, and saves the
+guest's COM1 to `run\guest-serial.log`
 (`-NoSerial` skips this; `.\scripts\read-serial.ps1` reattaches later). VM-exit
 diagnostics only appear there, not on the VM console. See
 [docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md). `-InjectNmi` sends the
 guest an NMI after its first VMCALL, and `-Features` builds with the
-test-only switches in `Cargo.toml` (`host-fault-test`, `host-nmi-test`; see
-[docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8).
+test-only switches in `Cargo.toml`: `host-fault-test` and `host-nmi-test` (see
+[docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8),
+`unexpected-exit-test` and `trace-exits` (see
+[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)).
 
 **QEMU + OVMF (no VMX):** put `OVMF_CODE.fd` and `OVMF_VARS.fd` from
 [rust-osdev/ovmf-prebuilt](https://github.com/rust-osdev/ovmf-prebuilt) in
@@ -89,7 +92,7 @@ diagnostics that run before VMXON.
 | `src/main.rs` | UEFI entry point and the `log!` macro |
 | `src/bring_up/` | The bring-up sequence (`mod.rs`), its errors (`error.rs`), status lines (`report.rs`) and the return to firmware (`teardown.rs`) |
 | `src/output.rs` | Output phases and the firmware-free panic handler |
-| `src/serial.rs` | COM1 serial logger usable without firmware |
+| `src/serial.rs` | Serial logger usable without firmware, on COM2 (`SerialPort`); COM1 is left to the guest |
 | `src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access |
 | `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
@@ -102,7 +105,7 @@ diagnostics that run before VMXON.
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
-| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge and apply (`handler.rs`); its report lines (`report.rs`) |
+| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
 | `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |

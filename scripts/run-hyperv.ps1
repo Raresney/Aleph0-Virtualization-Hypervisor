@@ -15,11 +15,16 @@
     Builds the release profile instead of debug.
 
 .PARAMETER PipeName
-    Named pipe COM1 is attached to (without the \\.\pipe\ prefix).
+    Named pipe COM2, Aleph0's serial output, is attached to (without the
+    \\.\pipe\ prefix). Streamed to this console and run\serial.log.
+
+.PARAMETER GuestPipeName
+    Named pipe COM1, the guest's serial port, is attached to. Saved to
+    run\guest-serial.log without being printed.
 
 .PARAMETER NoSerial
-    Do not stream COM1 output after starting the VM. COM1 is still attached,
-    so read-serial.ps1 can connect later.
+    Do not read the COM ports after starting the VM. Both stay attached, so
+    read-serial.ps1 can connect later.
 
 .PARAMETER InjectNmi
     Gives the VM one vCPU and, as soon as serial shows the guest resumed
@@ -29,14 +34,17 @@
 .PARAMETER Features
     Cargo features to build with, comma-separated, for the test-only
     switches in Cargo.toml: host-fault-test (the exit handler faults on
-    purpose) or host-nmi-test (with -InjectNmi, the NMI arrives while Aleph0
-    runs in VMX root operation).
+    purpose), host-nmi-test (with -InjectNmi, the NMI arrives while Aleph0
+    runs in VMX root operation), unexpected-exit-test (the guest stops at
+    main VMCALL #1 as an unexpected exit), or trace-exits (every VM exit
+    printed in full).
 #>
 param(
     [string]$VMName   = "Aleph0Test",
     [int]$MemoryMB    = 2048,
     [switch]$Release,
-    [string]$PipeName = "aleph0-com1",
+    [string]$PipeName = "aleph0-com2",
+    [string]$GuestPipeName = "aleph0-com1",
     [switch]$NoSerial,
     [switch]$InjectNmi,
     [string]$Features = ""
@@ -161,18 +169,21 @@ try {
     # only the one running Aleph0's guest turns it into a VM exit.
     $cpuCount = if ($InjectNmi) { 1 } else { 2 }
     Set-VMProcessor -VMName $VMName -Count $cpuCount -ExposeVirtualizationExtensions $true -ErrorAction Stop
-    # COM1 -> named pipe. Gen 2 VMs have no COM ports in the UI; this is the
-    # only way to attach one. The hypervisor's serial logger writes here.
-    Set-VMComPort -VMName $VMName -Number 1 -Path "\\.\pipe\$PipeName" -ErrorAction Stop
+    # COM ports -> named pipes. Gen 2 VMs have no COM ports in the UI; this
+    # is the only way to attach them. Aleph0 prints on COM2; COM1 is the
+    # guest's.
+    Set-VMComPort -VMName $VMName -Number 1 -Path "\\.\pipe\$GuestPipeName" -ErrorAction Stop
+    Set-VMComPort -VMName $VMName -Number 2 -Path "\\.\pipe\$PipeName" -ErrorAction Stop
 } catch {
     Write-Error "Setup failed: $_"
     exit 1
 }
 
 # 5. Boot it and open the console (uefi::println writes to ConOut, i.e. the video console)
-# A log left over from the previous run must not trigger the NMI job below.
+# A log left over from the previous run must not trigger the NMI job below,
+# nor pass for this run's when a reader cannot connect.
 $serialLog = Join-Path $runDir "serial.log"
-Remove-Item -Force -ErrorAction SilentlyContinue $serialLog
+Remove-Item -Force -ErrorAction SilentlyContinue $serialLog, (Join-Path $runDir "guest-serial.log")
 
 # With -InjectNmi, a background job waits until the guest has resumed after
 # its first VMCALL (it then sits in its wait loop) and injects one NMI.
@@ -199,25 +210,35 @@ if ($InjectNmi) {
     }
 }
 
-# 6. Stream COM1, with the reader waiting before the VM starts: Hyper-V
-#    drops serial output written while no client is attached, and Start-VM
-#    can return after Aleph0 has already printed its first lines. The reader
-#    runs as a job (in its own process, with this session's elevation) and
-#    connects as soon as Start-VM creates the pipe. Ctrl+C stops the
-#    streaming here; the job itself ends when the VM turns off.
-$serialJob = $null
-if (-not $NoSerial) {
-    $serialJob = Start-Job -ArgumentList (Join-Path $PSScriptRoot "read-serial.ps1"), $PipeName -ScriptBlock {
-        param($readerScript, $pipeName)
-        & $readerScript -PipeName $pipeName
+# 6. Read both COM ports, with the readers waiting before the VM starts:
+#    Hyper-V drops serial output written while no client is attached, and
+#    Start-VM can return after Aleph0 has already printed its first lines.
+#    Each reader runs as a job (in its own process, with this session's
+#    elevation) and connects as soon as Start-VM creates its pipe. COM2,
+#    Aleph0's output, streams to this console and run\serial.log; COM1, the
+#    guest's, goes to run\guest-serial.log only. Ctrl+C stops the streaming
+#    here; the jobs themselves end when the VM turns off.
+function Start-SerialReader([string]$Pipe, [string]$Log, [switch]$Quiet) {
+    Start-Job -ArgumentList (Join-Path $PSScriptRoot "read-serial.ps1"), $Pipe, $Log, $Quiet.IsPresent -ScriptBlock {
+        param($readerScript, $pipeName, $logName, $quiet)
+        & $readerScript -PipeName $pipeName -LogName $logName -Quiet:$quiet
     }
-    # Its first output is the "Waiting for" line, printed right before it
-    # starts connecting.
+}
+
+$serialJob = $null
+$guestSerialJob = $null
+if (-not $NoSerial) {
+    $serialJob = Start-SerialReader -Pipe $PipeName -Log "serial.log"
+    $guestSerialJob = Start-SerialReader -Pipe $GuestPipeName -Log "guest-serial.log" -Quiet
+    # A reader's first output is its "Waiting for" line, printed right before
+    # it starts connecting.
     $readyDeadline = (Get-Date).AddSeconds(30)
-    while ($serialJob.ChildJobs[0].Information.Count -eq 0 -and
-           $serialJob.State -in 'NotStarted', 'Running' -and
-           (Get-Date) -lt $readyDeadline) {
-        Start-Sleep -Milliseconds 50
+    foreach ($job in $serialJob, $guestSerialJob) {
+        while ($job.ChildJobs[0].Information.Count -eq 0 -and
+               $job.State -in 'NotStarted', 'Running' -and
+               (Get-Date) -lt $readyDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
     }
 }
 
@@ -227,6 +248,10 @@ vmconnect.exe localhost $VMName
 
 if ($serialJob) {
     Receive-Job -Job $serialJob -Wait -AutoRemoveJob
+}
+if ($guestSerialJob) {
+    # Only its own status lines: it saves the guest's lines without printing.
+    Receive-Job -Job $guestSerialJob -Wait -AutoRemoveJob
 }
 
 if ($nmiJob) {

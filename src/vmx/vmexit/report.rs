@@ -4,67 +4,193 @@
 //! Like the handler, everything here runs in exit context: only VMREAD and
 //! the serial port, never firmware.
 
-use super::handler::{EmulationOutcome, Resumed};
+use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
+use super::policy::{self, COUNTERS, Detail, Histogram, Level};
+use super::{RegisterFrame, dump, history, read_field};
 use crate::vmx::ept::InveptType;
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo,
-    PLANNED_MAIN_VMCALLS, expected_main_rax,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EptQualification, ExitEvent, ExitInfo, ExitState,
+    InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax,
 };
 use crate::vmx::guest::{EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE};
-use crate::vmx::vmcs::fields::{GUEST_LINEAR_ADDRESS, GUEST_PHYSICAL_ADDRESS};
-use crate::vmx::vmcs::{self, VmcsError};
+use crate::vmx::vmcs::VmcsError;
+use crate::vmx::vmcs::fields::GUEST_LINEAR_ADDRESS;
 
-/// Reads one VMCS field for the diagnostic, printing instead of failing.
-pub(super) fn read_or_report(name: &str, field: u32) -> Option<u64> {
-    // SAFETY: exit context: VMX root operation, with the guest's VMCS
-    // current.
-    match unsafe { vmcs::vmread(field) } {
-        Ok(value) => Some(value),
-        Err(error) => {
-            report_unreadable(name, error);
-            None
+/// One exit, as its report needs it.
+pub(super) struct ExitReport<'a> {
+    /// The exit's number, from 1.
+    pub(super) number: u64,
+    /// How many exits of its reason there have been, this one included.
+    pub(super) count: u64,
+    /// How much of it the print policy prints.
+    pub(super) detail: Detail,
+    /// What was read about it.
+    pub(super) read: &'a ExitRead,
+    /// Whether an NMI arrived in root operation since the last exit.
+    pub(super) host_nmi: bool,
+    /// What it turned out to be.
+    pub(super) event: ExitEvent,
+    /// The state after it.
+    pub(super) next: ExitState,
+    /// What came of it.
+    pub(super) outcome: Outcome,
+}
+
+/// Prints one exit in as much detail as the print policy gives it: what was
+/// read about it, an NMI that arrived in root operation meanwhile, what it
+/// turned out to be and what came of it. The NMI is printed whatever the
+/// detail.
+pub(super) fn report_exit(report: &ExitReport<'_>) {
+    let ExitReport {
+        number,
+        count,
+        detail,
+        read,
+        host_nmi,
+        event,
+        next,
+        outcome,
+    } = *report;
+    let tag = crate::TAG;
+    match detail {
+        Detail::Full => {}
+        Detail::Summary => {
+            // Only exits that resume are rate-limited, and only readable
+            // ones, so the reason is known here.
+            let basic = read.reason().map_or(0, |reason| reason.basic);
+            crate::serial_println!(
+                "{tag} VM exit #{number}: reason={basic} ({}), {count} exits of this reason so far.",
+                exit_reason_name(basic),
+            );
+            if host_nmi {
+                report_host_nmi(number);
+            }
+            return;
         }
+        Detail::Silent => {
+            if host_nmi {
+                report_host_nmi(number);
+            }
+            return;
+        }
+    }
+    report_read(number, read);
+    if host_nmi {
+        report_host_nmi(number);
+    }
+    match outcome {
+        Outcome::Resumed { resumed, .. } => report_event(number, event, read.exit, next, Some(resumed)),
+        Outcome::ResumeFailed(failure) => {
+            crate::serial_println!("{tag} VM exit #{number}: {failure}; not resuming.")
+        }
+        Outcome::Stopped(_) => report_event(number, event, read.exit, next, None),
+    }
+    if outcome.stops() {
+        crate::serial_println!("{tag} VM exit #{number}: stopping the guest; returning to bring-up.");
     }
 }
 
-fn report_unreadable(name: &str, error: VmcsError) {
-    crate::serial_println!("{} VM exit: {name} unreadable ({error:?})", crate::TAG);
+/// Prints what [`ExitRead`] holds: the reason, the qualification, an EPT
+/// exit's addresses, RIP and instruction length, RAX to RDX, and every field
+/// that could not be read.
+fn report_read(number: u64, read: &ExitRead) {
+    let tag = crate::TAG;
+    match read.reason() {
+        Some(reason) => {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: reason={} ({}){}",
+                reason.basic,
+                exit_reason_name(reason.basic),
+                if reason.entry_failure {
+                    " [VM entry failed; guest did not run]"
+                } else {
+                    ""
+                },
+            );
+            if reason.basic == EXIT_REASON_EXCEPTION_OR_NMI
+                && !reason.entry_failure
+                && let Ok(info) = read.interruption_info
+            {
+                report_exception(number, InterruptionInfo(info as u32));
+            }
+        }
+        None => report_unreadable(number, "VM_EXIT_REASON", read.reason),
+    }
+    match read.qualification {
+        Ok(qualification) => crate::serial_println!("{tag} VM exit #{number}: qualification={qualification:#018x}"),
+        Err(_) => report_unreadable(number, "EXIT_QUALIFICATION", read.qualification),
+    }
+    if let (Some(reason), Some(guest_physical)) = (read.reason(), read.guest_physical) {
+        match guest_physical {
+            Ok(guest_physical) => report_ept_exit(
+                number,
+                reason.basic,
+                EptQualification(read.qualification.unwrap_or(0)),
+                guest_physical,
+            ),
+            Err(_) => report_unreadable(number, "GUEST_PHYSICAL_ADDRESS", guest_physical),
+        }
+    }
+    match (read.rip, read.length) {
+        (Ok(rip), Ok(length)) => {
+            crate::serial_println!("{tag} VM exit #{number}: guest rip={rip:#018x} instruction length={length}")
+        }
+        (rip, length) => {
+            report_unreadable(number, "GUEST_RIP", rip);
+            report_unreadable(number, "VM_EXIT_INSTRUCTION_LEN", length);
+        }
+    }
+    let [rax, rbx, rcx, rdx] = read.registers;
+    crate::serial_println!(
+        "{tag} VM exit #{number}: guest rax={rax:#018x} rbx={rbx:#018x} rcx={rcx:#018x} rdx={rdx:#018x}"
+    );
+    report_unreadable(number, "VM_EXIT_INTERRUPTION_INFO", read.interruption_info);
+    report_unreadable(number, "GUEST_INTERRUPTIBILITY_STATE", read.interruptibility);
+    report_unreadable(number, "IDT_VECTORING_INFO", read.idt_vectoring);
 }
 
-/// Prints an EPT exit's addresses and what the EPT entries allowed, and
-/// returns GUEST_PHYSICAL_ADDRESS (`None` if unreadable, after printing why).
-pub(super) fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification) -> Option<u64> {
+/// Prints that the VMCS field `name` could not be read at exit `number`, if
+/// `value` says so; prints nothing for a value that was read.
+fn report_unreadable(number: u64, name: &str, value: Result<u64, VmcsError>) {
+    if let Err(error) = value {
+        crate::serial_println!("{} VM exit #{number}: {name} unreadable ({error:?})", crate::TAG);
+    }
+}
+
+/// Prints an EPT exit's addresses and what the EPT entries allowed.
+fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification, guest_physical: u64) {
     let tag = crate::TAG;
-    let guest_physical = read_or_report("GUEST_PHYSICAL_ADDRESS", GUEST_PHYSICAL_ADDRESS)?;
     if basic == EXIT_REASON_EPT_MISCONFIG {
         crate::serial_println!(
             "{tag} VM exit #{number}: EPT misconfiguration at GPA {guest_physical:#018x}: an EPT entry for it is invalid."
         );
-        return Some(guest_physical);
+        return;
     }
 
     let (r, w, x) = qualification.permissions();
     let access = qualification.access_name();
-    // The linear address is only valid with qualification bit 7.
-    match qualification
-        .linear_valid()
-        .then(|| read_or_report("GUEST_LINEAR_ADDRESS", GUEST_LINEAR_ADDRESS))
-        .flatten()
-    {
-        Some(linear) => crate::serial_println!(
+    // The linear address is only valid with qualification bit 7, and only
+    // the report needs it, so it is read here.
+    match qualification.linear_valid().then(|| read_field(GUEST_LINEAR_ADDRESS)) {
+        Some(Ok(linear)) => crate::serial_println!(
             "{tag} VM exit #{number}: EPT violation at GPA {guest_physical:#018x} (linear {linear:#018x}): {access}; page R={r} W={w} X={x}."
+        ),
+        Some(Err(error)) => crate::serial_println!(
+            "{tag} VM exit #{number}: EPT violation at GPA {guest_physical:#018x} (linear address unreadable: {error:?}): {access}; page R={r} W={w} X={x}."
         ),
         None => crate::serial_println!(
             "{tag} VM exit #{number}: EPT violation at GPA {guest_physical:#018x} (no linear address): {access}; page R={r} W={w} X={x}."
         ),
     }
-    Some(guest_physical)
 }
 
 /// Prints that an NMI arrived while Aleph0 ran in root operation, and is
 /// now pending for the guest. Not "resuming the guest": that text arms
 /// `run-hyperv.ps1 -InjectNmi`.
-pub(super) fn report_host_nmi(number: u64) {
+fn report_host_nmi(number: u64) {
+    if !policy::enabled(Level::Warn) {
+        return;
+    }
     crate::serial_println!(
         "{} VM exit #{number}: an NMI arrived while Aleph0 ran in root operation ({} so far); pending for the guest.",
         crate::TAG,
@@ -72,16 +198,24 @@ pub(super) fn report_host_nmi(number: u64) {
     );
 }
 
+/// Prints what every stop adds after the lines of exit `number`: the
+/// guest's state and registers (`frame`), how many exits of each reason there
+/// were (`exits_by_reason`), including those the print policy left out, and
+/// the last exits, oldest first.
+pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &[u64; COUNTERS]) {
+    dump::report_guest(number, frame);
+    crate::serial_println!(
+        "{} VM exit #{number}: exits by reason: {}.",
+        crate::TAG,
+        Histogram(exits_by_reason)
+    );
+    history::report(format_args!("VM exit #{number}"));
+}
+
 /// Prints what exit `number` turned out to be and what Aleph0 does about
 /// it. `state` is the state after the exit; `resumed` is how the guest goes
 /// on, for events that resume it.
-pub(super) fn report_event(
-    number: u64,
-    event: ExitEvent,
-    exit: Option<ExitInfo>,
-    state: ExitState,
-    resumed: Option<Resumed>,
-) {
+fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: ExitState, resumed: Option<Resumed>) {
     let tag = crate::TAG;
     let rax = exit.map_or(0, |exit| exit.guest_rax);
     let rip = resumed.map_or(0, |resumed| resumed.rip);
@@ -204,7 +338,7 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
 /// `info`. Exit qualification, printed by the caller, holds the faulting
 /// address for a page fault (#PF, vector 14). NMI exits share reason 0 but
 /// are not exceptions; the event line printed later reports them.
-pub(super) fn report_exception(number: u64, info: InterruptionInfo) {
+fn report_exception(number: u64, info: InterruptionInfo) {
     let tag = crate::TAG;
     if info.is_nmi() {
         return;

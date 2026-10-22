@@ -84,8 +84,9 @@ impl PassthroughState {
             // SAFETY: IA32_KERNEL_GS_BASE exists on every 64-bit CPU, and
             // reading it has no side effect.
             kernel_gs_base: unsafe { vmx::msr::rdmsr(IA32_KERNEL_GS_BASE) },
-            // SAFETY: the COM1 scratch register: COM1 is the UART `serial`
-            // owns, and reading the scratch register has no side effect.
+            // SAFETY: the COM1 scratch register, a byte with no effect on
+            // the UART; reading it has no side effect. Aleph0 prints on
+            // COM2, so this does not disturb its output.
             com1_scratch: unsafe { crate::port::inb(GUEST_SCRATCH_PORT) },
         }
     }

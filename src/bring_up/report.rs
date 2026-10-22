@@ -238,41 +238,6 @@ pub(super) fn passthrough_state(before: PassthroughState, after: PassthroughStat
 /// fails with "invalid guest state" (exit reason 33), these are the values
 /// the CPU rejected.
 pub(super) fn guest_state(state: &GuestState) {
-    log!(
-        "Guest rip={:#018x} rsp={:#018x} rflags={:#x} cr0={:#x} cr3={:#x} cr4={:#x}",
-        state.rip,
-        state.rsp,
-        state.rflags,
-        state.cr0,
-        state.cr3,
-        state.cr4,
-    );
-    for (name, segment) in [
-        ("cs", state.cs),
-        ("ss", state.ss),
-        ("ds", state.ds),
-        ("es", state.es),
-        ("fs", state.fs),
-        ("gs", state.gs),
-        ("tr", state.tr),
-        ("ldtr", state.ldtr),
-    ] {
-        log!(
-            "Guest {name:<4} selector={:#06x} base={:#018x} limit={:#010x} access={:#07x}",
-            segment.selector,
-            segment.base,
-            segment.limit,
-            segment.access_rights,
-        );
-    }
-    log!(
-        "Guest gdtr={:#018x}/{:#06x} idtr={:#018x}/{:#06x}; PAT load={} EFER load={}",
-        state.gdtr.base,
-        state.gdtr.limit,
-        state.idtr.base,
-        state.idtr.limit,
-        state.pat.is_some(),
-        state.efer.is_some(),
-    );
+    state.report(format_args!("Guest"));
     log!("VMCS guest fields written and read back; VM entry not attempted.");
 }

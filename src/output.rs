@@ -42,10 +42,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         halt_forever();
     }
 
-    // Serial first: it needs no firmware, so the message is already on COM1
+    // Serial first: it needs no firmware, so the message is already on serial
     // if the console call below hangs or faults. `PanicInfo`'s `Display`
     // prints "panicked at FILE:LINE:COL:" followed by the message.
     crate::serial_println!("{} PANIC: {info}", crate::TAG);
+    // What led here, if the guest ran: its last VM exits. After the message,
+    // so the message is out even if this goes wrong.
+    crate::vmx::vmexit::report_exit_history(format_args!("PANIC"));
 
     // Firmware console: only in the boot-services phase. In the VM-exit
     // handler or after `ExitBootServices` the message goes to serial alone.
