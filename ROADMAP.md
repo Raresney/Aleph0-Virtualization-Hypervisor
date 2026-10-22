@@ -1,6 +1,6 @@
 # Aleph0 hypervisor roadmap
 
-Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tracks it from the first VM entry to running an operating system as its guest, with EPT memory isolation, multiple vCPUs, and Aleph0 resident after `ExitBootServices`. Each milestone ends in a result that is verified on Hyper-V before the next piece is built. EPT is enabled with an identity map, and CPUID, RDMSR/WRMSR and port I/O exits are emulated; the immediate goals are the rest of section 5: EPT memory types from the MTRRs and intercepting the guest's writes to them, and hiding Aleph0's own memory from the guest.
+Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tracks it from the first VM entry to running an operating system as its guest, with EPT memory isolation, multiple vCPUs, and Aleph0 resident after `ExitBootServices`. Each milestone ends in a result that is verified on Hyper-V before the next piece is built. EPT is enabled with an identity map, CPUID, RDMSR/WRMSR, port I/O and HLT exits are emulated, and VM exits run on Aleph0's own page tables, GDT, TSS and IDT. The immediate goal is the first OS boot, in the order issue #15 sets..
 
 ## Current state
 
@@ -33,7 +33,7 @@ Aleph0 is an Intel VT-x hypervisor booted as a UEFI application. This roadmap tr
 
 There is no OS boot yet.
 
-**Next:** section 5: before an OS guest, EPT memory types from the MTRRs (implemented and host-tested, Hyper-V run pending), intercepting the guest's writes to the MTRRs, and hiding Aleph0's own pages through EPT. EPT and the emulated CPUID, MSR and port I/O exits are confirmed on Hyper-V.
+**Next:** the first OS boot (#15): record the Hyper-V run of the EPT memory types from the MTRRs (#16), boot the Linux target without Aleph0 (#17), move Aleph0's output to COM2 (#18), then map MMIO in EPT (#20) and virtualize the running firmware (#21). Intercepting the guest's MTRR writes (#14) and hiding Aleph0's pages through EPT come after the first boot.
 
 ## 0. Debug output that works without firmware
 

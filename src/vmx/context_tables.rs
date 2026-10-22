@@ -16,8 +16,8 @@
 //! that would switch to an IST stack.
 
 use crate::vmx::segment::{
-    self, DescriptorTable, SegmentDescriptor, descriptor_offset, read_cs, read_gdtr, read_idtr, read_ss, read_tr,
-    segment_base_from_gdt, system_descriptor_base,
+    self, DescriptorTable, GATE_IST_MASK, GATE_SIZE, SegmentDescriptor, descriptor_offset, read_cs, read_gdtr,
+    read_idtr, read_ss, read_tr, segment_base_from_gdt, system_descriptor_base,
 };
 use core::{
     arch::asm,
@@ -144,12 +144,10 @@ pub enum GdtError {
 /// Descriptor byte 5 of an available 64-bit TSS: present (bit 7), DPL 0,
 /// S = 0, type 0x9.
 const TSS_AVAILABLE_PRESENT: u8 = 0x89;
-/// Size of a 64-bit system descriptor (TSS) and of an IDT gate.
+/// Size of a 64-bit system descriptor (TSS).
 const SYSTEM_DESCRIPTOR_SIZE: usize = 16;
 /// IDT gate byte 5, bit 7: the gate is present.
 const GATE_PRESENT: u8 = 0x80;
-/// IDT gate byte 4, bits 2:0: the IST index (0 = no IST).
-const GATE_IST_MASK: u8 = 0x07;
 
 /// Encode a present, available 64-bit TSS descriptor (type 0x9, DPL 0)
 /// with byte granularity. Only the low 20 bits of `limit` are encodable.
@@ -297,11 +295,11 @@ impl GdtRegion {
 
         let idtr = read_idtr();
         let idt_length = idtr.limit as usize + 1;
-        if idtr.base == 0 || !idt_length.is_multiple_of(SYSTEM_DESCRIPTOR_SIZE) {
+        if idtr.base == 0 || !idt_length.is_multiple_of(GATE_SIZE) {
             return Err(GdtError::InvalidIdt);
         }
         let idt = idtr.base as *const u8;
-        for offset in (0..idt_length).step_by(SYSTEM_DESCRIPTOR_SIZE) {
+        for offset in (0..idt_length).step_by(GATE_SIZE) {
             // SAFETY: the gate lies within the IDT limit, and the caller
             // guarantees the IDT is readable through it.
             let (ist, attributes) =

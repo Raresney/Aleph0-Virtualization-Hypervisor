@@ -203,8 +203,8 @@ pub const GATE_SIZE: usize = 16;
 /// Gate byte 5: present (bit 7), DPL 0, type 0xE (64-bit interrupt gate,
 /// which clears RFLAGS.IF on delivery).
 const INTERRUPT_GATE_PRESENT: u8 = 0x8E;
-/// Gate byte 4, bits 2:0: the IST index.
-const GATE_IST_MASK: u8 = 0b111;
+/// Gate byte 4, bits 2:0: the IST index (0 = the current stack).
+pub(crate) const GATE_IST_MASK: u8 = 0b111;
 
 /// A 64-bit interrupt gate to `handler` through code segment `selector`:
 /// present, DPL 0, on interrupt stack `ist` (1-7 name the TSS's IST1-IST7;
