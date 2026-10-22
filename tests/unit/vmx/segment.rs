@@ -169,3 +169,28 @@ fn system_descriptor_base_joins_all_four_pieces() {
     bytes[8..12].copy_from_slice(&0x1122_3344u32.to_le_bytes());
     assert_eq!(system_descriptor_base(&bytes), 0x1122_3344_5566_7788);
 }
+
+#[test]
+fn interrupt_gate_splits_a_low_handler_address() {
+    assert_eq!(
+        interrupt_gate(0x7eb0_f020, 0x28, 0),
+        [0x20, 0xF0, 0x28, 0x00, 0x00, 0x8E, 0xB0, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+}
+
+#[test]
+fn interrupt_gate_keeps_the_high_handler_bits() {
+    assert_eq!(
+        interrupt_gate(0xFFFF_8000_1234_5678, 0x28, 0),
+        [
+            0x78, 0x56, 0x28, 0x00, 0x00, 0x8E, 0x34, 0x12, 0x00, 0x80, 0xFF, 0xFF, 0, 0, 0, 0
+        ],
+    );
+}
+
+#[test]
+fn interrupt_gate_puts_the_ist_index_in_byte_4() {
+    assert_eq!(interrupt_gate(0x1000, 0x28, 3)[4], 3);
+    // Only 3 bits exist; the rest of byte 4 stays reserved (0).
+    assert_eq!(interrupt_gate(0x1000, 0x28, 0xFF)[4], 7);
+}

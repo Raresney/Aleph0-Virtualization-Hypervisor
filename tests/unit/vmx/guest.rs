@@ -91,24 +91,6 @@ fn guest_code_fits_in_one_page() {
     assert!(guest_code().len() <= PAGE_SIZE);
 }
 
-#[test]
-fn interrupt_gate_splits_a_low_handler_address() {
-    assert_eq!(
-        interrupt_gate(0x7eb0_f020, 0x28),
-        [0x20, 0xF0, 0x28, 0x00, 0x00, 0x8E, 0xB0, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-    );
-}
-
-#[test]
-fn interrupt_gate_keeps_the_high_handler_bits() {
-    assert_eq!(
-        interrupt_gate(0xFFFF_8000_1234_5678, 0x28),
-        [
-            0x78, 0x56, 0x28, 0x00, 0x00, 0x8E, 0x34, 0x12, 0x00, 0x80, 0xFF, 0xFF, 0, 0, 0, 0
-        ],
-    );
-}
-
 /// A supervisor, writable, executable 4 KiB page.
 fn kernel_page() -> Mapping {
     Mapping {
