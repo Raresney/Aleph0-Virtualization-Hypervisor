@@ -264,11 +264,14 @@ Aleph0's lines only.
 ### QEMU
 
 `scripts/run.ps1` passes two `-serial` options; QEMU gives the first to
-COM1 and the second to COM2. COM2, Aleph0's, goes to the terminal
-(`-serial stdio`), so each of Aleph0's lines appears once. COM1 goes to
-`run\guest-serial.log`, together with the copy of its own console OVMF
-sends there. (Before Aleph0 moved to COM2, every `log!` line showed up
-twice in the terminal: once from Aleph0, once through OVMF's console.)
+COM1 and the second to COM2. OVMF mirrors its own console to **every**
+serial port, COM2 included, so COM2 carries each `log!` line twice: once
+from Aleph0, once through OVMF's console. COM1 carries the console only, so
+the terminal gets COM1 (`-serial stdio`) and shows each `log!` line once,
+among OVMF's own lines. Aleph0's serial output, COM2, goes to
+`run\qemu-serial.log` (not `serial.log`, which a Hyper-V run's reader keeps
+open while its VM stays on). Under QEMU nothing reaches VMX operation, so
+Aleph0 has no serial-only lines there; a panic also reaches the console.
 
 ## What the output looks like
 
@@ -430,7 +433,8 @@ developers rely on it.
 | Console says `Serial output disabled on COM2 (0x2f8): LoopbackFailed` | No UART at `0x2F8`: COM2 not attached to the VM (`Get-VMComPort -VMName Aleph0Test` lists both ports). Aleph0 does not fall back to COM1. |
 | Reader times out connecting | VM not running, or `-PipeName` differs between the two scripts. |
 | Reader connects but shows nothing | It connected after the hypervisor printed. Restart the VM with `scripts/run-hyperv.ps1`. |
-| The firmware's or the guest's own serial lines are missing | They are on COM1, in `run\guest-serial.log`. |
+| The firmware's or the guest's own serial lines are missing (Hyper-V) | They are on COM1, in `run\guest-serial.log`. |
+| Doubled lines in `run\qemu-serial.log` | Expected: OVMF mirrors its console to COM2 as well. The terminal (COM1) shows each line once. |
 
 ## Where this goes next
 

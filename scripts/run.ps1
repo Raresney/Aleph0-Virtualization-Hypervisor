@@ -29,7 +29,7 @@ $ovmfCode  = Join-Path $ovmfDir "OVMF_CODE.fd"
 $ovmfVarsTemplate = Join-Path $ovmfDir "OVMF_VARS.fd"
 $runDir    = Join-Path $root "run"
 $ovmfVars  = Join-Path $runDir "OVMF_VARS.fd"
-$guestSerialLog = Join-Path $runDir "guest-serial.log"
+$serialLog = Join-Path $runDir "qemu-serial.log"
 
 # 1. Build
 Write-Host "==> cargo build $(if ($Release) { '--release' })" -ForegroundColor Cyan
@@ -89,15 +89,19 @@ if ($qemuExe) {
     }
 }
 
-# 5. Launch QEMU. The first -serial is COM1, the second COM2: Aleph0's
-#    output (COM2) goes to this terminal, and COM1, where OVMF mirrors its
-#    own console, to run\guest-serial.log, so each line shows up once.
-Write-Host "==> Starting QEMU ($qemuExe); COM1 -> $guestSerialLog" -ForegroundColor Cyan
+# 5. Launch QEMU. The first -serial is COM1, the second COM2. OVMF mirrors
+#    its console to every serial port, COM2 included, so COM2 would show each
+#    log! line twice: once from Aleph0, once from OVMF's console. COM1 shows
+#    the console only, which every log! line reaches once, so the terminal
+#    gets COM1. Aleph0's own serial output (COM2) goes to run\qemu-serial.log,
+#    not run\serial.log, which a Hyper-V run's reader keeps open while its VM
+#    stays on. Nothing reaches VMX under QEMU, so no line is serial-only.
+Write-Host "==> Starting QEMU ($qemuExe); COM2 -> $serialLog" -ForegroundColor Cyan
 & $qemuExe `
     -drive "if=pflash,format=raw,readonly=on,file=$ovmfCode" `
     -drive "if=pflash,format=raw,file=$ovmfVars" `
     -drive "format=raw,file=fat:rw:$espDir" `
     -net none `
-    -serial "file:$guestSerialLog" `
     -serial stdio `
+    -serial "file:$serialLog" `
     -machine q35

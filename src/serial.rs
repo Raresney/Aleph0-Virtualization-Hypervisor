@@ -83,8 +83,9 @@
 //!
 //! # Seeing the output
 //!
-//! * QEMU: `scripts/run.ps1` sends COM2 to the terminal (`-serial stdio`)
-//!   and COM1, where OVMF mirrors its own console, to `run\guest-serial.log`.
+//! * QEMU: `scripts/run.ps1` sends COM2 to `run\qemu-serial.log` and COM1
+//!   to the terminal. OVMF mirrors its console to every serial port, so on
+//!   COM2 each `log!` line would show twice; COM1 shows it once.
 //! * Hyper-V: `scripts/run-hyperv.ps1` attaches COM2 to the named pipe
 //!   `aleph0-com2` and COM1 to `aleph0-com1`, and reads both; see that
 //!   script and the README.
