@@ -601,18 +601,36 @@ fn without_a_spare_pt_a_mixed_region_is_one_uc_page() {
 }
 
 #[test]
-fn a_region_left_uc_gets_a_pt_once_one_is_free() {
+fn a_pt_given_back_is_taken_by_a_region_below_it_in_the_same_retype() {
     // Built with region 3 mixed, so it has a PT, and no spare one.
     let mut map = TypeMap::new(&write_back_with(&[range(3 * SIZE_2M, 0x1000, UC)]), 0);
-    // Region 1 mixes before region 3 gives its PT back: UC for now.
-    let moved = write_back_with(&[range(SIZE_2M, 0x1000, UC)]);
-    let retyped = map.retype(&moved);
-    assert_eq!((retyped.split, retyped.merged, retyped.uncached), (0, 1, 1));
+    // The small range moves down to region 1, which comes first in address
+    // order but takes region 3's PT: the first one, as region 3 comes before
+    // the protected page's.
+    let retyped = map.retype(&write_back_with(&[range(SIZE_2M, 0x1000, UC)]));
+    assert_eq!((retyped.split, retyped.merged, retyped.uncached), (1, 1, 0));
+    assert_eq!((retyped.regions, retyped.span), (2, Some((SIZE_2M, 4 * SIZE_2M))));
+    assert_eq!(map.pds[1], EptEntry::table(PTS_ADDRESS));
+    assert_eq!(map.pds[3], EptEntry::large_page(3 * SIZE_2M, WB));
+    assert_eq!(map.pt(0)[0], EptEntry::page(SIZE_2M, EPT_RWX, UC));
+    assert_eq!(map.pt(0)[1], EptEntry::page(SIZE_2M + 0x1000, EPT_RWX, WB));
+    assert_eq!(map.free_len, 0);
+}
+
+#[test]
+fn a_region_left_uc_gets_a_pt_from_the_next_retype_that_gives_one_back() {
+    // Built with region 3 mixed, so it has a PT, and no spare one.
+    let mut map = TypeMap::new(&write_back_with(&[range(3 * SIZE_2M, 0x1000, UC)]), 0);
+    // Region 1 mixes too while region 3 keeps its PT: UC for now.
+    let retyped = map.retype(&write_back_with(&[
+        range(SIZE_2M, 0x1000, UC),
+        range(3 * SIZE_2M, 0x1000, UC),
+    ]));
+    assert_eq!((retyped.split, retyped.merged, retyped.uncached), (0, 0, 1));
     assert_eq!(map.pds[1], EptEntry::large_page(SIZE_2M, UC));
-    // The next retype finds region 3's PT free: the first one, as region 3
-    // comes before the protected page's in address order.
-    let retyped = map.retype(&moved);
-    assert_eq!((retyped.regions, retyped.split, retyped.uncached), (1, 1, 0));
+    // Region 3 is one type again: its PT goes to region 1.
+    let retyped = map.retype(&write_back_with(&[range(SIZE_2M, 0x1000, UC)]));
+    assert_eq!((retyped.split, retyped.merged, retyped.uncached), (1, 1, 0));
     assert_eq!(map.pds[1], EptEntry::table(PTS_ADDRESS));
     assert_eq!(map.pt(0)[0], EptEntry::page(SIZE_2M, EPT_RWX, UC));
 }

@@ -869,13 +869,15 @@ impl Retyped {
         self.regions > 0
     }
 
-    /// Counts the 2 MiB region number `region` as changed.
+    /// Counts the 2 MiB region number `region` as changed. [`retype`]'s
+    /// second pass can count a region below one the first pass counted.
     fn count(&mut self, region: usize) {
         let start = region as u64 * SIZE_2M;
+        let end = start + SIZE_2M;
         self.regions += 1;
         self.span = Some(match self.span {
-            Some((first, _)) => (first, start + SIZE_2M),
-            None => (start, start + SIZE_2M),
+            Some((first, last)) => (first.min(start), last.max(end)),
+            None => (start, end),
         });
     }
 }
@@ -896,7 +898,14 @@ impl Retyped {
 ///   entry points at it. With none left it stays one 2 MiB page, UC: the
 ///   one type that cannot hand a device stale data, as for an undefined
 ///   overlap of ranges. Only its RAM gets slower. It gets a PT at a later
-///   call, once one is free.
+///   call that gives one back.
+///
+/// The regions that need a PT come last, in a second pass over just the
+/// ones the first pass found, so that every PT this call gives back is free
+/// by then. In one pass, a region would find no PT when the one it needs is
+/// only given back by a region after it, as when the guest moves a small
+/// range down. A later call would only come with the guest's next type
+/// change, so the region could stay UC for good.
 ///
 /// The CPU may still hold translations made through the old entries:
 /// [`TypeTables::apply`] runs INVEPT after. A PT taken back here may be
@@ -904,16 +913,22 @@ impl Retyped {
 /// stopped and INVEPT run before it resumes. With several, the other vCPUs
 /// would have to drop their translations through it first.
 fn retype(tables: &mut Retype<'_>, mtrrs: &Mtrrs) -> Retyped {
-    let mut retyped = Retyped::default();
-    for (i, entry) in tables.pds.iter_mut().enumerate() {
-        let region = i as u64 * SIZE_2M;
-        let wanted = if i == tables.protected_region {
+    let protected_region = tables.protected_region;
+    // The type a region's 2 MiB page would have, `None` when it needs a PT.
+    let wanted = |i: usize| {
+        if i == protected_region {
             None
         } else {
-            mtrrs.block_type(region, SIZE_2M)
-        };
+            mtrrs.block_type(i as u64 * SIZE_2M, SIZE_2M)
+        }
+    };
+    let mut retyped = Retyped::default();
+    // The first and last region the second pass looks at.
+    let mut needing_pts: Option<(usize, usize)> = None;
+    for (i, entry) in tables.pds.iter_mut().enumerate() {
+        let region = i as u64 * SIZE_2M;
         let pt = pt_index(*entry, tables.pts_address, tables.pts.len());
-        let changed = match (entry.mapping(), wanted) {
+        let changed = match (entry.mapping(), wanted(i)) {
             (RegionMapping::LargePage(current), Some(memory_type)) => {
                 let change = current != memory_type;
                 if change {
@@ -932,26 +947,47 @@ fn retype(tables: &mut Retype<'_>, mtrrs: &Mtrrs) -> Retyped {
             (RegionMapping::Pt, None) => pt
                 .and_then(|index| tables.pts.get_mut(index))
                 .is_some_and(|pt| retype_pt(pt, region, mtrrs)),
-            (RegionMapping::LargePage(current), None) => {
-                match tables.free.take().filter(|&index| index < tables.pts.len()) {
-                    Some(index) => {
-                        fill_pt(&mut tables.pts[index], region, mtrrs);
-                        *entry = EptEntry::table(tables.pts_address + (index * PAGE_SIZE) as u64);
-                        retyped.split += 1;
-                        true
-                    }
-                    None => {
-                        retyped.uncached += 1;
-                        let change = current != MemoryType::Uncacheable;
-                        if change {
-                            *entry = EptEntry::large_page(region, MemoryType::Uncacheable);
-                        }
-                        change
-                    }
-                }
+            // Needs a PT: left to the second pass.
+            (RegionMapping::LargePage(_), None) => {
+                needing_pts = Some(needing_pts.map_or((i, i), |(first, _)| (first, i)));
+                false
             }
             // Never made by `build`: left as it is.
             (RegionMapping::Invalid, _) => false,
+        };
+        if changed {
+            retyped.count(i);
+        }
+    }
+
+    let Some((first, last)) = needing_pts else {
+        return retyped;
+    };
+    for (i, entry) in tables.pds.iter_mut().enumerate().take(last + 1).skip(first) {
+        // The first pass left these regions alone, and made every other one
+        // a PT or a 2 MiB page of the type it wants.
+        let RegionMapping::LargePage(current) = entry.mapping() else {
+            continue;
+        };
+        if wanted(i).is_some() {
+            continue;
+        }
+        let region = i as u64 * SIZE_2M;
+        let changed = match tables.free.take().filter(|&index| index < tables.pts.len()) {
+            Some(index) => {
+                fill_pt(&mut tables.pts[index], region, mtrrs);
+                *entry = EptEntry::table(tables.pts_address + (index * PAGE_SIZE) as u64);
+                retyped.split += 1;
+                true
+            }
+            None => {
+                retyped.uncached += 1;
+                let change = current != MemoryType::Uncacheable;
+                if change {
+                    *entry = EptEntry::large_page(region, MemoryType::Uncacheable);
+                }
+                change
+            }
         };
         if changed {
             retyped.count(i);

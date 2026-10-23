@@ -331,6 +331,13 @@ types the copy now gives, and changes only the entries that differ:
 | of different types | mapped through a PT | the same PT, each entry with its page's type |
 | of different types | a 2 MiB page | a spare PT, filled before the PD entry points at it |
 
+The last row runs in a second pass, over just the regions the first pass
+found needing a PT, so the PTs the first pass gave back are spare again by
+then. In a single pass in address order, a region could find no PT left
+when the one it needs is given back only by a region above it, as when the
+guest moves a small range down. Since `retype` runs again only when a type
+changes, that region could stay UC (section 7.5) for good.
+
 The protected data page's region keeps its PT whatever the types, and
 retyping a PT entry keeps its access bits, so that page stays read-only, or
 writable once its write was granted. Then INVEPT drops the translations the
@@ -361,7 +368,8 @@ leaves a higher one free, can split more regions than that. If a region
 needs a PT when none is left, it stays one 2 MiB page and becomes UC: the
 one type that cannot hand a device stale data, as for an undefined overlap
 (section 3). Only the speed of its RAM suffers, and it gets a PT at a later
-MTRR write once one is free. The report says how many regions are left so.
+MTRR write that gives one back. The report says how many regions are left
+so.
 
 ### 7.6 What serial shows
 
