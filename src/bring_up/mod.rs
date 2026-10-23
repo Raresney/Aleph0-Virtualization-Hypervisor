@@ -238,10 +238,11 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
 
     let mtrrs = vmx::mtrr::read()?;
     report::mtrrs(&mtrrs);
+    let protected_pages = [guest.data_page(), guest.stack_page()];
     // SAFETY: boot services are still active, and UEFI identity-maps
-    // memory, which also makes the data page's address its GPA.
-    let ept = unsafe { Ept::build(guest.data_page(), invept, &mtrrs) }?;
-    report::ept(&ept, guest.data_page());
+    // memory, which also makes the guest pages' addresses their GPAs.
+    let ept = unsafe { Ept::build(&protected_pages, invept, &mtrrs) }?;
+    report::ept(&ept, &protected_pages);
 
     // The same range as EPT: every address the UEFI memory map reaches,
     // which holds the image, every allocation and the firmware stack.

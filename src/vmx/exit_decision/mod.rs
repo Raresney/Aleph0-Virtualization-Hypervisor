@@ -351,8 +351,12 @@ pub struct ExitState {
     pub nmi_pending: bool,
     /// VMCALLs from the guest's NMI handler: reinjected NMIs that arrived.
     pub nmis_handled: u32,
-    /// EPT violations on the protected page after which write was granted.
+    /// EPT violations on the data page after which write was granted.
     pub ept_writes_granted: u32,
+    /// EPT violations while an NMI was being delivered (its push faulting on
+    /// the read-only stack page) after which write was granted and the NMI
+    /// re-delivered.
+    pub nmi_stack_grants: u32,
 }
 
 impl ExitState {

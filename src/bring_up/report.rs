@@ -128,14 +128,18 @@ pub(super) fn mtrrs(mtrrs: &Mtrrs) {
 /// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made,
 /// and how its PD entries map each run of 2 MiB regions: read back from the
 /// entries, so the lines show what the CPU walks.
-pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
+pub(super) fn ept(ept: &vmx::ept::Ept, protected_pages: &[u64]) {
     log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages; {} pages read-only (R=1 W=0 X=0).",
         ept.end(),
         ept.end() >> 30,
         ept.table_pages(),
         ept.split_regions(),
+        protected_pages.len(),
     );
+    for page in protected_pages {
+        log!("EPT read-only page: {page:#018x}.");
+    }
     for run in ept.region_runs() {
         log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
     }

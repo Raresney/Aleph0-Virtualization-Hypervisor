@@ -36,14 +36,16 @@
 //!
 //! Aleph0 builds an identity map (GPA = HPA) of all memory, each page with
 //! the memory type the MTRRs give it, so the guest runs exactly as without
-//! EPT. One 4 KiB page, the guest's data page, is mapped read-only: a guest
-//! write to it is the intentional EPT violation, and
-//! [`ProtectedPage::grant_write`] makes it writable when that exit arrives.
-//! The longer walkthrough is in `docs/EPT.md`.
+//! EPT. A few named 4 KiB pages are mapped read-only ([`MAX_PROTECTED`] at
+//! most): the guest's data page, so its write is the intentional EPT
+//! violation, and the guest's stack page, so the reinjected NMI's delivery
+//! faults when the CPU pushes the interrupt frame. Each
+//! [`ProtectedPage::grant_write`] makes its page writable when that page's
+//! violation arrives. The longer walkthrough is in `docs/EPT.md`.
 
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use uefi::boot;
 use uefi::mem::memory_map::MemoryMap;
@@ -78,6 +80,9 @@ const EPTP_WALK_LENGTH_4: u64 = 3 << 3;
 
 /// Entries per table: 4096 bytes / 8 bytes per entry.
 const ENTRIES: usize = 512;
+/// How many pages [`Ept::build`] can map read-only and publish for the exit
+/// handler at once: the guest's data page and its NMI-delivery stack page.
+pub const MAX_PROTECTED: usize = 2;
 /// What a PD entry maps: a 2 MiB page, or a PT of 512 4 KiB pages.
 pub const SIZE_2M: u64 = 1 << 21;
 /// What a PDPT entry maps: a PD of 512 2 MiB regions.
@@ -142,8 +147,8 @@ pub enum EptError {
     ProtectedPageOutsideMap,
     /// UEFI could not provide the table pages.
     AllocationFailed,
-    /// An EPT was already built and its protected page published; the exit
-    /// handler knows one protected page only.
+    /// An EPT was already built and its protected pages published; the exit
+    /// handler keeps one published set.
     AlreadyBuilt,
 }
 
@@ -465,11 +470,11 @@ struct Tables<'a> {
 
 /// The memory type of the 2 MiB region at `region` when one 2 MiB page can
 /// map it, or `None` when it needs a PT of 4 KiB pages: its pages differ in
-/// memory type, or it holds `protected_page`. An EPT entry has one memory
-/// type, so a 2 MiB page over pages of mixed types would give some of them
-/// the wrong one.
-fn large_page_type(mtrrs: &Mtrrs, region: u64, protected_page: u64) -> Option<MemoryType> {
-    if region == region_of(protected_page) {
+/// memory type, or it holds one of `protected_pages`. An EPT entry has one
+/// memory type, so a 2 MiB page over pages of mixed types would give some of
+/// them the wrong one.
+fn large_page_type(mtrrs: &Mtrrs, region: u64, protected_pages: &[u64]) -> Option<MemoryType> {
+    if protected_pages.iter().any(|&page| region == region_of(page)) {
         return None;
     }
     mtrrs.block_type(region, SIZE_2M)
@@ -482,25 +487,32 @@ fn region_of(address: u64) -> u64 {
 
 /// How many 2 MiB regions of the first `gibs` GiB need a PT
 /// ([`large_page_type`] is `None`): how many PTs [`fill_identity_map`]
-/// takes. At least 1, for the region holding `protected_page`.
-fn split_regions(mtrrs: &Mtrrs, gibs: usize, protected_page: u64) -> usize {
+/// takes. At least one, for the region holding a protected page (two
+/// protected pages in the same region still share one PT).
+fn split_regions(mtrrs: &Mtrrs, gibs: usize, protected_pages: &[u64]) -> usize {
     (0..gibs * ENTRIES)
-        .filter(|&i| large_page_type(mtrrs, i as u64 * SIZE_2M, protected_page).is_none())
+        .filter(|&i| large_page_type(mtrrs, i as u64 * SIZE_2M, protected_pages).is_none())
         .count()
 }
 
 /// Fills `tables` with an identity map of the first `gibs` GiB, each page
-/// with the memory type `mtrrs` gives it, and RWX except `protected_page`,
-/// which is read-only. A 2 MiB region is one 2 MiB page when it can be
+/// with the memory type `mtrrs` gives it, and RWX except `protected_pages`,
+/// which are read-only. A 2 MiB region is one 2 MiB page when it can be
 /// ([`large_page_type`]); otherwise it takes the next PT in `tables.pts`
-/// and is mapped in 4 KiB pages. Returns the index of `protected_page`'s
-/// entry in `tables.pts`.
+/// and is mapped in 4 KiB pages. Returns the index in `tables.pts` of each
+/// protected page's entry, in the order given.
 ///
-/// `pds` holds `gibs` tables and `pts` [`split_regions`] tables, and
-/// `protected_page` is 4 KiB-aligned and inside the map; [`Ept::build`]
+/// `pds` holds `gibs` tables and `pts` [`split_regions`] tables, and each of
+/// `protected_pages` is 4 KiB-aligned and inside the map; [`Ept::build`]
 /// checks all three.
-fn fill_identity_map(tables: Tables<'_>, gibs: usize, mtrrs: &Mtrrs, protected_page: u64) -> usize {
+fn fill_identity_map(
+    tables: Tables<'_>,
+    gibs: usize,
+    mtrrs: &Mtrrs,
+    protected_pages: &[u64],
+) -> [usize; MAX_PROTECTED] {
     debug_assert!(tables.pds.len() == gibs * ENTRIES);
+    debug_assert!(protected_pages.len() <= MAX_PROTECTED);
     tables.pml4[0] = EptEntry::table(tables.pdpt_address);
     for gib in 0..gibs {
         tables.pdpt[gib] = EptEntry::table(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
@@ -512,10 +524,10 @@ fn fill_identity_map(tables: Tables<'_>, gibs: usize, mtrrs: &Mtrrs, protected_p
     let (pts, rest) = tables.pts.as_chunks_mut::<ENTRIES>();
     debug_assert!(rest.is_empty(), "the PTs are whole tables");
     let mut pts = pts.iter_mut().enumerate();
-    let mut protected = None;
+    let mut protected = [None; MAX_PROTECTED];
     for (i, entry) in tables.pds.iter_mut().enumerate() {
         let region = i as u64 * SIZE_2M;
-        if let Some(memory_type) = large_page_type(mtrrs, region, protected_page) {
+        if let Some(memory_type) = large_page_type(mtrrs, region, protected_pages) {
             *entry = EptEntry::large_page(region, memory_type);
             continue;
         }
@@ -525,14 +537,22 @@ fn fill_identity_map(tables: Tables<'_>, gibs: usize, mtrrs: &Mtrrs, protected_p
             let address = region + (j * PAGE_SIZE) as u64;
             *page = EptEntry::page(address, EPT_RWX, mtrrs.memory_type(address));
         }
-        if region == region_of(protected_page) {
-            let index = Pt::index(protected_page);
-            pt[index] = pt[index].with_access(EPT_READ);
-            protected = Some(number * ENTRIES + index);
+        // Mark every protected page that falls in this region read-only; two
+        // in the same region share this one PT.
+        for (slot, &protected_page) in protected_pages.iter().enumerate() {
+            if region == region_of(protected_page) {
+                let index = Pt::index(protected_page);
+                pt[index] = pt[index].with_access(EPT_READ);
+                protected[slot] = Some(number * ENTRIES + index);
+            }
         }
     }
     debug_assert!(pts.next().is_none(), "every PT is used");
-    protected.expect("the protected page is inside the map")
+    let mut indices = [0; MAX_PROTECTED];
+    for slot in 0..protected_pages.len() {
+        indices[slot] = protected[slot].expect("the protected page is inside the map");
+    }
+    indices
 }
 
 /// One EPT identity map. Its table pages are never freed: the CPU walks them
@@ -550,25 +570,28 @@ pub struct Ept {
 
 impl Ept {
     /// Builds the identity map from the UEFI memory map, with the memory
-    /// types of `mtrrs` and `protected_page` read-only, and publishes the
-    /// [`ProtectedPage`] the exit handler needs later. Refuses a second
-    /// build with [`EptError::AlreadyBuilt`]: the handler knows one page
-    /// only.
+    /// types of `mtrrs` and each of `protected_pages` read-only, and
+    /// publishes the [`ProtectedPage`]s the exit handler needs later. Refuses
+    /// a second build with [`EptError::AlreadyBuilt`]: the handler keeps a
+    /// fixed, small set ([`MAX_PROTECTED`]).
     ///
     /// # Safety
     ///
     /// Boot services must still be active, and physical memory must be
     /// identity-mapped (as UEFI does), since the tables are filled through
     /// their physical addresses.
-    pub unsafe fn build(protected_page: u64, invept: InveptType, mtrrs: &Mtrrs) -> Result<Self, EptError> {
+    pub unsafe fn build(protected_pages: &[u64], invept: InveptType, mtrrs: &Mtrrs) -> Result<Self, EptError> {
+        debug_assert!(protected_pages.len() <= MAX_PROTECTED);
         let map = boot::memory_map(boot::MemoryType::LOADER_DATA).map_err(|_| EptError::MemoryMapUnavailable)?;
         let end = identity_map_end(map.entries().map(|region| (region.phys_start, region.page_count)))?;
-        if protected_page >= end || !protected_page.is_multiple_of(PAGE_SIZE as u64) {
-            return Err(EptError::ProtectedPageOutsideMap);
+        for &protected_page in protected_pages {
+            if protected_page >= end || !protected_page.is_multiple_of(PAGE_SIZE as u64) {
+                return Err(EptError::ProtectedPageOutsideMap);
+            }
         }
 
         let gibs = (end / SIZE_1G) as usize;
-        let split_regions = split_regions(mtrrs, gibs, protected_page);
+        let split_regions = split_regions(mtrrs, gibs, protected_pages);
         let pml4 = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
         let pdpt = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
         let pds = allocate_zeroed_pages(gibs, EptError::AllocationFailed)?.as_ptr() as u64;
@@ -602,7 +625,7 @@ impl Ept {
                 pts_address: pts,
             }
         };
-        let protected = fill_identity_map(tables, gibs, mtrrs, protected_page);
+        let protected = fill_identity_map(tables, gibs, mtrrs, protected_pages);
 
         let ept = Self {
             eptp: Eptp::new(pml4),
@@ -611,12 +634,16 @@ impl Ept {
             split_regions,
             table_pages: 2 + gibs + split_regions,
         };
-        publish(ProtectedPage {
-            gpa: protected_page,
-            entry: (pts as *mut EptEntry<Pt>).wrapping_add(protected),
-            eptp: ept.eptp,
-            invept,
-        })?;
+        let mut pages = [ProtectedPage::ABSENT; MAX_PROTECTED];
+        for (slot, &gpa) in protected_pages.iter().enumerate() {
+            pages[slot] = ProtectedPage {
+                gpa,
+                entry: (pts as *mut EptEntry<Pt>).wrapping_add(protected[slot]),
+                eptp: ept.eptp,
+                invept,
+            };
+        }
+        publish(&pages[..protected_pages.len()])?;
         Ok(ept)
     }
 
@@ -661,6 +688,15 @@ pub struct ProtectedPage {
 }
 
 impl ProtectedPage {
+    /// A placeholder for the unused slots of a fixed-size array, before
+    /// [`Ept::build`] fills the ones it uses. Never published.
+    const ABSENT: Self = Self {
+        gpa: 0,
+        entry: core::ptr::null_mut(),
+        eptp: Eptp(0),
+        invept: InveptType::SingleContext,
+    };
+
     /// Makes the page writable and drops cached translations with INVEPT.
     /// Returns the INVEPT type used, for the report.
     ///
@@ -687,12 +723,17 @@ impl ProtectedPage {
 }
 
 // What `Ept::build` publishes for the exit handler, which cannot take
-// arguments from bring-up. Written once before VMLAUNCH; read only in exit
-// context, on the one CPU that runs the guest. Atomics rather than a
+// arguments from bring-up: up to [`MAX_PROTECTED`] read-only pages, all with
+// the one EPTP and INVEPT type. Written once before VMLAUNCH; read only in
+// exit context, on the one CPU that runs the guest. Atomics rather than a
 // `static mut` or a lock: this `no_std` build has neither an allocator for
 // `Once`-style cells nor a `Mutex`.
-static PROTECTED_GPA: AtomicU64 = AtomicU64::new(0);
-static PROTECTED_ENTRY: AtomicPtr<EptEntry<Pt>> = AtomicPtr::new(core::ptr::null_mut());
+static PROTECTED_GPAS: [AtomicU64; MAX_PROTECTED] = [const { AtomicU64::new(0) }; MAX_PROTECTED];
+static PROTECTED_ENTRIES: [AtomicPtr<EptEntry<Pt>>; MAX_PROTECTED] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_PROTECTED];
+/// How many of the slots above [`publish`] filled. Read after [`INVEPT_TYPE`]
+/// (Acquire), so a reader that sees a type sees this and the slots too.
+static PROTECTED_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PUBLISHED_EPTP: AtomicU64 = AtomicU64::new(0);
 /// The [`InveptType`] as its operand value, and the "published" flag: 0
 /// until [`publish`] has stored everything else. Written last (Release),
@@ -709,25 +750,44 @@ fn decode_invept(value: u8) -> Option<InveptType> {
     }
 }
 
-/// Publishes `page` for [`protected_page`]. Refuses a second publication.
-fn publish(page: ProtectedPage) -> Result<(), EptError> {
+/// Publishes `pages` for [`protected_page_for`]. Refuses a second
+/// publication. `pages` holds at most [`MAX_PROTECTED`] entries, all sharing
+/// one EPTP and INVEPT type.
+fn publish(pages: &[ProtectedPage]) -> Result<(), EptError> {
     if decode_invept(INVEPT_TYPE.load(Ordering::Acquire)).is_some() {
         return Err(EptError::AlreadyBuilt);
     }
-    PROTECTED_GPA.store(page.gpa, Ordering::Relaxed);
-    PROTECTED_ENTRY.store(page.entry, Ordering::Relaxed);
-    PUBLISHED_EPTP.store(page.eptp.raw(), Ordering::Relaxed);
-    INVEPT_TYPE.store(page.invept as u8, Ordering::Release);
+    debug_assert!(pages.len() <= MAX_PROTECTED);
+    for (slot, page) in pages.iter().enumerate() {
+        PROTECTED_GPAS[slot].store(page.gpa, Ordering::Relaxed);
+        PROTECTED_ENTRIES[slot].store(page.entry, Ordering::Relaxed);
+    }
+    PROTECTED_COUNT.store(pages.len(), Ordering::Relaxed);
+    // Every published page shares the one EPTP and INVEPT type; take them
+    // from the first (there is always at least the data page).
+    if let Some(first) = pages.first() {
+        PUBLISHED_EPTP.store(first.eptp.raw(), Ordering::Relaxed);
+        INVEPT_TYPE.store(first.invept as u8, Ordering::Release);
+    }
     Ok(())
 }
 
-/// The page [`Ept::build`] made read-only, or `None` before it ran.
-pub fn protected_page() -> Option<ProtectedPage> {
+/// The published read-only page whose 4 KiB frame holds `gpa`, or `None`
+/// when no page was published yet or `gpa` is in none of them. The exit
+/// handler calls it with an EPT violation's GUEST_PHYSICAL_ADDRESS to find
+/// the page to make writable.
+pub fn protected_page_for(gpa: u64) -> Option<ProtectedPage> {
     let invept = decode_invept(INVEPT_TYPE.load(Ordering::Acquire))?;
+    let eptp = Eptp(PUBLISHED_EPTP.load(Ordering::Relaxed));
+    let count = PROTECTED_COUNT.load(Ordering::Relaxed);
+    let frame = gpa & !(PAGE_SIZE as u64 - 1);
+    let slot = PROTECTED_GPAS[..count]
+        .iter()
+        .position(|slot| slot.load(Ordering::Relaxed) == frame)?;
     Some(ProtectedPage {
-        gpa: PROTECTED_GPA.load(Ordering::Relaxed),
-        entry: PROTECTED_ENTRY.load(Ordering::Relaxed),
-        eptp: Eptp(PUBLISHED_EPTP.load(Ordering::Relaxed)),
+        gpa: PROTECTED_GPAS[slot].load(Ordering::Relaxed),
+        entry: PROTECTED_ENTRIES[slot].load(Ordering::Relaxed),
+        eptp,
         invept,
     })
 }

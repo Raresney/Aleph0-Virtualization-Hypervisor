@@ -287,8 +287,10 @@ with `rcx = 0`: the loop ran out.
   injected per VM entry, so a plan that advances RIP or injects its own
   event cannot also re-deliver one: the guest stops (no double-fault
   synthesis yet). The test guest's case is the reinjected NMI whose delivery
-  faults on the read-only data page: an EPT violation that grants write and
-  re-delivers the NMI. The remaining pieces of this (the STI window above,
+  faults on the read-only stack page, as the CPU pushes the interrupt frame:
+  an EPT violation whose IDT-vectoring field holds the NMI, so Aleph0 grants
+  write to the stack page and re-delivers the NMI. The remaining pieces of
+  this (the STI window above,
   NMI blocking after a fault in IRET, external-interrupt passthrough) are
   tracked in issue #26.
 - **Ordinary interrupts.** External-interrupt exiting comes with an OS guest

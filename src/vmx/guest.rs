@@ -7,12 +7,18 @@
 //! works because the code is position-independent: no absolute addresses,
 //! only relative jumps and RIP-relative addressing.
 //!
-//! The data page is the one EPT maps read-only (`vmx::ept`). It is allocated
-//! together with the code page, so the guest finds it at a fixed distance
-//! from its own code (`lea rdi, [rip + guest_code_start]`, plus one page)
-//! without being told an address. The guest reads it (allowed), writes it
-//! (an EPT violation, after which Aleph0 makes it writable and the write is
-//! retried), and reads it back.
+//! The data page is one of two EPT maps read-only (`vmx::ept`). It is
+//! allocated together with the code page, so the guest finds it at a fixed
+//! distance from its own code (`lea rdi, [rip + guest_code_start]`, plus one
+//! page) without being told an address. The guest reads it (allowed), writes
+//! it (an EPT violation, after which Aleph0 makes it writable and the write
+//! is retried), and reads it back.
+//!
+//! The stack page is the other (`GuestMemory::stack_page`). The guest's main
+//! code never touches the stack; only the reinjected NMI's delivery does,
+//! pushing the interrupt frame. With the stack EPT read-only, that push is an
+//! EPT violation whose IDT-vectoring field holds the NMI, so Aleph0 grants
+//! write and re-delivers the interrupted NMI (`exit_decision`).
 //!
 //! Before that, the guest runs the instructions Aleph0 emulates (CPUID,
 //! RDMSR/WRMSR of IA32_KERNEL_GS_BASE, IN/OUT of the COM1 scratch register)
@@ -451,6 +457,15 @@ impl GuestMemory {
         let top = unsafe { self.stack.as_ptr().add(PAGE_SIZE) } as usize;
         assert_eq!(top % 16, 0);
         top as u64
+    }
+
+    /// Guest-physical address of the stack page (its base). EPT maps it
+    /// read-only, so the reinjected NMI's delivery faults when the CPU
+    /// pushes the interrupt frame onto it; Aleph0 then grants write and
+    /// re-delivers the NMI. The guest touches the stack only during that
+    /// delivery, so a read-only stack never faults any other access.
+    pub fn stack_page(&self) -> u64 {
+        self.stack.as_ptr() as u64
     }
 
     /// The guest's own IDT, for GUEST_IDTR: vectors 0 to 2, only vector 2

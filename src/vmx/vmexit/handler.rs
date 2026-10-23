@@ -66,6 +66,7 @@ static MAIN_VMCALLS: AtomicU32 = AtomicU32::new(0);
 static NMI_PENDING: AtomicBool = AtomicBool::new(false);
 static NMIS_HANDLED: AtomicU32 = AtomicU32::new(0);
 static EPT_WRITES_GRANTED: AtomicU32 = AtomicU32::new(0);
+static NMI_STACK_GRANTS: AtomicU32 = AtomicU32::new(0);
 
 fn load_state() -> ExitState {
     ExitState {
@@ -73,6 +74,7 @@ fn load_state() -> ExitState {
         nmi_pending: NMI_PENDING.load(Ordering::Relaxed),
         nmis_handled: NMIS_HANDLED.load(Ordering::Relaxed),
         ept_writes_granted: EPT_WRITES_GRANTED.load(Ordering::Relaxed),
+        nmi_stack_grants: NMI_STACK_GRANTS.load(Ordering::Relaxed),
     }
 }
 
@@ -81,6 +83,7 @@ fn store_state(state: ExitState) {
     NMI_PENDING.store(state.nmi_pending, Ordering::Relaxed);
     NMIS_HANDLED.store(state.nmis_handled, Ordering::Relaxed);
     EPT_WRITES_GRANTED.store(state.ept_writes_granted, Ordering::Relaxed);
+    NMI_STACK_GRANTS.store(state.nmi_stack_grants, Ordering::Relaxed);
 }
 
 /// Handler return value that tells the entry stub to resume the guest.
@@ -262,7 +265,13 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     let length = read_field(VM_EXIT_INSTRUCTION_LEN);
     let interruptibility = read_field(GUEST_INTERRUPTIBILITY_STATE);
     let idt_vectoring = read_field(IDT_VECTORING_INFO);
-    let protected = ept::protected_page();
+    // The read-only page this exit's access fell in, if any: an EPT exit
+    // whose GUEST_PHYSICAL_ADDRESS is one of the published protected pages
+    // (the data page, or the NMI-delivery stack page). The grant path makes
+    // exactly this page writable.
+    let protected = guest_physical
+        .and_then(|gpa| gpa.ok())
+        .and_then(ept::protected_page_for);
 
     // Only EPT and I/O exits are judged by EXIT_QUALIFICATION. For any other
     // exit an unreadable one (reported later) does not matter.
@@ -680,8 +689,8 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
     let invept = if grant_write {
         let page = read.protected.ok_or(ResumeFailure::NoProtectedPage)?;
         // SAFETY: exit context: VMX root operation, guest stopped. `page`
-        // came from `ept::protected_page`, so `Ept::build` made the tables,
-        // which are never freed.
+        // came from `ept::protected_page_for`, so `Ept::build` made the
+        // tables, which are never freed.
         Some(unsafe { page.grant_write() }.map_err(ResumeFailure::GrantWrite)?)
     } else {
         None

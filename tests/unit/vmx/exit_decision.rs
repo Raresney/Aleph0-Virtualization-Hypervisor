@@ -25,6 +25,7 @@ const START: ExitState = ExitState {
     nmi_pending: false,
     nmis_handled: 0,
     ept_writes_granted: 0,
+    nmi_stack_grants: 0,
 };
 /// After the EPT violation: the data page is writable, main VMCALL #1 next.
 const WRITTEN: ExitState = ExitState {
@@ -409,6 +410,11 @@ fn full_nmi_run_finishes_with_both_counts() {
         protected_write(),
         vmcall(MARKER),
         nmi(0),
+        // The injected NMI's delivery faults on the read-only stack page.
+        ExitInfo {
+            idt_vectoring: VECTORING_NMI,
+            ..protected_write()
+        },
         vmcall(NMI_MARKER),
         vmcall(MARKER + 1),
     ] {
@@ -422,6 +428,7 @@ fn full_nmi_run_finishes_with_both_counts() {
             nmi_pending: false,
             nmis_handled: 1,
             ept_writes_granted: 1,
+            nmi_stack_grants: 1,
         },
     );
 }
@@ -433,6 +440,11 @@ fn deferred_nmi_run_finishes_with_both_counts() {
         vmcall(MARKER),
         nmi(BLOCKING_BY_NMI),
         exit(EXIT_REASON_NMI_WINDOW),
+        // The window-injected NMI's delivery faults on the read-only stack page.
+        ExitInfo {
+            idt_vectoring: VECTORING_NMI,
+            ..protected_write()
+        },
         vmcall(NMI_MARKER),
         vmcall(MARKER + 1),
     ];
@@ -449,6 +461,7 @@ fn deferred_nmi_run_finishes_with_both_counts() {
             nmi_pending: false,
             nmis_handled: 1,
             ept_writes_granted: 1,
+            nmi_stack_grants: 1,
         },
     );
 }
@@ -470,15 +483,17 @@ fn a_vectoring_exit_is_still_judged_by_its_reason() {
 
 #[test]
 fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
-    // The test guest's reinjected NMI faults on its read-only data page: an
-    // EPT violation whose IDT-vectoring field holds the NMI. Grant write,
-    // and re-deliver the NMI on the retried entry.
+    // The test guest's reinjected NMI faults on its read-only stack page as
+    // the CPU pushes the interrupt frame: an EPT violation whose IDT-vectoring
+    // field holds the NMI. Grant write, and re-deliver the NMI on the retried
+    // entry.
     let interrupted = ExitInfo {
         idt_vectoring: VECTORING_NMI,
         ..protected_write()
     };
-    let (event, _) = decide(START, interrupted);
+    let (event, state) = decide(START, interrupted);
     assert_eq!(event, ExitEvent::EptWriteGranted);
+    assert_eq!(state.nmi_stack_grants, 1);
     let plan = match event.action() {
         ExitAction::Resume(plan) => plan,
         other => panic!("expected a resume, got {other:?}"),
@@ -492,6 +507,46 @@ fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
             ..ResumePlan::RETRY_AFTER_GRANT
         })
     );
+}
+
+#[test]
+fn the_nmi_delivery_fault_is_a_separate_grant_from_the_data_write() {
+    // The data-page write was already granted; the reinjected NMI's delivery
+    // now faults on the stack page. It advances its own counter, so it is
+    // still granted (and re-delivered on top).
+    let after_data = ExitState {
+        ept_writes_granted: 1,
+        ..START
+    };
+    let fault = ExitInfo {
+        idt_vectoring: VECTORING_NMI,
+        ..protected_write()
+    };
+    assert_eq!(
+        decide(after_data, fault),
+        (
+            ExitEvent::EptWriteGranted,
+            ExitState {
+                nmi_stack_grants: 1,
+                ..after_data
+            }
+        )
+    );
+}
+
+#[test]
+fn a_second_nmi_delivery_fault_is_unexpected() {
+    // One NMI-delivery fault is expected; a repeat means the grant did not
+    // take effect.
+    let after_fault = ExitState {
+        nmi_stack_grants: 1,
+        ..START
+    };
+    let fault = ExitInfo {
+        idt_vectoring: VECTORING_NMI,
+        ..protected_write()
+    };
+    assert_eq!(decide(after_fault, fault), (ExitEvent::Unexpected, after_fault));
 }
 
 #[test]

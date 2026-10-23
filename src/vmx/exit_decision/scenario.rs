@@ -1,5 +1,6 @@
 //! The test guest's own exits: its write to the EPT-protected data page,
-//! its main VMCALLs, and NMI reinjection.
+//! its main VMCALLs, NMI reinjection, and the reinjected NMI's delivery
+//! faulting on the EPT-protected stack page.
 //!
 //! The guest (`guest.rs`) writes its read-only data page, makes two main
 //! VMCALLs, with `GUEST_MARKER` and then `GUEST_MARKER + 1` in RAX, and
@@ -15,6 +16,9 @@
 //!                    guest cannot yet (STI, MOV SS or NMI blocking):
 //!                                             turn on NMI-window exiting,
 //! NMI-window exit──▶                          inject when the window opens
+//! EPT violation  ──▶ the injected NMI's delivery pushed the interrupt frame
+//!  (IDT-vectoring   onto the read-only stack page: make it writable and
+//!   = the NMI)      re-deliver the NMI (the handler, from IDT-vectoring)
 //! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
 //! main VMCALL #2 ──▶ finished
 //! ```
@@ -107,24 +111,41 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
     }
 }
 
-/// EPT violation (exit reason 48). Exactly one is handled: the guest's
-/// write to its protected data page, which must come before the first main
-/// VMCALL.
+/// EPT violation (exit reason 48). Two are handled, each once: the guest's
+/// write to its protected data page (before the first main VMCALL), and the
+/// reinjected NMI's delivery faulting on the read-only stack page as the CPU
+/// pushes the interrupt frame. The second carries the NMI in its
+/// IDT-vectoring field, which the handler re-delivers on top of the grant
+/// (`ExitInfo::redelivery`); here they differ only in the grant counter they
+/// advance, so a stray repeat of either is still `Unexpected`.
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     let protected_write = exit.protected_page != 0
         && exit.guest_physical & !0xFFF == exit.protected_page
         && EptQualification(exit.qualification).is_protected_write();
-    if protected_write && state.ept_writes_granted == 0 {
-        (
+    if !protected_write {
+        return (ExitEvent::Unexpected, state);
+    }
+    if exit.idt_vectoring.is_nmi() {
+        // The push for the reinjected NMI faulted on the read-only stack page.
+        if state.nmi_stack_grants == 0 {
+            return (
+                ExitEvent::EptWriteGranted,
+                ExitState {
+                    nmi_stack_grants: 1,
+                    ..state
+                },
+            );
+        }
+    } else if state.ept_writes_granted == 0 {
+        return (
             ExitEvent::EptWriteGranted,
             ExitState {
                 ept_writes_granted: 1,
                 ..state
             },
-        )
-    } else {
-        (ExitEvent::Unexpected, state)
+        );
     }
+    (ExitEvent::Unexpected, state)
 }
 
 /// VMCALL (exit reason 18): the guest's NMI handler, or its next main
