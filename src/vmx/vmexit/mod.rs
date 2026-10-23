@@ -10,8 +10,9 @@
 //! `bring_up::run` enters the guest through `vmcs::launch`, so the guest's
 //! first VM exit lands here. The handler (`handler.rs`) prints each exit over
 //! serial, and `exit_decision::decide` says what it is: an instruction to
-//! execute for the guest (CPUID, RDMSR, WRMSR, IN, OUT), or a #GP to inject
-//! for an MSR it cannot have or a non-canonical value written to one it can,
+//! execute for the guest (CPUID, RDMSR, WRMSR, IN, OUT), an access to its
+//! copy of its MTRRs (`guest_mtrrs.rs`), or a #GP to inject for an MSR it
+//! cannot have or a value written to one that the CPU would refuse,
 //! a write to the EPT-protected data page to allow and retry, a VMCALL to
 //! resume past, an NMI to reinject, an NMI window to inject in, the last
 //! planned VMCALL, or something unexpected. To resume, the
@@ -29,12 +30,14 @@ use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::{self, VmcsError};
 
 mod dump;
+mod guest_mtrrs;
 mod handler;
 mod history;
 mod policy;
 mod report;
 mod stats;
 
+pub use guest_mtrrs::{publish as publish_guest_mtrrs, registers as guest_mtrr_registers};
 pub use stats::{VcpuStats, snapshot as vcpu_stats};
 
 /// Prints the last VM exits, oldest first, each line after `context`: for

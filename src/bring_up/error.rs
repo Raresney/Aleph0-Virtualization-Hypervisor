@@ -62,6 +62,9 @@ pub enum BringUpError {
         number: u64,
         reason: ExitReason,
     },
+    /// The CPU's MTRRs read differently after the guest than before: a
+    /// guest write reached them instead of the guest's copy.
+    MtrrsChanged,
     /// The guest finished, but its exit statistics differ from what the
     /// test guest does (`guest::expected_stats`): an emulated exit is
     /// missing or came twice.
@@ -225,6 +228,9 @@ pub fn report_error(error: BringUpError) {
             vmx::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
         ),
+        BringUpError::MtrrsChanged => {
+            log!("The CPU's MTRRs changed while the guest ran: a guest write reached them, not its copy.")
+        }
         BringUpError::UnexpectedExitStats(stats) => log!(
             "Guest finished, but its exit statistics were {stats}; expected {}.",
             vmx::guest::expected_stats(&stats),

@@ -9,6 +9,12 @@
 //! hardware says, except where a policy here changes it
 //! ([`cpuid_policy`]).
 //!
+//! The guest's MTRRs are the exception to passthrough. The CPU's still set
+//! the memory types of Aleph0's own accesses in root operation, so the
+//! guest's RDMSR and WRMSR of them reach a copy instead
+//! (`vmexit::guest_mtrrs`), and a value WRMSR would refuse gets the #GP it
+//! would get on bare metal.
+//!
 //! HLT is decided here too, but never executed: Aleph0 resumes past it (see
 //! [`hlt`]).
 //!
@@ -20,6 +26,7 @@ use core::arch::x86_64::CpuidResult;
 
 use super::{ExitEvent, ExitInfo};
 use crate::vmx::exit_bitmaps::{INTERCEPTED_MSRS, MsrAccess, msr_bit};
+use crate::vmx::mtrr::{MtrrCapabilities, MtrrMsr};
 
 /// An instruction the exit handler executes for the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +38,13 @@ pub enum Emulation {
     /// WRMSR of `value` (EDX:EAX) to `msr`, an intercepted MSR. `value` is
     /// canonical, so the real WRMSR cannot fault.
     Wrmsr { msr: u32, value: u64 },
+    /// RDMSR of `msr`, one of the guest's MTRRs: from its copy, never the
+    /// CPU's.
+    MtrrRead { msr: MtrrMsr },
+    /// WRMSR of `value` to `msr`, one of the guest's MTRRs: into its copy,
+    /// never the CPU's, and EPT takes the types it gives. `value` is one
+    /// WRMSR would take.
+    MtrrWrite { msr: MtrrMsr, value: u64 },
     /// IN of `size` from `port`.
     In { port: u16, size: IoSize },
     /// OUT of `value` (`size` wide) to `port`.
@@ -87,8 +101,10 @@ pub fn is_canonical_48(value: u64) -> bool {
 
 /// What an RDMSR or WRMSR of an MSR gets.
 enum MsrRoute {
-    /// In [`INTERCEPTED_MSRS`]: emulate it.
+    /// In [`INTERCEPTED_MSRS`]: pass it through.
     Intercepted,
+    /// One of the guest's MTRRs: read or write its copy.
+    Mtrr(MtrrMsr),
     /// Outside both MSR-bitmap ranges, so it exits whatever the bitmap
     /// says. Aleph0 does not know it exists, and a real RDMSR/WRMSR of a
     /// missing MSR would #GP in the host, so the guest gets the #GP.
@@ -98,12 +114,14 @@ enum MsrRoute {
     NotIntercepted,
 }
 
-/// Which [`MsrRoute`] `msr` takes.
-fn route(msr: u32) -> MsrRoute {
+/// Which [`MsrRoute`] `msr` takes, for a guest whose MTRR MSRs are `mtrr`.
+fn route(msr: u32, mtrr: MtrrCapabilities) -> MsrRoute {
     if msr_bit(msr, MsrAccess::Read).is_none() {
         MsrRoute::OutOfRange
     } else if INTERCEPTED_MSRS.contains(&msr) {
         MsrRoute::Intercepted
+    } else if let Some(msr) = mtrr.msr(msr) {
+        MsrRoute::Mtrr(msr)
     } else {
         MsrRoute::NotIntercepted
     }
@@ -112,24 +130,36 @@ fn route(msr: u32) -> MsrRoute {
 /// RDMSR (exit reason 31) of the MSR in ECX.
 pub(super) fn rdmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
-    match route(msr) {
+    match route(msr, exit.mtrr) {
         MsrRoute::Intercepted => ExitEvent::Emulated(Emulation::Rdmsr { msr }),
+        MsrRoute::Mtrr(msr) => ExitEvent::Emulated(Emulation::MtrrRead { msr }),
         MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
         MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }
 }
 
-/// WRMSR (exit reason 32) of EDX:EAX to the MSR in ECX. Like WRMSR itself,
-/// it ignores the upper halves of RDX and RAX.
+/// The value a WRMSR exit writes: EDX:EAX. Like WRMSR itself, it ignores
+/// the upper halves of RDX and RAX.
+pub fn wrmsr_value(exit: &ExitInfo) -> u64 {
+    (exit.guest_rdx << 32) | (exit.guest_rax & 0xFFFF_FFFF)
+}
+
+/// WRMSR (exit reason 32) of EDX:EAX to the MSR in ECX.
 pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
-    let value = (exit.guest_rdx << 32) | (exit.guest_rax & 0xFFFF_FFFF);
-    match route(msr) {
+    let value = wrmsr_value(exit);
+    match route(msr, exit.mtrr) {
         // Every intercepted MSR holds an address (only IA32_KERNEL_GS_BASE
         // today). A real WRMSR of a non-canonical one would #GP in the host,
         // in exit context, so the guest gets that #GP instead.
         MsrRoute::Intercepted if !is_canonical_48(value) => ExitEvent::GuestGeneralProtection,
         MsrRoute::Intercepted => ExitEvent::Emulated(Emulation::Wrmsr { msr, value }),
+        // Checked on its own, as the CPU does: a reserved type or bit gets
+        // the #GP even in an MTRR not in use, and the copy stays as it was.
+        MsrRoute::Mtrr(msr) => match exit.mtrr.check(msr, value) {
+            Ok(()) => ExitEvent::Emulated(Emulation::MtrrWrite { msr, value }),
+            Err(_) => ExitEvent::GuestGeneralProtection,
+        },
         MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
         MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }

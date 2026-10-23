@@ -13,9 +13,10 @@
 //! in one place:
 //!
 //! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID,
-//!   RDMSR, WRMSR, IN, OUT), and HLT, which it skips. Each handler reads the
-//!   exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR, which get
-//!   #UD, need no handler of their own.
+//!   RDMSR, WRMSR, IN, OUT), RDMSR and WRMSR of the guest's MTRRs, which
+//!   reach a copy of them instead, and HLT, which it skips. Each handler
+//!   reads the exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR,
+//!   which get #UD, need no handler of their own.
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
 //!   NMI reinjection), which depend on what came before:
 //!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`.
@@ -27,7 +28,9 @@
 mod emulation;
 mod scenario;
 
-pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in};
+use crate::vmx::mtrr::MtrrCapabilities;
+
+pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in, wrmsr_value};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
@@ -321,6 +324,10 @@ pub struct ExitInfo {
     pub guest_physical: u64,
     /// GPA of the page EPT maps read-only (`ept::protected_page`), 0 if none.
     pub protected_page: u64,
+    /// The guest's MTRR MSRs: which exist, and which values WRMSR refuses
+    /// (`vmexit::guest_mtrrs`). [`MtrrCapabilities::NONE`] until bring-up
+    /// publishes them, and on a CPU without MTRRs.
+    pub mtrr: MtrrCapabilities,
 }
 
 impl ExitInfo {
@@ -401,7 +408,8 @@ pub enum ExitEvent {
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
     /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
-    /// bitmap, or a non-canonical value for an intercepted one.
+    /// bitmap, a non-canonical value for an intercepted one, or a value its
+    /// MTRRs would refuse.
     GuestGeneralProtection,
     /// HLT: resume past it at once. The guest's next instruction runs as if
     /// an interrupt had woken it.

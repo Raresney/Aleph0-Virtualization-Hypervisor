@@ -8,13 +8,16 @@
 //!    refuses an unusable guest TR. The firmware's GDTR is recorded first,
 //!    and put back on every return path once this step has succeeded: by
 //!    `run` if a failure comes before VMXON, by step 7 after it.
-//! 2. Allocate the VM-exit stack, the guest's pages and the MSR and I/O
-//!    bitmaps, and check how the page tables map the guest pages.
+//! 2. Allocate the VM-exit stack and the guest's pages, and check how the
+//!    page tables map the guest pages.
 //! 3. Detect VMX, read its capability MSRs and check EPT support
 //!    ([`check_vmx_support`]), read the MTRRs, then build the EPT identity
-//!    map with their memory types and the guest's data page read-only. Build
-//!    what Aleph0 runs on after a VM exit ([`HostEnvironment`]): page tables
-//!    mapping the same range, a GDT, a TSS with interrupt stacks, an IDT.
+//!    map with their memory types and the guest's data page read-only, with
+//!    spare PTs for the guest's MTRR writes. Allocate the MSR and I/O
+//!    bitmaps, which intercept every MTRR MSR, and give the exit handler the
+//!    guest's copy of the MTRRs. Build what Aleph0 runs on after a VM exit
+//!    ([`HostEnvironment`]): page tables mapping the same range, a GDT, a
+//!    TSS with interrupt stacks, an IDT.
 //! 4. Enter VMX root operation and create the VMCS.
 //! 5. Fill in the VMCS: controls, EPT pointer, exit bitmaps, host state,
 //!    guest state ([`prepare_vmcs`]). Then check that none of this disturbed
@@ -23,7 +26,8 @@
 //!    guest has stopped: after its last planned exit, or at an exit or
 //!    failure the exit handler in `vmx::vmexit` does not handle. The host
 //!    state the guest reaches through passthrough emulation
-//!    ([`PassthroughState`]) is read before and after, and printed.
+//!    ([`PassthroughState`]) is read before and after, and printed, and so
+//!    are the CPU's MTRRs, which the guest must never reach.
 //! 7. Leave VMX operation and restore the firmware's state
 //!    ([`teardown::teardown`]). Runs whatever happened after VMXON
 //!    succeeded (creating the VMCS, steps 5 and 6), so firmware gets the CPU
@@ -47,12 +51,13 @@ pub use error::{BringUpError, report_error};
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
 use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
-use crate::vmx::ept::{self, Ept, InveptType};
+use crate::vmx::ept::{self, Ept, InveptType, TypeTables};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
 use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host::{FirmwareSelectors, HostEnvironment};
 use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
+use crate::vmx::mtrr::{MtrrError, MtrrRegisters, MtrrState};
 use crate::vmx::segment::DescriptorTable;
 use crate::vmx::vmcs::{DesiredControls, GuestKind, GuestStop, VmcsRegion};
 use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
@@ -121,6 +126,7 @@ const _: () = assert!(
         && !core::mem::needs_drop::<VmExitStack>()
         && !core::mem::needs_drop::<GuestMemory>()
         && !core::mem::needs_drop::<Ept>()
+        && !core::mem::needs_drop::<TypeTables>()
         && !core::mem::needs_drop::<ExitBitmaps>()
         && !core::mem::needs_drop::<VmxOperation>()
         && !core::mem::needs_drop::<VmcsRegion>()
@@ -202,11 +208,11 @@ struct VmxEntry {
     vmx_operation: VmxOperation,
 }
 
-/// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack, the guest's
-/// pages and the exit bitmaps, checks VMX and EPT support, reads the MTRRs,
-/// builds the EPT tables and the host environment, and enters VMX root
-/// operation. A failure here leaves the CPU
-/// outside VMX operation, so `run` only has to put the firmware's GDTR back.
+/// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack and the guest's
+/// pages, checks VMX and EPT support, reads the MTRRs, builds the EPT
+/// tables, the exit bitmaps and the host environment, and enters VMX root
+/// operation. A failure here leaves the CPU outside VMX operation, so `run`
+/// only has to put the firmware's GDTR back.
 fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let vmexit_stack = VmExitStack::allocate()?;
     log!(
@@ -231,17 +237,20 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
 
-    let bitmaps = ExitBitmaps::allocate()?;
-    report::exit_bitmaps(&bitmaps);
-
     let (controls, invept) = check_vmx_support()?;
 
-    let mtrrs = vmx::mtrr::read()?.decode()?;
-    report::mtrrs(&mtrrs);
+    // The guest's MTRRs start as the CPU's.
+    let mtrrs = MtrrState::new(vmx::mtrr::read()?)?;
+    let capabilities = mtrrs.registers().capabilities();
+    report::mtrrs(mtrrs.mtrrs());
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the data page's address its GPA.
-    let ept = unsafe { Ept::build(guest.data_page(), invept, &mtrrs) }?;
-    report::ept(&ept, guest.data_page());
+    let (ept, types) = unsafe { Ept::build(guest.data_page(), invept, mtrrs.mtrrs(), ept::spare_pts(capabilities)) }?;
+    report::ept(&ept, &types, guest.data_page());
+
+    let bitmaps = ExitBitmaps::allocate(capabilities)?;
+    report::exit_bitmaps(&bitmaps, capabilities);
+    vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
 
     // The same range as EPT: every address the UEFI memory map reaches,
     // which holds the image, every allocation and the firmware stack.
@@ -355,19 +364,39 @@ fn launch_guest(
 
     log!("Launching the guest with VMLAUNCH; its VM exits are reported on serial only.");
     let before = PassthroughState::read();
+    let mtrrs_before = vmx::mtrr::read();
     // SAFETY: `prepare_vmcs` wrote the controls, the host state
     // (HOST_RSP/HOST_RIP at the live exit stack and handler) and the guest
     // state; the exit stack, guest pages, EPT tables, host environment and
     // exit bitmaps are never freed.
     let stop = unsafe { vmx::vmcs::launch() };
     report::passthrough_state(before, PassthroughState::read());
+    let mtrrs_after = vmx::mtrr::read();
+    // The guest has stopped, so no exit handler writes its MTRRs any more.
+    let guest_mtrrs = vmx::vmexit::guest_mtrr_registers();
+    report::mtrrs_after_guest(&mtrrs_before, &mtrrs_after, guest_mtrrs.as_ref());
     let run = guest_result(stop)?;
     // The guest has stopped, so no exit handler is counting any more.
     let stats = vmx::vmexit::vcpu_stats();
     if stats != vmx::guest::expected_stats(&stats) {
         return Err(BringUpError::UnexpectedExitStats(stats));
     }
+    check_mtrrs_untouched(&mtrrs_before, &mtrrs_after)?;
     Ok(run)
+}
+
+/// Checks that the CPU's MTRRs read the same after the guest as before
+/// (`before`, `after`): its MTRR writes went to its copy, never to the MSRs
+/// that set the memory types of Aleph0's own accesses.
+fn check_mtrrs_untouched(
+    before: &Result<MtrrRegisters, MtrrError>,
+    after: &Result<MtrrRegisters, MtrrError>,
+) -> Result<(), BringUpError> {
+    match (before, after) {
+        (Ok(before), Ok(after)) if before == after => Ok(()),
+        (Err(error), _) | (_, Err(error)) => Err(BringUpError::Mtrr(*error)),
+        (Ok(_), Ok(_)) => Err(BringUpError::MtrrsChanged),
+    }
 }
 
 /// Fills in the current VMCS: controls, EPT pointer, exit bitmaps, host state,

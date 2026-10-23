@@ -23,7 +23,10 @@
 //! ```
 //!
 //! - Their values ([`MtrrRegisters`]), each one a value the CPU would
-//!   accept.
+//!   accept, and the same values decoded ([`MtrrState`]), which is what the
+//!   guest's copy of its MTRRs is (`vmexit::guest_mtrrs`).
+
+use core::fmt;
 
 use super::{
     ADDRESS_BITS, CAP_FIXED, CAP_VARIABLE_COUNT, DEF_TYPE_ENABLE, DEF_TYPE_FIXED_ENABLE, FIXED_MSRS, FIXED_RANGES,
@@ -82,6 +85,33 @@ impl MtrrCapabilities {
     /// How many variable ranges the CPU has.
     pub fn variable_count(self) -> usize {
         self.variable_count.into()
+    }
+
+    /// Whether the fixed-range MSRs exist.
+    pub fn fixed(self) -> bool {
+        self.supported && self.fixed
+    }
+
+    /// The MTRR MSR at `address`, or `None` when the CPU has no MTRR there.
+    pub fn msr(self, address: u32) -> Option<MtrrMsr> {
+        if !self.supported {
+            return None;
+        }
+        if address == IA32_MTRR_DEF_TYPE {
+            return Some(MtrrMsr(Kind::DefType));
+        }
+        if let Some(index) = FIXED_RANGES.iter().position(|&(msr, ..)| msr == address) {
+            return self.fixed.then_some(MtrrMsr(Kind::Fixed(index as u8)));
+        }
+        let offset = address.checked_sub(IA32_MTRR_PHYSBASE0)?;
+        let number = u8::try_from(offset / 2)
+            .ok()
+            .filter(|&number| number < self.variable_count)?;
+        Some(MtrrMsr(if offset % 2 == 0 {
+            Kind::PhysBase(number)
+        } else {
+            Kind::PhysMask(number)
+        }))
     }
 
     /// Every MTRR MSR the CPU has: IA32_MTRR_DEF_TYPE, the fixed-range MSRs
@@ -158,6 +188,27 @@ impl MtrrMsr {
             Kind::PhysMask(number) => IA32_MTRR_PHYSBASE0 + 2 * u32::from(number) + 1,
         }
     }
+
+    /// Whether it is one of the fixed-range MSRs.
+    pub fn is_fixed(self) -> bool {
+        matches!(self.0, Kind::Fixed(_))
+    }
+}
+
+impl fmt::Display for MtrrMsr {
+    /// The SDM's name: `IA32_MTRR_DEF_TYPE`, `IA32_MTRR_FIX16K_A0000`,
+    /// `IA32_MTRR_PHYSMASK7`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Kind::DefType => f.write_str("IA32_MTRR_DEF_TYPE"),
+            Kind::Fixed(index) => {
+                let (_, start, size) = FIXED_RANGES[usize::from(index)];
+                write!(f, "IA32_MTRR_FIX{}K_{start:05X}", size / 1024)
+            }
+            Kind::PhysBase(number) => write!(f, "IA32_MTRR_PHYSBASE{number}"),
+            Kind::PhysMask(number) => write!(f, "IA32_MTRR_PHYSMASK{number}"),
+        }
+    }
 }
 
 /// The values of every MTRR MSR a CPU has ([`MtrrCapabilities::msrs`]),
@@ -192,6 +243,30 @@ impl MtrrRegisters {
         Ok(registers)
     }
 
+    /// Which MSRs there are.
+    pub fn capabilities(&self) -> MtrrCapabilities {
+        self.capabilities
+    }
+
+    /// The value of `msr`, as RDMSR returns it.
+    pub fn get(&self, msr: MtrrMsr) -> u64 {
+        match msr.0 {
+            Kind::DefType => self.def_type,
+            Kind::Fixed(index) => self.fixed[usize::from(index)],
+            Kind::PhysBase(number) => self.variable[usize::from(number)].0,
+            Kind::PhysMask(number) => self.variable[usize::from(number)].1,
+        }
+    }
+
+    /// Writes `value` to `msr` as WRMSR does: a value the CPU would refuse
+    /// ([`MtrrCapabilities::check`]) is refused, and every value stays as
+    /// it was.
+    pub fn write(&mut self, msr: MtrrMsr, value: u64) -> Result<(), MtrrError> {
+        self.capabilities.check(msr, value)?;
+        *self.value_mut(msr) = value;
+        Ok(())
+    }
+
     /// The memory types the values give ([`Mtrrs::decode`]).
     /// [`Mtrrs::Unsupported`] without MTRRs.
     pub fn decode(&self) -> Result<Mtrrs, MtrrError> {
@@ -212,6 +287,63 @@ impl MtrrRegisters {
             Kind::Fixed(index) => &mut self.fixed[usize::from(index)],
             Kind::PhysBase(number) => &mut self.variable[usize::from(number)].0,
             Kind::PhysMask(number) => &mut self.variable[usize::from(number)].1,
+        }
+    }
+}
+
+/// MTRRs both as their MSRs hold them and decoded, kept in step: what the
+/// guest's copy of its MTRRs is. KVM keeps the same per vCPU
+/// (`kvm_mtrr`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtrrState {
+    registers: MtrrRegisters,
+    /// `registers`, decoded.
+    mtrrs: Mtrrs,
+}
+
+impl MtrrState {
+    /// `registers` with their decoding.
+    pub fn new(registers: MtrrRegisters) -> Result<Self, MtrrError> {
+        let mtrrs = registers.decode()?;
+        Ok(Self { registers, mtrrs })
+    }
+
+    /// The MSRs' values.
+    pub fn registers(&self) -> &MtrrRegisters {
+        &self.registers
+    }
+
+    /// The memory types they give.
+    pub fn mtrrs(&self) -> &Mtrrs {
+        &self.mtrrs
+    }
+
+    /// Writes `value` to `msr` as WRMSR does, and returns whether the
+    /// memory type of any address changed.
+    ///
+    /// A value the CPU would refuse is refused, and everything stays as it
+    /// was: the #GP the guest gets for it is all that happens, as on bare
+    /// metal. That holds while the MTRRs are disabled too, when nothing
+    /// decodes them: an OS clears IA32_MTRR_DEF_TYPE.E, writes the ranges,
+    /// then sets E again, and a bad range must fault at its own WRMSR, not
+    /// at the one that sets E. Writes while E is clear change no type, so
+    /// only the write that sets E again returns `true`.
+    ///
+    /// A value WRMSR takes always decodes, every type field being valid;
+    /// should one not, it is refused all the same.
+    pub fn write(&mut self, msr: MtrrMsr, value: u64) -> Result<bool, MtrrError> {
+        let old = self.registers.get(msr);
+        self.registers.write(msr, value)?;
+        match self.registers.decode() {
+            Ok(mtrrs) => {
+                let changed = mtrrs != self.mtrrs;
+                self.mtrrs = mtrrs;
+                Ok(changed)
+            }
+            Err(error) => {
+                *self.registers.value_mut(msr) = old;
+                Err(error)
+            }
         }
     }
 }

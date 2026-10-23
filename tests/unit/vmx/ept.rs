@@ -7,6 +7,7 @@
 use super::level::{Pd, Pdpt, Pml4, Pt};
 use super::*;
 use crate::vmx::mtrr::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteProtected as WP};
+use crate::vmx::mtrr::MtrrCapabilities;
 use crate::vmx::mtrr::tests::{enabled, enabled_with_fixed, pc_fixed, range};
 
 /// A secondary capability MSR that allows EPT and nothing else.
@@ -339,7 +340,9 @@ fn pd_entries_read_back_how_they_map() {
 #[test]
 fn region_runs_merge_pd_entries_that_map_alike() {
     let ((_, _, pds, _), _) = filled(0x7eb1_d000);
-    let runs: Vec<_> = region_runs(&pds).map(|run| (run.start, run.end, run.mapping)).collect();
+    let runs: Vec<_> = region_runs(&pds, 0)
+        .map(|run| (run.start, run.end, run.mapping))
+        .collect();
     assert_eq!(
         runs,
         [
@@ -362,4 +365,313 @@ fn only_published_invept_types_decode() {
     assert_eq!(decode_invept(2), Some(InveptType::AllContext));
     assert_eq!(decode_invept(3), None);
     assert_eq!(decode_invept(0xFF), None);
+}
+
+#[test]
+fn with_memory_type_keeps_the_address_and_the_access() {
+    let read_only = EptEntry::page(0x7eb1_d000, EPT_READ, WB);
+    assert_eq!(
+        read_only.with_memory_type(UC),
+        EptEntry::page(0x7eb1_d000, EPT_READ, UC)
+    );
+    let writable = EptEntry::page(0x7eb1_d000, EPT_READ | EPT_WRITE, UC);
+    assert_eq!(
+        writable.with_memory_type(WP),
+        EptEntry::page(0x7eb1_d000, EPT_READ | EPT_WRITE, WP)
+    );
+}
+
+#[test]
+fn region_runs_count_regions_from_the_first_entry_given() {
+    let ((_, _, pds, _), _) = filled(0x7eb1_d000);
+    // Entries 0x1FF..=0x201: WB, then the UC region at 0x4000_0000, then WB.
+    let runs: Vec<_> = region_runs(&pds[0x1FF..0x202], 0x1FF)
+        .map(|run| (run.start, run.end, run.mapping))
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            (0x3FE0_0000, 0x4000_0000, RegionMapping::LargePage(WB)),
+            (0x4000_0000, 0x4020_0000, RegionMapping::LargePage(UC)),
+            (0x4020_0000, 0x4040_0000, RegionMapping::LargePage(WB)),
+        ]
+    );
+}
+
+#[test]
+fn spare_pts_cover_each_variable_range_and_the_fixed_ranges() {
+    assert_eq!(spare_pts(MtrrCapabilities::NONE), 0);
+    // Hyper-V: eight variable ranges and the fixed ones.
+    assert_eq!(spare_pts(MtrrCapabilities::new((1 << 8) | 8, 46).unwrap()), 9);
+    assert_eq!(spare_pts(MtrrCapabilities::new(10, 46).unwrap()), 10);
+}
+
+#[test]
+fn the_free_stack_hands_out_the_spare_pts_in_address_order() {
+    let mut stack = [0; 5];
+    let mut len = fill_free_stack(&mut stack, 2);
+    assert_eq!(len, 3);
+    let mut free = FreePts {
+        stack: &mut stack,
+        len: &mut len,
+    };
+    assert_eq!(
+        [free.take(), free.take(), free.take(), free.take()],
+        [Some(2), Some(3), Some(4), None]
+    );
+    free.give_back(3);
+    assert_eq!(free.take(), Some(3));
+}
+
+#[test]
+fn a_pd_entry_names_its_pt_by_index() {
+    let pts = 0x10_0000;
+    assert_eq!(pt_index(EptEntry::table(pts), pts, 3), Some(0));
+    assert_eq!(pt_index(EptEntry::table(pts + 0x2000), pts, 3), Some(2));
+    assert_eq!(pt_index(EptEntry::table(pts + 0x3000), pts, 3), None);
+    assert_eq!(pt_index(EptEntry::table(pts - 0x1000), pts, 3), None);
+}
+
+/// Where [`TypeMap`] puts its PTs.
+const PTS_ADDRESS: u64 = 0x10_0000;
+/// The protected page of the [`TypeMap`] tests: in region 0x3F5
+/// (0x7EA0_0000), at index 0x11D of its PT.
+const PROTECTED: u64 = 0x7eb1_d000;
+
+/// A 2 GiB identity map as [`Ept::build`] leaves it, with the free stack
+/// that [`TypeTables`] keeps, on vectors.
+struct TypeMap {
+    pds: Vec<EptEntry<Pd>>,
+    /// Every PT, the spare ones last.
+    pts: Vec<EptEntry<Pt>>,
+    free: Vec<u32>,
+    free_len: usize,
+}
+
+impl TypeMap {
+    /// The map `mtrrs` give, with [`PROTECTED`] read-only and `spare` PTs
+    /// set aside.
+    fn new(mtrrs: &Mtrrs, spare: usize) -> Self {
+        let split = split_regions(mtrrs, 2, PROTECTED);
+        let mut pml4 = vec![EptEntry::EMPTY; ENTRIES];
+        let mut pdpt = vec![EptEntry::EMPTY; ENTRIES];
+        let mut pds = vec![EptEntry::EMPTY; 2 * ENTRIES];
+        let mut pts = vec![EptEntry::EMPTY; (split + spare) * ENTRIES];
+        fill_identity_map(
+            Tables {
+                pml4: &mut pml4,
+                pdpt: &mut pdpt,
+                pds: &mut pds,
+                pts: &mut pts[..split * ENTRIES],
+                pdpt_address: 0x1000,
+                pds_address: 0x2000,
+                pts_address: PTS_ADDRESS,
+            },
+            2,
+            mtrrs,
+            PROTECTED,
+        );
+        let mut free = vec![0; split + spare];
+        let free_len = fill_free_stack(&mut free, split);
+        Self {
+            pds,
+            pts,
+            free,
+            free_len,
+        }
+    }
+
+    /// Gives the map the types of `mtrrs`, as [`TypeTables::apply`] does
+    /// before its INVEPT.
+    fn retype(&mut self, mtrrs: &Mtrrs) -> Retyped {
+        let (pts, _) = self.pts.as_chunks_mut::<ENTRIES>();
+        let mut tables = Retype {
+            pds: &mut self.pds,
+            pts,
+            pts_address: PTS_ADDRESS,
+            free: FreePts {
+                stack: &mut self.free,
+                len: &mut self.free_len,
+            },
+            protected_region: (PROTECTED / SIZE_2M) as usize,
+        };
+        retype(&mut tables, mtrrs)
+    }
+
+    /// PT number `index`.
+    fn pt(&self, index: usize) -> &[EptEntry<Pt>] {
+        &self.pts[index * ENTRIES..][..ENTRIES]
+    }
+}
+
+/// A 2 GiB machine: all of it WB, the default UC above.
+fn all_write_back() -> Mtrrs {
+    Mtrrs::decode(enabled(UC), None, &[range(0, 2 * SIZE_1G, WB)]).unwrap()
+}
+
+/// [`all_write_back`] with variable ranges `more` added after the first.
+fn write_back_with(more: &[(u64, u64)]) -> Mtrrs {
+    let mut variable = vec![range(0, 2 * SIZE_1G, WB)];
+    variable.extend_from_slice(more);
+    Mtrrs::decode(enabled(UC), None, &variable).unwrap()
+}
+
+#[test]
+fn the_same_types_change_nothing() {
+    let mut map = TypeMap::new(&test_mtrrs(), 1);
+    let (pds, pts) = (map.pds.clone(), map.pts.clone());
+    assert_eq!(map.retype(&test_mtrrs()), Retyped::default());
+    assert_eq!((map.pds, map.pts, map.free_len), (pds, pts, 1));
+}
+
+#[test]
+fn a_region_of_one_type_changes_only_its_type_bits() {
+    let mut map = TypeMap::new(&all_write_back(), 1);
+    let before = map.pds.clone();
+    let retyped = map.retype(&write_back_with(&[range(SIZE_2M, SIZE_2M, UC)]));
+    assert_eq!(
+        retyped,
+        Retyped {
+            regions: 1,
+            span: Some((SIZE_2M, 2 * SIZE_2M)),
+            ..Retyped::default()
+        }
+    );
+    assert_eq!(map.pds[1], EptEntry::large_page(SIZE_2M, UC));
+    // WB is 6 in bits 5:3, UC 0: nothing else in the entry differs.
+    assert_eq!(map.pds[1].raw ^ before[1].raw, 6 << 3);
+    for (i, (after, before)) in map.pds.iter().zip(&before).enumerate().filter(|&(i, _)| i != 1) {
+        assert_eq!(after, before, "PD entry {i:#x}");
+    }
+}
+
+#[test]
+fn a_region_that_comes_to_mix_types_takes_a_spare_pt() {
+    let mut map = TypeMap::new(&all_write_back(), 2);
+    // One PT at build, the protected page's; the spare ones are 1 and 2.
+    let retyped = map.retype(&write_back_with(&[range(SIZE_2M, 0x1000, UC)]));
+    assert_eq!((retyped.regions, retyped.split, retyped.merged), (1, 1, 0));
+    assert_eq!(map.pds[1], EptEntry::table(PTS_ADDRESS + 0x1000));
+    assert_eq!(map.free_len, 1);
+    let pt = map.pt(1);
+    assert_eq!(pt[0], EptEntry::page(SIZE_2M, EPT_RWX, UC));
+    assert_eq!(pt[1], EptEntry::page(SIZE_2M + 0x1000, EPT_RWX, WB));
+    assert_eq!(pt[511], EptEntry::page(2 * SIZE_2M - 0x1000, EPT_RWX, WB));
+}
+
+#[test]
+fn a_region_of_one_type_again_gives_its_pt_back() {
+    let mut map = TypeMap::new(&all_write_back(), 2);
+    map.retype(&write_back_with(&[range(SIZE_2M, 0x1000, UC)]));
+    let retyped = map.retype(&all_write_back());
+    assert_eq!((retyped.regions, retyped.split, retyped.merged), (1, 0, 1));
+    assert_eq!(map.pds[1], EptEntry::large_page(SIZE_2M, WB));
+    assert_eq!(map.free_len, 2);
+    // The PT given back is the next one taken.
+    map.retype(&write_back_with(&[range(3 * SIZE_2M, 0x1000, UC)]));
+    assert_eq!(map.pds[3], EptEntry::table(PTS_ADDRESS + 0x1000));
+}
+
+#[test]
+fn the_protected_region_keeps_its_pt_and_its_access() {
+    let mut map = TypeMap::new(&all_write_back(), 0);
+    let region = PROTECTED & !(SIZE_2M - 1);
+    let retyped = map.retype(&write_back_with(&[range(region, SIZE_2M, UC)]));
+    assert_eq!((retyped.regions, retyped.split, retyped.merged), (1, 0, 0));
+    assert_eq!(map.pds[0x3F5], EptEntry::table(PTS_ADDRESS));
+    assert_eq!(map.pt(0)[0x11D], EptEntry::page(PROTECTED, EPT_READ, UC));
+    assert_eq!(map.pt(0)[0], EptEntry::page(region, EPT_RWX, UC));
+    // Once its write is granted, the page stays writable through a retype.
+    map.pts[0x11D] = map.pts[0x11D].with_access(EPT_READ | EPT_WRITE);
+    map.retype(&all_write_back());
+    assert_eq!(map.pt(0)[0x11D], EptEntry::page(PROTECTED, EPT_READ | EPT_WRITE, WB));
+}
+
+#[test]
+fn without_a_spare_pt_a_mixed_region_is_one_uc_page() {
+    let mut map = TypeMap::new(&all_write_back(), 0);
+    let retyped = map.retype(&write_back_with(&[range(SIZE_2M, 0x1000, UC)]));
+    assert_eq!((retyped.regions, retyped.split, retyped.uncached), (1, 0, 1));
+    assert_eq!(map.pds[1], EptEntry::large_page(SIZE_2M, UC));
+    // Back to one type: WB again, nothing left UC.
+    let retyped = map.retype(&all_write_back());
+    assert_eq!((retyped.regions, retyped.uncached), (1, 0));
+    assert_eq!(map.pds[1], EptEntry::large_page(SIZE_2M, WB));
+}
+
+#[test]
+fn a_region_left_uc_gets_a_pt_once_one_is_free() {
+    // Built with region 3 mixed, so it has a PT, and no spare one.
+    let mut map = TypeMap::new(&write_back_with(&[range(3 * SIZE_2M, 0x1000, UC)]), 0);
+    // Region 1 mixes before region 3 gives its PT back: UC for now.
+    let moved = write_back_with(&[range(SIZE_2M, 0x1000, UC)]);
+    let retyped = map.retype(&moved);
+    assert_eq!((retyped.split, retyped.merged, retyped.uncached), (0, 1, 1));
+    assert_eq!(map.pds[1], EptEntry::large_page(SIZE_2M, UC));
+    // The next retype finds region 3's PT free: the first one, as region 3
+    // comes before the protected page's in address order.
+    let retyped = map.retype(&moved);
+    assert_eq!((retyped.regions, retyped.split, retyped.uncached), (1, 1, 0));
+    assert_eq!(map.pds[1], EptEntry::table(PTS_ADDRESS));
+    assert_eq!(map.pt(0)[0], EptEntry::page(SIZE_2M, EPT_RWX, UC));
+}
+
+#[test]
+fn disabling_the_mtrrs_makes_everything_uc_and_enabling_them_restores_the_map() {
+    let mut map = TypeMap::new(&test_mtrrs(), 1);
+    let retyped = map.retype(&Mtrrs::Disabled);
+    // Every region but the protected one is a UC 2 MiB page; the mixed one
+    // at 0x7FE0_0000 gave its PT back.
+    assert_eq!(retyped.merged, 1);
+    assert_eq!(map.free_len, 2);
+    for (i, entry) in map.pds.iter().enumerate().filter(|&(i, _)| i != 0x3F5) {
+        assert_eq!(*entry, EptEntry::large_page(i as u64 * SIZE_2M, UC), "PD entry {i:#x}");
+    }
+    assert!(map.pt(0).iter().all(|page| page.with_memory_type(UC) == *page));
+    // Setting E again gives back exactly the map bring-up built.
+    map.retype(&test_mtrrs());
+    let built = TypeMap::new(&test_mtrrs(), 1);
+    assert_eq!((map.pds, map.pts, map.free_len), (built.pds, built.pts, 1));
+}
+
+#[test]
+fn the_spare_pts_cover_a_small_range_in_every_variable_range() {
+    // Fixed ranges mixing the first 2 MiB, and eight 4 KiB UC ranges in
+    // eight other regions: the most regions contiguous masks can split.
+    let mut small: Vec<_> = (0..7).map(|n| range((2 + 2 * n) * SIZE_2M, 0x1000, UC)).collect();
+    small.insert(0, range(0, 2 * SIZE_1G, WB));
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &small).unwrap();
+    let mut map = TypeMap::new(
+        &all_write_back(),
+        spare_pts(MtrrCapabilities::new((1 << 8) | 8, 39).unwrap()),
+    );
+    let retyped = map.retype(&mtrrs);
+    assert_eq!((retyped.split, retyped.uncached), (8, 0));
+    assert_eq!(retyped.span, Some((0, 15 * SIZE_2M)));
+}
+
+#[test]
+fn the_fixed_ranges_retype_the_first_region_page_by_page() {
+    let pc = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &[range(0, 2 * SIZE_1G, WB)]).unwrap();
+    let mut map = TypeMap::new(&pc, 0);
+    // The VGA window becomes WB too: the first region stays mixed (WP ROMs).
+    let mut fixed = pc_fixed();
+    fixed[2] = u64::from_le_bytes([WB.raw() as u8; 8]);
+    let vga_wb = Mtrrs::decode(enabled_with_fixed(UC), Some(fixed), &[range(0, 2 * SIZE_1G, WB)]).unwrap();
+    let retyped = map.retype(&vga_wb);
+    assert_eq!(retyped.span, Some((0, SIZE_2M)));
+    assert_eq!(map.pds[0], EptEntry::table(PTS_ADDRESS));
+    assert_eq!(map.pt(0)[0xA0], EptEntry::page(0xA_0000, EPT_RWX, WB));
+    assert_eq!(map.pt(0)[0xC0], EptEntry::page(0xC_0000, EPT_RWX, WP));
+}
+
+#[test]
+fn the_span_runs_from_the_first_changed_region_to_the_last() {
+    let mut map = TypeMap::new(&all_write_back(), 0);
+    let retyped = map.retype(&write_back_with(&[
+        range(SIZE_2M, SIZE_2M, UC),
+        range(0x4000_0000, SIZE_2M, UC),
+    ]));
+    assert_eq!(retyped.regions, 2);
+    assert_eq!(retyped.span, Some((SIZE_2M, 0x4020_0000)));
 }

@@ -29,7 +29,7 @@ use super::page::PAGE_SIZE;
 
 mod registers;
 
-pub use registers::read;
+pub use registers::{MtrrCapabilities, MtrrMsr, MtrrRegisters, MtrrState, read};
 
 /// IA32_MTRRCAP: bits 7:0 count the variable ranges, bit 8 says the fixed
 /// ranges exist.
@@ -468,6 +468,14 @@ pub struct TypeRun {
     pub end: u64,
     /// `None` when the pages of each block differ in type.
     pub memory_type: Option<MemoryType>,
+}
+
+impl TypeRun {
+    /// The run's type for a report: its name, or "mixed" for blocks whose
+    /// pages differ.
+    pub fn type_name(&self) -> &'static str {
+        self.memory_type.map_or("mixed (4 KiB pages)", MemoryType::name)
+    }
 }
 
 /// The memory type in bits 7:0 of `value`, read from MSR `msr`.

@@ -11,6 +11,7 @@ use crate::vmx::guest::{
     GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_NMI_MARKER,
     GUEST_SCRATCH_PORT, expected_stats,
 };
+use crate::vmx::mtrr::MtrrCapabilities;
 use crate::vmx::vmexit::VcpuStats;
 
 const MARKER: u64 = GUEST_MARKER as u64;
@@ -64,6 +65,7 @@ fn exit(basic: u16) -> ExitInfo {
         qualification: 0,
         guest_physical: 0,
         protected_page: PROTECTED_PAGE,
+        mtrr: MtrrCapabilities::NONE,
     }
 }
 

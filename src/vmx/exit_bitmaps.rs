@@ -27,13 +27,20 @@ use super::msr::{
     IA32_BNDCFGS, IA32_DEBUGCTL, IA32_EFER, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_PAT,
     IA32_PERF_GLOBAL_CTRL, IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP,
 };
+use super::mtrr::{MtrrCapabilities, MtrrMsr};
 use super::page::{PAGE_SIZE, allocate_zeroed_page};
 use super::vmcs::fields::{IO_BITMAP_A, IO_BITMAP_B, MSR_BITMAP};
 use super::vmcs::{self, VmcsError};
 
-/// MSRs whose RDMSR and WRMSR exit to Aleph0. Aleph0 emulates them with a
-/// real RDMSR/WRMSR in root operation, which reaches the CPU's own MSR, so
-/// none may be in [`VMCS_HELD_MSRS`] (checked at compile time below).
+/// MSRs whose RDMSR and WRMSR exit to Aleph0, which passes them through: it
+/// runs a real RDMSR/WRMSR in root operation, which reaches the CPU's own
+/// MSR, so none may be in [`VMCS_HELD_MSRS`] (checked at compile time
+/// below).
+///
+/// The MTRR MSRs the CPU has exit too ([`ExitBitmaps::allocate`]), but are
+/// never passed through: the guest reads and writes a copy of them
+/// (`vmexit::guest_mtrrs`), since the CPU's still set the memory types of
+/// Aleph0's own accesses.
 pub const INTERCEPTED_MSRS: [u32; 1] = [IA32_KERNEL_GS_BASE];
 
 /// Ports whose IN and OUT exit to Aleph0.
@@ -111,12 +118,15 @@ pub const fn io_bit(port: u16) -> (IoBitmap, usize, u8) {
     (page, index / 8, (port % 8) as u8)
 }
 
-/// Sets the bits of [`INTERCEPTED_MSRS`] (read and write) and
-/// [`INTERCEPTED_PORTS`] in zeroed bitmap pages.
-fn fill(msr: &mut [u8], io_a: &mut [u8], io_b: &mut [u8]) {
-    for intercepted in INTERCEPTED_MSRS {
+/// Sets the bits of [`INTERCEPTED_MSRS`] and of every MTRR MSR `mtrr`
+/// lists (read and write), and of [`INTERCEPTED_PORTS`], in zeroed bitmap
+/// pages.
+fn fill(msr: &mut [u8], io_a: &mut [u8], io_b: &mut [u8], mtrr: MtrrCapabilities) {
+    let mtrr_msrs = mtrr.msrs().map(MtrrMsr::address);
+    for intercepted in INTERCEPTED_MSRS.into_iter().chain(mtrr_msrs) {
         for access in [MsrAccess::Read, MsrAccess::Write] {
-            // Always `Some`: checked at compile time above.
+            // Always `Some`: checked at compile time above, and every MTRR
+            // MSR is below 0x300.
             if let Some((offset, bit)) = msr_bit(intercepted, access) {
                 msr[offset] |= 1 << bit;
             }
@@ -147,8 +157,10 @@ pub struct ExitBitmaps {
 }
 
 impl ExitBitmaps {
-    /// Allocates three zeroed pages and sets the intercepted bits.
-    pub fn allocate() -> Result<Self, ExitBitmapsError> {
+    /// Allocates three zeroed pages and sets the intercepted bits: those of
+    /// [`INTERCEPTED_MSRS`], of every MTRR MSR `mtrr` lists, and of
+    /// [`INTERCEPTED_PORTS`].
+    pub fn allocate(mtrr: MtrrCapabilities) -> Result<Self, ExitBitmapsError> {
         let page = || allocate_zeroed_page(ExitBitmapsError::AllocationFailed);
         let bitmaps = Self {
             msr: page()?,
@@ -164,7 +176,7 @@ impl ExitBitmaps {
                 core::slice::from_raw_parts_mut(bitmaps.io_b.as_ptr(), PAGE_SIZE),
             )
         };
-        fill(msr, io_a, io_b);
+        fill(msr, io_a, io_b, mtrr);
         Ok(bitmaps)
     }
 

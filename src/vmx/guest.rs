@@ -109,6 +109,8 @@ pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
         cpuid_exits: 1,
         msr_read_exits: 2,
         msr_write_exits: 2,
+        mtrr_read_exits: 0,
+        mtrr_write_exits: 0,
         io_in_exits: 2,
         io_out_exits: 2,
         halt_exits: 1,

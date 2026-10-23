@@ -24,12 +24,16 @@ fn hyper_v() -> MtrrCapabilities {
     MtrrCapabilities::new(HYPER_V_MTRRCAP, HYPER_V_ADDRESS_BITS).unwrap()
 }
 
-/// The MSR at `address` among those `capabilities` lists.
+/// The MTRR MSR at `address`; panics if `capabilities` has none there.
 fn msr(capabilities: MtrrCapabilities, address: u32) -> MtrrMsr {
     capabilities
-        .msrs()
-        .find(|msr| msr.address() == address)
+        .msr(address)
         .unwrap_or_else(|| panic!("no MTRR MSR {address:#x}"))
+}
+
+/// Hyper-V's MTRRs, as the guest's copy starts.
+fn hyper_v_state() -> MtrrState {
+    MtrrState::new(MtrrRegisters::read_with(hyper_v(), |msr| hyper_v_value(msr.address())).unwrap()).unwrap()
 }
 
 /// Every byte of a fixed-range MSR set to `memory_type`.
@@ -276,4 +280,104 @@ fn errors_say_what_the_cpu_refuses() {
         MtrrError::TooManyVariableRanges { count: 40 }.to_string(),
         "IA32_MTRRCAP reports 40 variable ranges, more than the 32 Aleph0 keeps"
     );
+}
+
+#[test]
+fn msr_finds_every_mtrr_msr_the_cpu_has_and_nothing_else() {
+    for capabilities in [hyper_v(), MtrrCapabilities::new(2, 39).unwrap(), MtrrCapabilities::NONE] {
+        let listed: Vec<MtrrMsr> = capabilities.msrs().collect();
+        for address in 0..0x1000 {
+            let expected = listed.iter().copied().find(|msr| msr.address() == address);
+            assert_eq!(capabilities.msr(address), expected, "{address:#x} in {capabilities:?}");
+        }
+    }
+    // IA32_PAT sits between the fixed-range MSRs and IA32_MTRR_DEF_TYPE.
+    assert_eq!(hyper_v().msr(0x277), None);
+    // Variable range 8 does not exist with eight ranges.
+    assert_eq!(hyper_v().msr(0x210), None);
+}
+
+#[test]
+fn mtrr_msrs_are_named_as_the_sdm_names_them() {
+    let capabilities = hyper_v();
+    for (address, name) in [
+        (0x2FF, "IA32_MTRR_DEF_TYPE"),
+        (0x250, "IA32_MTRR_FIX64K_00000"),
+        (0x259, "IA32_MTRR_FIX16K_A0000"),
+        (0x26F, "IA32_MTRR_FIX4K_F8000"),
+        (0x200, "IA32_MTRR_PHYSBASE0"),
+        (0x20F, "IA32_MTRR_PHYSMASK7"),
+    ] {
+        assert_eq!(msr(capabilities, address).to_string(), name);
+    }
+    assert!(msr(capabilities, 0x268).is_fixed());
+    assert!(!msr(capabilities, 0x2FF).is_fixed());
+}
+
+#[test]
+fn rdmsr_reads_back_what_wrmsr_wrote() {
+    let mut registers = MtrrRegisters::read_with(hyper_v(), |msr| hyper_v_value(msr.address())).unwrap();
+    let physmask = msr(hyper_v(), 0x20F);
+    assert_eq!(registers.get(physmask), 0);
+    registers.write(physmask, 0x3FFF_FFE0_0800).unwrap();
+    assert_eq!(registers.get(physmask), 0x3FFF_FFE0_0800);
+    assert_eq!(registers.get(msr(hyper_v(), 0x201)), HYPER_V_PHYSMASK0);
+}
+
+#[test]
+fn a_refused_write_leaves_every_value_as_it_was() {
+    let mut state = hyper_v_state();
+    let before = state.clone();
+    for (address, value) in [(0x2FF, HYPER_V_DEF_TYPE | 0x200), (0x258, 2), (0x201, 1 << 50)] {
+        assert!(state.write(msr(hyper_v(), address), value).is_err(), "{address:#x}");
+        assert_eq!(state, before);
+    }
+}
+
+#[test]
+fn a_write_that_moves_a_range_changes_the_types() {
+    let mut state = hyper_v_state();
+    // Variable range 7: 2 MiB at 2 MiB, UC. Off until its mask is valid.
+    assert_eq!(state.write(msr(hyper_v(), 0x20E), 0x20_0000), Ok(false));
+    assert_eq!(state.write(msr(hyper_v(), 0x20F), 0x3FFF_FFE0_0800), Ok(true));
+    assert_eq!(state.mtrrs().memory_type(0x20_0000), UC);
+    assert_eq!(state.mtrrs().memory_type(0x40_0000), WB);
+    assert_eq!(state.registers().get(msr(hyper_v(), 0x20F)), 0x3FFF_FFE0_0800);
+}
+
+#[test]
+fn writing_the_value_already_there_changes_no_type() {
+    let mut state = hyper_v_state();
+    assert_eq!(state.write(msr(hyper_v(), 0x201), HYPER_V_PHYSMASK0), Ok(false));
+    assert_eq!(state, hyper_v_state());
+}
+
+#[test]
+fn only_the_write_that_sets_e_again_changes_the_types() {
+    // An OS's MTRR update: clear E (all memory UC), write the ranges, set E.
+    let mut state = hyper_v_state();
+    let def_type = msr(hyper_v(), IA32_MTRR_DEF_TYPE);
+    assert_eq!(state.write(def_type, 0), Ok(true));
+    assert_eq!(state.mtrrs(), &Mtrrs::Disabled);
+    assert_eq!(state.write(msr(hyper_v(), 0x20E), 0x20_0000), Ok(false));
+    assert_eq!(state.write(msr(hyper_v(), 0x20F), 0x3FFF_FFE0_0800), Ok(false));
+    assert_eq!(state.write(def_type, HYPER_V_DEF_TYPE), Ok(true));
+    assert_eq!(state.mtrrs().memory_type(0x20_0000), UC);
+    assert_eq!(state.mtrrs().memory_type(0x9_F000), WB);
+}
+
+#[test]
+fn a_bad_physbase_faults_at_its_own_write_while_the_mtrrs_are_off() {
+    // With E clear nothing decodes the ranges, so `Mtrrs::decode` alone
+    // would take a reserved type here, and refuse only the write that sets
+    // E again. The CPU refuses it at once.
+    let mut state = hyper_v_state();
+    let def_type = msr(hyper_v(), IA32_MTRR_DEF_TYPE);
+    state.write(def_type, 0).unwrap();
+    assert_eq!(
+        state.write(msr(hyper_v(), 0x20E), 0x20_0000 | 2),
+        Err(MtrrError::ReservedType { msr: 0x20E, value: 2 })
+    );
+    assert_eq!(state.registers().get(msr(hyper_v(), 0x20E)), 0);
+    assert_eq!(state.write(def_type, HYPER_V_DEF_TYPE), Ok(true));
 }
