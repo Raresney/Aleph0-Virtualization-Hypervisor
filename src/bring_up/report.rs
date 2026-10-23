@@ -113,6 +113,14 @@ pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
         ept.split_regions(),
         ept.spare_pts(),
     );
+    let ram = types.ram().ranges();
+    log!(
+        "EPT memory types: the MTRRs' for the {} RAM range(s) of the UEFI memory map, UC for everything else (MMIO, reserved memory, holes).",
+        ram.len()
+    );
+    for &(start, end) in ram {
+        log!("EPT RAM {start:#014x}..{end:#014x}");
+    }
     for run in types.region_runs(0, ept.end()) {
         log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
     }

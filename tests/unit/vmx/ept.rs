@@ -187,11 +187,27 @@ fn filled(protected_page: u64) -> (Tables4, usize) {
     filled_with(&test_mtrrs(), protected_page)
 }
 
-/// Fills a 2 GiB identity map with `mtrrs` and made-up table addresses (PDs
+/// All of memory RAM: the memory types are the MTRRs' alone.
+const ALL_RAM: RamMap<'static> = RamMap {
+    ranges: &[(0, u64::MAX)],
+};
+
+/// The EPT types of `mtrrs` with all memory RAM.
+fn all_ram(mtrrs: &Mtrrs) -> EptTypes<'_> {
+    EptTypes { mtrrs, ram: ALL_RAM }
+}
+
+/// Fills a 2 GiB identity map with `mtrrs`, all of it RAM: see
+/// [`filled_with_ram`].
+fn filled_with(mtrrs: &Mtrrs, protected_page: u64) -> (Tables4, usize) {
+    filled_with_ram(&all_ram(mtrrs), protected_page)
+}
+
+/// Fills a 2 GiB identity map with `types` and made-up table addresses (PDs
 /// at 0x2000, PTs from 0x10_0000), and returns the tables and the protected
 /// page's index in the PTs.
-fn filled_with(mtrrs: &Mtrrs, protected_page: u64) -> (Tables4, usize) {
-    let split = split_regions(mtrrs, 2, protected_page);
+fn filled_with_ram(types: &EptTypes<'_>, protected_page: u64) -> (Tables4, usize) {
+    let split = split_regions(types, 2, protected_page);
     let (mut pml4, mut pdpt, mut pds, mut pts) = (
         vec![EptEntry::EMPTY; ENTRIES],
         vec![EptEntry::EMPTY; ENTRIES],
@@ -209,7 +225,7 @@ fn filled_with(mtrrs: &Mtrrs, protected_page: u64) -> (Tables4, usize) {
             pts_address: 0x10_0000,
         },
         2,
-        mtrrs,
+        types,
         protected_page,
     );
     ((pml4, pdpt, pds, pts), protected)
@@ -239,7 +255,7 @@ fn regions_of_one_memory_type_are_2m_pages_of_that_type() {
 #[test]
 fn the_protected_region_and_mixed_regions_get_a_pt_each_in_address_order() {
     let mtrrs = test_mtrrs();
-    assert_eq!(split_regions(&mtrrs, 2, 0x7eb1_d000), 2);
+    assert_eq!(split_regions(&all_ram(&mtrrs), 2, 0x7eb1_d000), 2);
     let ((_, _, pds, _), _) = filled(0x7eb1_d000);
     // 0x7eb1_d000 is in the 2 MiB region 0x7ea0_0000, entry 0x3F5; the
     // mixed region 0x7FE0_0000 is entry 0x3FF.
@@ -250,7 +266,7 @@ fn the_protected_region_and_mixed_regions_get_a_pt_each_in_address_order() {
 #[test]
 fn a_protected_page_in_a_mixed_region_needs_no_second_pt() {
     let mtrrs = test_mtrrs();
-    assert_eq!(split_regions(&mtrrs, 2, 0x7FE0_0000), 1);
+    assert_eq!(split_regions(&all_ram(&mtrrs), 2, 0x7FE0_0000), 1);
     let ((_, _, pds, pts), protected) = filled(0x7FE0_0000);
     assert_eq!(pds[0x3FF], EptEntry::table(0x10_0000));
     assert_eq!(protected, 0);
@@ -283,7 +299,7 @@ fn a_mixed_region_maps_each_4k_page_with_its_own_type() {
 fn the_fixed_ranges_give_the_first_region_a_pt_of_their_types() {
     // The usual PC layout: WB RAM, the UC VGA window, WP ROMs below 1 MiB.
     let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &[range(0, 2 * SIZE_1G, WB)]).unwrap();
-    assert_eq!(split_regions(&mtrrs, 2, 0x7eb1_d000), 2);
+    assert_eq!(split_regions(&all_ram(&mtrrs), 2, 0x7eb1_d000), 2);
     let ((_, _, pds, pts), protected) = filled_with(&mtrrs, 0x7eb1_d000);
     // Region 0 comes first in address order, so it takes the first PT.
     assert_eq!(pds[0], EptEntry::table(0x10_0000));
@@ -303,7 +319,7 @@ fn the_fixed_ranges_give_the_first_region_a_pt_of_their_types() {
 #[test]
 fn without_mtrrs_the_map_is_all_write_back_with_one_pt() {
     // As before the MTRRs were read: only the protected region has a PT.
-    assert_eq!(split_regions(&Mtrrs::Unsupported, 2, 0x7eb1_d000), 1);
+    assert_eq!(split_regions(&all_ram(&Mtrrs::Unsupported), 2, 0x7eb1_d000), 1);
     let ((_, _, pds, pts), protected) = filled_with(&Mtrrs::Unsupported, 0x7eb1_d000);
     for (i, entry) in pds.iter().enumerate() {
         let expected = if i == 0x3F5 {
@@ -447,13 +463,20 @@ struct TypeMap {
     pts: Vec<EptEntry<Pt>>,
     free: Vec<u32>,
     free_len: usize,
+    ram: RamMap<'static>,
 }
 
 impl TypeMap {
-    /// The map `mtrrs` give, with [`PROTECTED`] read-only and `spare` PTs
-    /// set aside.
+    /// The map `mtrrs` give, all of it RAM, with [`PROTECTED`] read-only and
+    /// `spare` PTs set aside.
     fn new(mtrrs: &Mtrrs, spare: usize) -> Self {
-        let split = split_regions(mtrrs, 2, PROTECTED);
+        Self::with_ram(mtrrs, spare, ALL_RAM)
+    }
+
+    /// [`new`](Self::new), with `ram` the only RAM.
+    fn with_ram(mtrrs: &Mtrrs, spare: usize, ram: RamMap<'static>) -> Self {
+        let types = EptTypes { mtrrs, ram };
+        let split = split_regions(&types, 2, PROTECTED);
         let mut pml4 = vec![EptEntry::EMPTY; ENTRIES];
         let mut pdpt = vec![EptEntry::EMPTY; ENTRIES];
         let mut pds = vec![EptEntry::EMPTY; 2 * ENTRIES];
@@ -469,7 +492,7 @@ impl TypeMap {
                 pts_address: PTS_ADDRESS,
             },
             2,
-            mtrrs,
+            &types,
             PROTECTED,
         );
         let mut free = vec![0; split + spare];
@@ -479,11 +502,12 @@ impl TypeMap {
             pts,
             free,
             free_len,
+            ram,
         }
     }
 
-    /// Gives the map the types of `mtrrs`, as [`TypeTables::apply`] does
-    /// before its INVEPT.
+    /// Gives the map the types of `mtrrs` for its RAM, as
+    /// [`TypeTables::apply`] does before its INVEPT.
     fn retype(&mut self, mtrrs: &Mtrrs) -> Retyped {
         let (pts, _) = self.pts.as_chunks_mut::<ENTRIES>();
         let mut tables = Retype {
@@ -496,7 +520,7 @@ impl TypeMap {
             },
             protected_region: (PROTECTED / SIZE_2M) as usize,
         };
-        retype(&mut tables, mtrrs)
+        retype(&mut tables, &EptTypes { mtrrs, ram: self.ram })
     }
 
     /// PT number `index`.
@@ -732,4 +756,136 @@ fn the_test_guests_mtrr_writes_retype_the_region_at_2_mib_and_put_it_back() {
     }
     // As bring-up built it: the PT the 4 KiB range took is spare again.
     assert_eq!((map.pds, map.free_len), (built.pds, built.free_len));
+}
+
+#[test]
+fn only_memory_the_firmware_or_an_os_uses_as_memory_is_ram() {
+    use boot::MemoryType as Type;
+    for ram in [
+        Type::LOADER_CODE,
+        Type::LOADER_DATA,
+        Type::BOOT_SERVICES_CODE,
+        Type::BOOT_SERVICES_DATA,
+        Type::RUNTIME_SERVICES_CODE,
+        Type::RUNTIME_SERVICES_DATA,
+        Type::CONVENTIONAL,
+        Type::ACPI_RECLAIM,
+        Type::ACPI_NON_VOLATILE,
+        Type::PERSISTENT_MEMORY,
+    ] {
+        assert!(is_ram(ram), "{ram:?}");
+    }
+    for other in [
+        Type::RESERVED,
+        Type::UNUSABLE,
+        Type::MMIO,
+        Type::MMIO_PORT_SPACE,
+        Type::PAL_CODE,
+        Type::UNACCEPTED,
+        Type::custom(0x8000_0000),
+    ] {
+        assert!(!is_ram(other), "{other:?}");
+    }
+}
+
+#[test]
+fn the_ram_map_sorts_and_merges_the_ram_regions_and_drops_the_rest() {
+    use boot::MemoryType as Type;
+    let regions = [
+        (0x10_0000, 0x100, Type::BOOT_SERVICES_DATA),
+        (0, 0xA0, Type::CONVENTIONAL),
+        // Touches the first region: one range with it.
+        (0x20_0000, 0x200, Type::LOADER_DATA),
+        (0xFEC0_0000, 1, Type::MMIO),
+        (0x5000_0000, 0x10, Type::RESERVED),
+        // Empty: ignored.
+        (0x30_0000, 0, Type::CONVENTIONAL),
+        // Overlaps the range the first and third make: merged into it.
+        (0x38_0000, 0x100, Type::ACPI_NON_VOLATILE),
+    ];
+    let mut ranges = [(0, 0); 7];
+    let ram = RamMap::collect(regions.into_iter(), &mut ranges);
+    assert_eq!(ram.ranges(), [(0, 0xA_0000), (0x10_0000, 0x48_0000)]);
+}
+
+#[test]
+fn the_ram_map_says_how_much_of_a_block_is_ram() {
+    let ram = RamMap {
+        ranges: &[(0, 0xA_0000), (0x10_0000, 0x7FF0_0000)],
+    };
+    assert!(ram.contains(0x9_F000));
+    assert!(!ram.contains(0xA_0000));
+    assert!(ram.contains(0x10_0000));
+    assert!(!ram.contains(0x7FF0_0000));
+    assert_eq!(ram.coverage(0, SIZE_2M), RamCoverage::Part);
+    assert_eq!(ram.coverage(SIZE_2M, SIZE_2M), RamCoverage::All);
+    assert_eq!(ram.coverage(0x7FC0_0000, SIZE_2M), RamCoverage::All);
+    assert_eq!(ram.coverage(0x7FE0_0000, SIZE_2M), RamCoverage::Part);
+    assert_eq!(ram.coverage(0x8000_0000, SIZE_2M), RamCoverage::None);
+    // A block inside the gap between two ranges.
+    assert_eq!(ram.coverage(0xA_0000, 0x1000), RamCoverage::None);
+}
+
+/// RAM below 1.5 GiB but for the legacy hole at 0xA0000..0x100000, as a
+/// memory map with holes gives it; nothing above it in the 2 GiB of the
+/// [`TypeMap`] tests, the protected page included.
+const RAM_BELOW_1536_MIB: RamMap<'static> = RamMap {
+    ranges: &[(0, 0xA_0000), (0x10_0000, 0x6000_0000)],
+};
+
+#[test]
+fn memory_that_is_not_ram_is_uc_whatever_the_mtrrs_say() {
+    // The MTRRs make all of the 2 GiB WB, as Hyper-V's make the first 4 GiB.
+    let mtrrs = all_write_back();
+    let types = EptTypes {
+        mtrrs: &mtrrs,
+        ram: RAM_BELOW_1536_MIB,
+    };
+    let ((_, _, pds, pts), _) = filled_with_ram(&types, PROTECTED);
+    // Region 0 is only partly RAM: a PT, the hole UC.
+    assert_eq!(pds[0], EptEntry::table(0x10_0000));
+    assert_eq!(pts[0x9F], EptEntry::page(0x9_F000, EPT_RWX, WB));
+    assert_eq!(pts[0xA0], EptEntry::page(0xA_0000, EPT_RWX, UC));
+    assert_eq!(pts[0xFF], EptEntry::page(0xF_F000, EPT_RWX, UC));
+    assert_eq!(pts[0x100], EptEntry::page(0x10_0000, EPT_RWX, WB));
+    // RAM up to 1.5 GiB, WB; then UC 2 MiB pages.
+    assert_eq!(pds[0x2FF], EptEntry::large_page(0x5FE0_0000, WB));
+    assert_eq!(pds[0x300], EptEntry::large_page(0x6000_0000, UC));
+    assert_eq!(pds[0x3FF], EptEntry::large_page(0x7FE0_0000, UC));
+}
+
+#[test]
+fn a_region_only_partly_ram_has_a_pt_even_when_its_pages_share_a_type() {
+    // With the MTRRs off, every page is UC, but the guest can turn them on
+    // and make region 0's RAM WB: its PT is there from the start.
+    let types = EptTypes {
+        mtrrs: &Mtrrs::Disabled,
+        ram: RAM_BELOW_1536_MIB,
+    };
+    assert_eq!(split_regions(&types, 2, PROTECTED), 2);
+    let ((_, _, pds, _), _) = filled_with_ram(&types, PROTECTED);
+    assert_eq!(pds[0], EptEntry::table(0x10_0000));
+    assert_eq!(pds[1], EptEntry::large_page(SIZE_2M, UC));
+}
+
+#[test]
+fn the_guests_mtrrs_never_make_memory_that_is_not_ram_cacheable() {
+    let mut map = TypeMap::with_ram(&all_write_back(), 1, RAM_BELOW_1536_MIB);
+    let built = (map.pds.clone(), map.pts.clone(), map.free_len);
+    assert_eq!(map.pds[0x300], EptEntry::large_page(0x6000_0000, UC));
+    // A range over memory that is not RAM changes nothing, UC or WB.
+    assert_eq!(
+        map.retype(&write_back_with(&[range(0x6000_0000, SIZE_2M, UC)])),
+        Retyped::default()
+    );
+    // With the MTRRs off the RAM is UC too: the 0x2FF regions of RAM from
+    // 2 MiB, and region 0's RAM pages, which keep their PT.
+    let retyped = map.retype(&Mtrrs::Disabled);
+    assert_eq!((retyped.regions, retyped.merged, retyped.split), (0x300, 0, 0));
+    assert_eq!(retyped.span, Some((0, 0x6000_0000)));
+    assert_eq!(map.pds[0], EptEntry::table(PTS_ADDRESS));
+    assert_eq!(map.pt(0)[0x100], EptEntry::page(0x10_0000, EPT_RWX, UC));
+    // On again: the map bring-up built.
+    map.retype(&all_write_back());
+    assert_eq!((map.pds, map.pts, map.free_len), built);
 }

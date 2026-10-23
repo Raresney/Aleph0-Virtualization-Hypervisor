@@ -141,12 +141,14 @@ Bring-up, before `Ept::build`:
    stops bring-up with the MSR that holds it.
 
 `Ept::build` then maps memory as before, 2 MiB at a time, but asks
-`Mtrrs::block_type` for each 2 MiB region first:
+`EptTypes::region_type` for each 2 MiB region first. For RAM that is
+`Mtrrs::block_type`; memory that is not RAM is UC whatever the MTRRs say
+(below):
 
 - **One type for the whole region:** a 2 MiB page of that type.
-- **Pages of different types:** a PT, and 512 pages of 4 KiB, each with its
-  own type. An EPT entry has one type, so a 2 MiB page would give part of
-  the region the wrong one.
+- **Pages of different types, or RAM and memory that is not:** a PT, and
+  512 pages of 4 KiB, each with its own type. An EPT entry has one type, so
+  a 2 MiB page would give part of the region the wrong one.
 
 The region holding the guest's data page still gets a PT too, for the
 read-only page. If that region is mixed already, it shares the PT.
@@ -167,6 +169,46 @@ it (`VariableRange::may_split`). The other case is the first 2 MiB, where
 the fixed ranges apply below 1 MiB. Everywhere else, one lookup gives the
 whole region's type.
 
+### Memory that is not RAM
+
+Copying the MTRRs' type is right for RAM. For device memory it trusts that
+the MTRRs make it UC, and two things break that:
+
+- **A VMM below Aleph0 may not bother.** Hyper-V's MTRRs (section 6) make
+  all of the first 4 GiB WB, the device window below 4 GiB with the Local
+  APIC and IOAPIC included. Hyper-V's own EPT makes its devices UC; Aleph0's
+  EPT took WB from the MTRRs.
+- **The guest owns its MTRRs** (section 7), and can make any range WB.
+
+WB on a device's registers lets the CPU read them speculatively and keep
+them in its caches, which the device does not expect: a read can have side
+effects, a cached value goes stale, and some platforms answer with a
+machine check, which takes down the whole machine, Aleph0 included.
+
+So `ept::EptTypes` gives each page the MTRRs' type only if the UEFI memory
+map calls it RAM (`ept::is_ram`: loader, boot and runtime services code and
+data, conventional, ACPI reclaim and NVS, persistent memory), and UC
+otherwise: MMIO, reserved and unusable memory, types it does not know, and
+the holes the map describes nothing at. `Ept::build` gathers that RAM into
+sorted, merged ranges (`RamMap`), kept with the tables, since `retype` needs
+them in exit context, where UEFI cannot be asked.
+
+- A 2 MiB region all of RAM is typed by the MTRRs, as above.
+- A region with no RAM is one UC 2 MiB page, whatever the guest writes.
+- A region only partly RAM always gets a PT, even when its pages happen to
+  share a type: the guest's MTRRs could make its RAM WB at any time, and
+  that PT must not have to come from the spare ones (section 7.5), which
+  only cover what MTRR writes split.
+
+UC from EPT does not take WC away from a framebuffer: with IPAT clear the
+guest's PAT still combines with it, and UC from EPT with WC from the PAT is
+WC (SDM Vol. 3A, "Selecting Memory Types for Pentium III and More Recent
+Processor Families"). KVM does the same: `vmx_get_mt_mask` gives MMIO UC.
+
+This also settles the types of the ranges #20 adds above the map's end:
+none of them is RAM, so they are UC, not the WB Hyper-V's MTRRs give
+`0x80000000..0x100000000`.
+
 ## 6. What bring-up prints
 
 After the VMX capabilities, for example:
@@ -178,6 +220,9 @@ MTRR fixed 0x00000..0xa0000: WB
 MTRR fixed 0xa0000..0xc0000: UC
 MTRR fixed 0xc0000..0x100000: WP
 EPT built: identity 0x0..0x100000000 (4 GiB), 17 table pages, 2 of them PTs for 2 MiB regions mapped in 4 KiB pages and 9 spare PTs for the guest's MTRR writes; data page 0x000000007eb01000 read-only (R=1 W=0 X=0).
+EPT memory types: the MTRRs' for the 2 RAM range(s) of the UEFI memory map, UC for everything else (MMIO, reserved memory, holes).
+EPT RAM 0x000000000000..0x0000000a0000
+EPT RAM 0x000000100000..0x000080000000
 EPT 0x000000000000..0x000000200000: 4 KiB pages (a PT each)
 EPT 0x000000200000..0x00007ea00000: 2 MiB pages, WB
 EPT 0x00007ea00000..0x00007ec00000: 4 KiB pages (a PT each)
@@ -187,12 +232,15 @@ EPT 0x000080000000..0x000100000000: 2 MiB pages, UC
 
 The lines above show the format on an example layout; the Hyper-V run
 follows. It predates the spare PTs of section 7, so its `EPT built` line
-has no spare PTs and nine table pages fewer than a run now prints. The fixed-range lines show the first MiB in runs of one type. The `EPT`
+has no spare PTs and nine table pages fewer than a run now prints, and the
+RAM lines of section 5 ("Memory that is not RAM"). The fixed-range lines show the first MiB in runs of one type. The `EPT`
 lines are read back from the PD entries `Ept::build` filled, the ones the
 CPU walks, rather than worked out again from the MTRRs: runs of 2 MiB pages
 with the type in their entries, and runs of regions mapped through a PT. Here
-the first 2 MiB has a PT because the fixed ranges give it three types, and
-`0x7ea00000` is the data page's region.
+the first 2 MiB has a PT because the fixed ranges give it three types (and
+because `0xa0000..0x100000` is not RAM), and `0x7ea00000` is the data page's
+region. From `0x80000000` on nothing is RAM, so it is UC whatever the MTRRs
+say.
 
 ### On Hyper-V
 
@@ -380,11 +428,16 @@ so.
 
 ### 7.6 What serial shows
 
-Bring-up adds a line for the intercepted MSRs, and the spare PTs to the
-`EPT built` line:
+Bring-up adds a line for the intercepted MSRs, the spare PTs to the
+`EPT built` line, and the RAM that takes the MTRRs' types (section 5,
+"Memory that is not RAM"). The number of PTs below is what the MTRRs alone
+need; regions only partly RAM add one each, so the Hyper-V run will show
+how many its memory map has:
 
 ```text
 EPT built: identity 0x0..0x80000000 (2 GiB), 15 table pages, 2 of them PTs for 2 MiB regions mapped in 4 KiB pages and 9 spare PTs for the guest's MTRR writes; data page ... read-only (R=1 W=0 X=0).
+EPT memory types: the MTRRs' for the N RAM range(s) of the UEFI memory map, UC for everything else (MMIO, reserved memory, holes).
+EPT RAM <start>..<end>          (one line per range)
 Intercepted MTRR addresses (read and write): all 76. The guest reads and writes a copy of the 28 MSRs the CPU has (IA32_MTRR_DEF_TYPE, 11 fixed-range MSRs and 8 variable ranges); the other 48 get #GP.
 ```
 
@@ -438,7 +491,7 @@ Three checks back the lines up:
   nothing for them beyond what the CPU does.
 - **Hiding the MTRRs** from the guest altogether (CPUID.1:EDX bit 12).
 - **Hiding MMIO from the guest.** The identity map still passes every device
-  through; the MTRRs only make the caching right.
+  through; EPT only makes the caching right, UC for whatever is not RAM.
 
 ## Cheat sheet
 
@@ -453,6 +506,7 @@ Three checks back the lines up:
 | Overlaps | UC wins; WT + WB = WT; others undefined (Aleph0: UC) |
 | EPT leaf entry | type in bits 5:3, IPAT bit 6 left clear |
 | A 2 MiB region of mixed types | a PT of 4 KiB pages, each with its own type |
+| Memory the UEFI map does not call RAM | UC in EPT, whatever the MTRRs say; a region only partly RAM always has a PT |
 | Guest RDMSR/WRMSR of an MTRR | its copy (`vmexit/guest_mtrrs.rs`), never the CPU's |
 | WRMSR refuses | a reserved type in any type field; DEF_TYPE bits 9:8 and 63:12; PHYSBASE bits 11:8; PHYSMASK bits 10:0; PHYSBASE/PHYSMASK bits from MAXPHYADDR up |
 | Spare PTs | one per variable range, plus one for the first 2 MiB |

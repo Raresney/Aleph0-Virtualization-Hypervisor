@@ -147,8 +147,11 @@ same memory. Only the permissions can now differ.
 1. Reads the UEFI memory map and takes the highest address any region
    reaches, rounded up to 1 GiB (`identity_map_end`). Every region counts,
    whatever its type. One PDPT reaches 512 GiB, so that is the limit.
-2. Counts the 2 MiB regions that need a PT (`split_regions`): those whose
-   pages differ in memory type ([MTRR.md](MTRR.md)), and the one holding
+2. Gathers the memory map's RAM into sorted, merged ranges (`RamMap`):
+   RAM takes the MTRRs' memory type, and everything else (MMIO, reserved
+   memory, holes) is UC (`EptTypes`, [MTRR.md](MTRR.md) section 5).
+   Counts the 2 MiB regions that need a PT (`split_regions`): those whose
+   pages differ in memory type or are only partly RAM, and the one holding
    the guest's data page.
 3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs, plus spare
    PTs for regions the guest's MTRR writes split later (`spare_pts`), and a
@@ -397,7 +400,7 @@ section 10).
 | `EPT_POINTER` | `0x201A`; low bits `0x1E` = WB, 4 levels |
 | `IA32_VMX_PROCBASED_CTLS2` | `0x48B` |
 | `IA32_VMX_EPT_VPID_CAP` | `0x48C`; bits 6, 14, 16, 20, 25/26 required |
-| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs; 0 = UC, 6 = WB), 6 IPAT, 7 2 MiB page |
+| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs for RAM, UC for the rest; 0 = UC, 6 = WB), 6 IPAT, 7 2 MiB page |
 | Exit reason 48 | EPT violation: `GUEST_PHYSICAL_ADDRESS` `0x2400`, `GUEST_LINEAR_ADDRESS` `0x640A` |
 | Exit reason 49 | EPT misconfiguration: never handled |
 | Qualification | 0 read, 1 write, 2 fetch, 3/4/5 R/W/X allowed, 7 linear valid, 8 translated access, 12 NMI-unblocking IRET |
