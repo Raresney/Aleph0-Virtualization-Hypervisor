@@ -9,7 +9,7 @@ EPT:
 - what bring-up prints, and what is not covered yet.
 
 Code:
-- `src/vmx/mtrr.rs`: the MTRR MSRs, decoding and checking them, the type of
+- `src/vmx/mtrr/mod.rs`: the MTRR MSRs, decoding and checking them, the type of
   an address (`Mtrrs::memory_type`) and of a block (`Mtrrs::block_type`);
 - `src/vmx/cpuid.rs`: `has_mtrr`, the CPUID check before any MTRR MSR is read;
 - `src/vmx/ept.rs`: `large_page_type`, `split_regions` and

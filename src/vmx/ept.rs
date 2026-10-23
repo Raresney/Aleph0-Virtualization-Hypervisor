@@ -28,7 +28,7 @@
 //!   "present" bit: an entry with R = W = X = 0 is not present.
 //! - type (bits 5:3, leaf entries only): memory type. With EPT on it
 //!   replaces the MTRRs' type for guest accesses, so Aleph0 copies the
-//!   MTRRs' type into it (see `mtrr.rs`).
+//!   MTRRs' type into it (see `mtrr/`).
 //! - IPAT (bit 6): ignore the guest's PAT. Left clear, so the guest's PAT
 //!   still combines with the EPT type, as it would with the MTRRs' type
 //!   without EPT.

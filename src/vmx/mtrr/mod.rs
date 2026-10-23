@@ -20,6 +20,8 @@
 //! - Variable ranges: IA32_MTRR_PHYSBASEn / IA32_MTRR_PHYSMASKn pairs. An
 //!   address is in range n when `address & mask == base & mask`.
 
+use core::fmt;
+
 use super::cpuid;
 use super::msr::rdmsr;
 use super::page::PAGE_SIZE;
@@ -209,6 +211,20 @@ impl VariableRange {
     }
 }
 
+impl fmt::Display for VariableRange {
+    /// `variable range 0: base=0x000000000000 mask=0x3fff00000000 WB`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "variable range {}: base={:#014x} mask={:#014x} {}",
+            self.number,
+            self.base,
+            self.mask,
+            self.memory_type.name()
+        )
+    }
+}
+
 /// The MTRRs of this CPU, decoded and checked: every type in use is a valid
 /// memory type, so looking one up cannot fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +355,26 @@ impl Mtrrs {
     }
 }
 
+impl fmt::Display for Mtrrs {
+    /// Whether the MTRRs are on and, when they are, the default type and
+    /// how many ranges apply: `enabled, default type UC; fixed ranges
+    /// enabled; 8 variable ranges, 1 in use`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("not supported (CPUID); all memory is treated as WB"),
+            Self::Disabled => f.write_str("disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC"),
+            Self::Enabled(enabled) => write!(
+                f,
+                "enabled, default type {}; fixed ranges {}; {} variable ranges, {} in use",
+                enabled.default_type().name(),
+                if enabled.fixed_enabled() { "enabled" } else { "disabled" },
+                enabled.variable_count(),
+                enabled.variable_ranges().len(),
+            ),
+        }
+    }
+}
+
 impl EnabledMtrrs {
     /// The type of memory no range covers.
     pub fn default_type(&self) -> MemoryType {
@@ -456,5 +492,5 @@ pub fn read() -> Result<Mtrrs, MtrrError> {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/mtrr.rs"]
+#[path = "../../../tests/unit/vmx/mtrr.rs"]
 pub(crate) mod tests;

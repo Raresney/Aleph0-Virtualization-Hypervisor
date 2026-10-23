@@ -143,7 +143,7 @@ diagnostics that run before VMXON.
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT |
-| `src/vmx/mtrr.rs` | The MTRRs: reading and checking them, and the memory type of each address, which the EPT entries copy |
+| `src/vmx/mtrr/` | The MTRRs: reading and checking them, and the memory type of each address, which the EPT entries copy |
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
