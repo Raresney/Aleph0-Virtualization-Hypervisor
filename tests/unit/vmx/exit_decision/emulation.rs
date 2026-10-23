@@ -69,22 +69,10 @@ fn cpuid_takes_leaf_and_subleaf_from_the_low_halves_of_rax_and_rcx() {
         guest_rcx: 0x0000_0001_0000_0001,
         ..exit(EXIT_REASON_CPUID)
     };
-    let (event, state) = cpuid(ExitState::default(), &cpuid_exit);
-    assert_eq!(event, ExitEvent::Emulated(Emulation::Cpuid { leaf: 7, subleaf: 1 }));
-    assert_eq!(state.emulated.cpuid, 1);
-}
-
-#[test]
-fn counts_display_names_each_instruction() {
-    let counts = EmulationCounts {
-        cpuid: 1,
-        rdmsr: 2,
-        wrmsr: 3,
-        io_in: 4,
-        io_out: 5,
-        hlt: 6,
-    };
-    assert_eq!(counts.to_string(), "cpuid=1 rdmsr=2 wrmsr=3 in=4 out=5 hlt=6");
+    assert_eq!(
+        cpuid(&cpuid_exit),
+        ExitEvent::Emulated(Emulation::Cpuid { leaf: 7, subleaf: 1 })
+    );
 }
 
 const KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -99,13 +87,11 @@ fn msr_exit(basic: u16, msr: u64, rax: u64, rdx: u64) -> ExitInfo {
 }
 
 #[test]
-fn rdmsr_of_an_intercepted_msr_is_emulated_and_counted() {
-    let (event, state) = rdmsr(
-        ExitState::default(),
-        &msr_exit(EXIT_REASON_RDMSR, KERNEL_GS_BASE.into(), 0, 0),
+fn rdmsr_of_an_intercepted_msr_is_emulated() {
+    assert_eq!(
+        rdmsr(&msr_exit(EXIT_REASON_RDMSR, KERNEL_GS_BASE.into(), 0, 0)),
+        ExitEvent::Emulated(Emulation::Rdmsr { msr: KERNEL_GS_BASE })
     );
-    assert_eq!(event, ExitEvent::Emulated(Emulation::Rdmsr { msr: KERNEL_GS_BASE }));
-    assert_eq!(state.emulated.rdmsr, 1);
 }
 
 #[test]
@@ -117,7 +103,7 @@ fn rdmsr_ignores_the_upper_half_of_rcx() {
         0,
     );
     assert_eq!(
-        rdmsr(ExitState::default(), &exit).0,
+        rdmsr(&exit),
         ExitEvent::Emulated(Emulation::Rdmsr { msr: KERNEL_GS_BASE })
     );
 }
@@ -126,14 +112,13 @@ fn rdmsr_ignores_the_upper_half_of_rcx() {
 fn msrs_outside_the_bitmap_get_a_general_protection_fault() {
     // Hyper-V's synthetic MSRs start at 0x40000000; neither range covers them.
     for msr in [0x4000_0000, 0xC000_2000] {
-        let state = ExitState::default();
         assert_eq!(
-            rdmsr(state, &msr_exit(EXIT_REASON_RDMSR, msr, 0, 0)),
-            (ExitEvent::GuestGeneralProtection, state)
+            rdmsr(&msr_exit(EXIT_REASON_RDMSR, msr, 0, 0)),
+            ExitEvent::GuestGeneralProtection
         );
         assert_eq!(
-            wrmsr(state, &msr_exit(EXIT_REASON_WRMSR, msr, 0, 0)),
-            (ExitEvent::GuestGeneralProtection, state)
+            wrmsr(&msr_exit(EXIT_REASON_WRMSR, msr, 0, 0)),
+            ExitEvent::GuestGeneralProtection
         );
     }
 }
@@ -142,14 +127,8 @@ fn msrs_outside_the_bitmap_get_a_general_protection_fault() {
 fn an_msr_in_range_but_not_intercepted_means_a_broken_bitmap() {
     // IA32_TIME_STAMP_COUNTER and IA32_EFER: in range, bits clear.
     for msr in [0x10, 0xC000_0080] {
-        assert_eq!(
-            rdmsr(ExitState::default(), &msr_exit(EXIT_REASON_RDMSR, msr, 0, 0)).0,
-            ExitEvent::Unexpected
-        );
-        assert_eq!(
-            wrmsr(ExitState::default(), &msr_exit(EXIT_REASON_WRMSR, msr, 0, 0)).0,
-            ExitEvent::Unexpected
-        );
+        assert_eq!(rdmsr(&msr_exit(EXIT_REASON_RDMSR, msr, 0, 0)), ExitEvent::Unexpected);
+        assert_eq!(wrmsr(&msr_exit(EXIT_REASON_WRMSR, msr, 0, 0)), ExitEvent::Unexpected);
     }
 }
 
@@ -161,29 +140,26 @@ fn wrmsr_value_is_edx_eax_without_their_upper_halves() {
         0xDEAD_BEEF_0000_1234,
         0xFFFF_FFFF_0000_7A1E,
     );
-    let (event, state) = wrmsr(ExitState::default(), &exit);
     assert_eq!(
-        event,
+        wrmsr(&exit),
         ExitEvent::Emulated(Emulation::Wrmsr {
             msr: KERNEL_GS_BASE,
             value: 0x0000_7A1E_0000_1234
         })
     );
-    assert_eq!(state.emulated.wrmsr, 1);
 }
 
 #[test]
 fn a_non_canonical_wrmsr_value_gets_a_general_protection_fault() {
     let exit = msr_exit(EXIT_REASON_WRMSR, KERNEL_GS_BASE.into(), 0, 0x0000_8000);
-    let state = ExitState::default();
-    assert_eq!(wrmsr(state, &exit), (ExitEvent::GuestGeneralProtection, state));
+    assert_eq!(wrmsr(&exit), ExitEvent::GuestGeneralProtection);
 }
 
 #[test]
 fn a_canonical_upper_half_wrmsr_value_is_emulated() {
     let exit = msr_exit(EXIT_REASON_WRMSR, KERNEL_GS_BASE.into(), 0, 0xFFFF_8000);
     assert_eq!(
-        wrmsr(ExitState::default(), &exit).0,
+        wrmsr(&exit),
         ExitEvent::Emulated(Emulation::Wrmsr {
             msr: KERNEL_GS_BASE,
             value: 0xFFFF_8000_0000_0000
@@ -268,71 +244,25 @@ fn out_value_takes_al_ax_or_eax() {
 }
 
 #[test]
-fn in_is_emulated_and_counted() {
-    let (event, state) = io(ExitState::default(), &io_exit(io_qualification(0x3FF, 0, true), 0));
+fn in_is_emulated() {
     assert_eq!(
-        event,
+        io(&io_exit(io_qualification(0x3FF, 0, true), 0)),
         ExitEvent::Emulated(Emulation::In {
             port: 0x3FF,
             size: IoSize::Byte
         })
     );
-    assert_eq!(state.emulated.io_in, 1);
 }
 
 #[test]
 fn out_is_emulated_with_the_value_from_rax() {
-    let (event, state) = io(
-        ExitState::default(),
-        &io_exit(io_qualification(0x3FF, 0, false), 0xFFFF_FF00 | 0xA5),
-    );
     assert_eq!(
-        event,
+        io(&io_exit(io_qualification(0x3FF, 0, false), 0xFFFF_FF00 | 0xA5)),
         ExitEvent::Emulated(Emulation::Out {
             port: 0x3FF,
             size: IoSize::Byte,
             value: 0xA5
         })
-    );
-    assert_eq!(state.emulated.io_out, 1);
-}
-
-#[test]
-fn counts_saturate_instead_of_overflowing() {
-    // A guest decides how often it runs these instructions, so every counter can reach u32::MAX.
-    let full = ExitState {
-        emulated: EmulationCounts {
-            cpuid: u32::MAX,
-            rdmsr: u32::MAX,
-            wrmsr: u32::MAX,
-            io_in: u32::MAX,
-            io_out: u32::MAX,
-            hlt: u32::MAX,
-        },
-        ..ExitState::default()
-    };
-    let after = [
-        cpuid(full, &exit(EXIT_REASON_CPUID)).1,
-        hlt(full).1,
-        rdmsr(full, &msr_exit(EXIT_REASON_RDMSR, KERNEL_GS_BASE.into(), 0, 0)).1,
-        wrmsr(full, &msr_exit(EXIT_REASON_WRMSR, KERNEL_GS_BASE.into(), 0, 0)).1,
-        io(full, &io_exit(io_qualification(0x3FF, 0, true), 0)).1,
-        io(full, &io_exit(io_qualification(0x3FF, 0, false), 0)).1,
-    ];
-    for state in after {
-        assert_eq!(state, full);
-    }
-}
-
-#[test]
-fn counting_one_exit_leaves_the_other_counters_alone() {
-    let state = hlt(ExitState::default()).1;
-    assert_eq!(
-        state.emulated,
-        EmulationCounts {
-            hlt: 1,
-            ..EmulationCounts::default()
-        }
     );
 }
 
@@ -341,19 +271,13 @@ fn string_or_rep_io_stops_the_guest() {
     let string = io_qualification(0x3FF, 0, true) | (1 << 4);
     let rep = string | (1 << 5);
     for qualification in [string, rep] {
-        assert_eq!(
-            io(ExitState::default(), &io_exit(qualification, 0)).0,
-            ExitEvent::Unexpected
-        );
+        assert_eq!(io(&io_exit(qualification, 0)), ExitEvent::Unexpected);
     }
 }
 
 #[test]
 fn io_with_an_unused_size_stops_the_guest() {
-    assert_eq!(
-        io(ExitState::default(), &io_exit(io_qualification(0x3FF, 2, true), 0)).0,
-        ExitEvent::Unexpected
-    );
+    assert_eq!(io(&io_exit(io_qualification(0x3FF, 2, true), 0)), ExitEvent::Unexpected);
 }
 
 /// Every MSR index the bitmap covers: the two ranges whose bits the CPU consults.
@@ -364,13 +288,12 @@ fn bitmap_msr_indexes() -> impl Iterator<Item = u32> {
 #[test]
 fn rdmsr_is_emulated_only_for_the_intercepted_msrs() {
     for msr in bitmap_msr_indexes() {
-        let (event, state) = rdmsr(ExitState::default(), &msr_exit(EXIT_REASON_RDMSR, msr.into(), 0, 0));
+        let event = rdmsr(&msr_exit(EXIT_REASON_RDMSR, msr.into(), 0, 0));
         if INTERCEPTED_MSRS.contains(&msr) {
             assert_eq!(event, ExitEvent::Emulated(Emulation::Rdmsr { msr }), "MSR {msr:#x}");
         } else {
             // In range with its bit clear: it should never have exited, so the bitmap is broken.
             assert_eq!(event, ExitEvent::Unexpected, "MSR {msr:#x}");
-            assert_eq!(state, ExitState::default(), "MSR {msr:#x}");
         }
     }
 }
@@ -379,7 +302,7 @@ fn rdmsr_is_emulated_only_for_the_intercepted_msrs() {
 fn wrmsr_is_emulated_only_for_the_intercepted_msrs() {
     for msr in bitmap_msr_indexes() {
         // RAX and RDX are zero, so the value is 0, which is canonical.
-        let (event, state) = wrmsr(ExitState::default(), &msr_exit(EXIT_REASON_WRMSR, msr.into(), 0, 0));
+        let event = wrmsr(&msr_exit(EXIT_REASON_WRMSR, msr.into(), 0, 0));
         if INTERCEPTED_MSRS.contains(&msr) {
             assert_eq!(
                 event,
@@ -388,7 +311,6 @@ fn wrmsr_is_emulated_only_for_the_intercepted_msrs() {
             );
         } else {
             assert_eq!(event, ExitEvent::Unexpected, "MSR {msr:#x}");
-            assert_eq!(state, ExitState::default(), "MSR {msr:#x}");
         }
     }
 }

@@ -40,11 +40,12 @@ use core::ptr::NonNull;
 use uefi::boot::MemoryType;
 
 use super::cr::{self, read_cr4};
-use super::exit_decision::{EmulationCounts, NMI_VECTOR};
+use super::exit_decision::NMI_VECTOR;
 use super::msr::IA32_KERNEL_GS_BASE;
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable, GATE_SIZE};
+use super::vmexit::VcpuStats;
 
 /// Value the guest loads into EAX before its first main VMCALL.
 ///
@@ -62,9 +63,10 @@ pub const GUEST_NMI_MARKER: u32 = 0x004E_4D49;
 
 /// Rounds of the guest's wait loop (test, pause, decrement) before it gives
 /// up waiting for an NMI. PAUSE takes a different number of cycles on each
-/// CPU generation, so the Hyper-V runs measure the real time: 0x20000000
-/// rounds took about 65 s, so this is about 8 s. The `-InjectNmi` NMI
-/// arrived after about 15.5 million rounds, a quarter of this.
+/// CPU, and its speed varied threefold between Hyper-V runs: 0x20000000
+/// rounds once took about 65 s, these 0x04000000 at most about 2.5 s. The
+/// `-InjectNmi` NMI arrived after 15.5 and 18.8 million rounds, under a
+/// third of this.
 pub const GUEST_WAIT_ITERATIONS: u32 = 0x0400_0000;
 
 /// Value Aleph0 writes at the start of the guest data page before launch.
@@ -78,9 +80,9 @@ pub const GUEST_DATA_SEED: u32 = 0xDA7A;
 pub const GUEST_EPT_VALUE: u32 = 0x0045_5054;
 
 /// The I/O port the guest reads and writes through Aleph0: the COM1 scratch
-/// register (base + 7), a byte with no effect on the UART, which
-/// `serial.rs` never uses.
-pub const GUEST_SCRATCH_PORT: u16 = crate::serial::COM1 + 7;
+/// register (base + 7), a byte with no effect on the UART. COM1 is the
+/// guest's; Aleph0 prints on COM2.
+pub const GUEST_SCRATCH_PORT: u16 = crate::serial::SerialPort::COM1.base() + 7;
 
 /// Value the guest writes to IA32_KERNEL_GS_BASE through Aleph0 and reads
 /// back: canonical (bits 63:47 equal), so WRMSR accepts it. The guest puts
@@ -96,16 +98,24 @@ pub const GUEST_IO_VALUE: u8 = 0xA5;
 /// this marker in RAX on serial says why.
 pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 
-/// The emulated exits the guest causes before its last main VMCALL.
-/// `exit_decision` stops the guest at that VMCALL if the counts differ.
-pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts {
-    cpuid: 1,
-    rdmsr: 2,
-    wrmsr: 2,
-    io_in: 2,
-    io_out: 2,
-    hlt: 1,
-};
+/// The exit statistics a finished run of the guest must end with, given the
+/// run's own (`actual`): one CPUID, two RDMSRs and two WRMSRs of
+/// IA32_KERNEL_GS_BASE, two INs and two OUTs of the COM1 scratch register,
+/// one HLT, and no exception injected. Bring-up compares the two once the
+/// guest has finished. The number of exits and of NMIs injected depend on
+/// whether an NMI arrived during the run, so they are taken from `actual`.
+pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
+    VcpuStats {
+        cpuid_exits: 1,
+        msr_read_exits: 2,
+        msr_write_exits: 2,
+        io_in_exits: 2,
+        io_out_exits: 2,
+        halt_exits: 1,
+        exception_injections: 0,
+        ..*actual
+    }
+}
 
 core::arch::global_asm!(
     r#"

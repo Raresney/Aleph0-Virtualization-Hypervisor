@@ -8,23 +8,26 @@
 //!
 //! [`decide`] first checks what holds for every exit (a failed VM entry, an
 //! interrupted event delivery), then dispatches on the exit reason to a
-//! handler with the signature `fn(ExitState, &ExitInfo) -> (ExitEvent,
-//! ExitState)`, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a
-//! `match` instead of a table of function pointers: each handler stays a
-//! separate pure function with one signature, and the handled reasons are
-//! listed in one place:
+//! handler, the way KVM's `kvm_vmx_exit_handlers[]` does, but as a `match`
+//! instead of a table of function pointers, so the handled reasons are listed
+//! in one place:
 //!
-//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID, RDMSR, WRMSR, IN, OUT), HLT, which it
-//!   skips, and MWAIT and MONITOR, which get #UD.
+//! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID,
+//!   RDMSR, WRMSR, IN, OUT), and HLT, which it skips. Each handler reads the
+//!   exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR, which get
+//!   #UD, need no handler of their own.
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
-//!   NMI reinjection).
+//!   NMI reinjection), which depend on what came before:
+//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`.
 //!
-//! An exit reason without a handler stops the guest.
+//! An exit reason without a handler stops the guest. Nothing here counts
+//! exits: `vmexit::stats` does, for every guest, from what the handler
+//! carried out.
 
 mod emulation;
 mod scenario;
 
-pub use emulation::{Emulation, EmulationCounts, IoSize, cpuid_policy, is_canonical_48, merge_in};
+pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
@@ -338,21 +341,18 @@ impl ExitInfo {
     }
 }
 
-/// What the handler remembers between exits.
+/// What the handler remembers between exits: the NMI waiting for the guest,
+/// and how far the test guest's scenario has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExitState {
     /// Main VMCALLs handled so far.
     pub main_vmcalls: u32,
     /// An NMI arrived while the guest blocked NMIs and is not injected yet.
     pub nmi_pending: bool,
-    /// NMIs reinjected into the guest.
-    pub nmis_injected: u32,
     /// VMCALLs from the guest's NMI handler: reinjected NMIs that arrived.
     pub nmis_handled: u32,
     /// EPT violations on the protected page after which write was granted.
     pub ept_writes_granted: u32,
-    /// Exits emulated so far, per instruction.
-    pub emulated: EmulationCounts,
 }
 
 impl ExitState {
@@ -410,9 +410,6 @@ pub enum ExitEvent {
     /// them: the guest's CPUID.1:ECX bit 3 (MONITOR/MWAIT) is clear under
     /// Hyper-V, and `cpuid_policy` passes it through.
     GuestInvalidOpcode,
-    /// The last main VMCALL arrived, but the guest's emulated exits
-    /// (HLT included) do not match `guest::EXPECTED_EMULATION`.
-    EmulationMissing,
     /// Anything else.
     Unexpected,
 }
@@ -587,9 +584,7 @@ impl ExitEvent {
             Self::Halted => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
             Self::GuestInvalidOpcode => ExitAction::Resume(ResumePlan::INJECT_UD),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::EptWriteMissing | Self::DataPageMismatch | Self::EmulationMissing | Self::Unexpected => {
-                ExitAction::Unexpected
-            }
+            Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => ExitAction::Unexpected,
         }
     }
 }
@@ -607,11 +602,11 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         return (ExitEvent::Unexpected, state);
     }
     match exit.reason.basic {
-        EXIT_REASON_CPUID => emulation::cpuid(state, &exit),
-        EXIT_REASON_RDMSR => emulation::rdmsr(state, &exit),
-        EXIT_REASON_WRMSR => emulation::wrmsr(state, &exit),
-        EXIT_REASON_IO_INSTRUCTION => emulation::io(state, &exit),
-        EXIT_REASON_HLT => emulation::hlt(state),
+        EXIT_REASON_CPUID => (emulation::cpuid(&exit), state),
+        EXIT_REASON_RDMSR => (emulation::rdmsr(&exit), state),
+        EXIT_REASON_WRMSR => (emulation::wrmsr(&exit), state),
+        EXIT_REASON_IO_INSTRUCTION => (emulation::io(&exit), state),
+        EXIT_REASON_HLT => (emulation::hlt(), state),
         EXIT_REASON_MWAIT | EXIT_REASON_MONITOR => (ExitEvent::GuestInvalidOpcode, state),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),

@@ -57,3 +57,33 @@ fn next_rip_past_the_lower_half_is_refused() {
     assert_eq!(next_rip(0x0000_7FFF_FFFF_FFFF, 1), None);
     assert_eq!(next_rip(0x0000_7FFF_FFFF_FFF1, 15), None);
 }
+
+#[test]
+fn resume_failures_read_as_the_report_has_always_printed_them() {
+    // The report adds "; not resuming." after each.
+    assert_eq!(ResumeFailure::RipUnreadable.to_string(), "guest RIP unreadable");
+    assert_eq!(
+        ResumeFailure::NextRipInvalid.to_string(),
+        "next guest RIP would wrap or be non-canonical"
+    );
+    let write = ResumeFailure::Write {
+        what: "advance guest RIP",
+        error: VmcsError::VmFailValid,
+    };
+    assert_eq!(write.to_string(), "could not advance guest RIP (VmFailValid)");
+    assert_eq!(
+        ResumeFailure::GrantWrite(VmxFail::Invalid).to_string(),
+        "could not make the protected page writable (INVEPT Invalid)"
+    );
+}
+
+#[test]
+fn only_a_resumed_outcome_lets_the_guest_go_on() {
+    assert!(Outcome::ResumeFailed(ResumeFailure::NoProtectedPage).stops());
+    assert_eq!(
+        Outcome::ResumeFailed(ResumeFailure::NoProtectedPage).action(),
+        ExitAction::Unexpected
+    );
+    assert!(Outcome::Stopped(ExitAction::Finished).stops());
+    assert_eq!(Outcome::Stopped(ExitAction::Finished).action(), ExitAction::Finished);
+}

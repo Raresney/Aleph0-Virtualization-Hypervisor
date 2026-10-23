@@ -34,6 +34,12 @@
 //! the host fields, that proves storage only: the CPU checks the state when
 //! VMLAUNCH runs, and reports a bad guest state as exit reason 33.
 //! [`check_segments`] catches the two mistakes most likely to cause that.
+//!
+//! After a VM exit the same fields hold the guest's state as the CPU saved
+//! it. [`GuestState::read`] reads them back, and every stop prints them with
+//! [`GuestState::report`], in the format bring-up prints before VMLAUNCH.
+
+use core::fmt;
 
 use super::cr;
 use super::msr;
@@ -105,6 +111,82 @@ impl GuestSegment {
         self.access_rights & ACCESS_RIGHTS_UNUSABLE == 0
     }
 }
+
+impl fmt::Display for GuestSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "selector={:#06x} base={:#018x} limit={:#010x} access={:#07x}",
+            self.selector, self.base, self.limit, self.access_rights,
+        )
+    }
+}
+
+/// The four VMCS fields of one segment register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentFields {
+    selector: u32,
+    base: u32,
+    limit: u32,
+    access_rights: u32,
+}
+
+/// The fields of ES, CS, SS, DS, FS, GS, LDTR and TR, in the order
+/// [`GuestState::segments`] lists the registers. [`GuestState::write`] and
+/// [`GuestState::read`] both walk this table, so they cannot disagree.
+const SEGMENT_FIELDS: [SegmentFields; 8] = {
+    use fields::*;
+    [
+        SegmentFields {
+            selector: GUEST_ES_SELECTOR,
+            base: GUEST_ES_BASE,
+            limit: GUEST_ES_LIMIT,
+            access_rights: GUEST_ES_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_CS_SELECTOR,
+            base: GUEST_CS_BASE,
+            limit: GUEST_CS_LIMIT,
+            access_rights: GUEST_CS_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_SS_SELECTOR,
+            base: GUEST_SS_BASE,
+            limit: GUEST_SS_LIMIT,
+            access_rights: GUEST_SS_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_DS_SELECTOR,
+            base: GUEST_DS_BASE,
+            limit: GUEST_DS_LIMIT,
+            access_rights: GUEST_DS_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_FS_SELECTOR,
+            base: GUEST_FS_BASE,
+            limit: GUEST_FS_LIMIT,
+            access_rights: GUEST_FS_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_GS_SELECTOR,
+            base: GUEST_GS_BASE,
+            limit: GUEST_GS_LIMIT,
+            access_rights: GUEST_GS_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_LDTR_SELECTOR,
+            base: GUEST_LDTR_BASE,
+            limit: GUEST_LDTR_LIMIT,
+            access_rights: GUEST_LDTR_ACCESS_RIGHTS,
+        },
+        SegmentFields {
+            selector: GUEST_TR_SELECTOR,
+            base: GUEST_TR_BASE,
+            limit: GUEST_TR_LIMIT,
+            access_rights: GUEST_TR_ACCESS_RIGHTS,
+        },
+    ]
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestStateError {
@@ -203,6 +285,11 @@ impl GuestState {
         Ok(state)
     }
 
+    /// The segment registers, in [`SEGMENT_FIELDS`] order.
+    fn segments(&self) -> [GuestSegment; 8] {
+        [self.es, self.cs, self.ss, self.ds, self.fs, self.gs, self.ldtr, self.tr]
+    }
+
     /// Writes every guest-state field to the current VMCS and reads each one
     /// back. Does not launch.
     ///
@@ -211,65 +298,6 @@ impl GuestState {
     /// VMX operation must be active and a VMCS current on this CPU.
     pub unsafe fn write(&self) -> Result<(), GuestStateError> {
         use fields::*;
-
-        let segments = [
-            (
-                self.es,
-                GUEST_ES_SELECTOR,
-                GUEST_ES_BASE,
-                GUEST_ES_LIMIT,
-                GUEST_ES_ACCESS_RIGHTS,
-            ),
-            (
-                self.cs,
-                GUEST_CS_SELECTOR,
-                GUEST_CS_BASE,
-                GUEST_CS_LIMIT,
-                GUEST_CS_ACCESS_RIGHTS,
-            ),
-            (
-                self.ss,
-                GUEST_SS_SELECTOR,
-                GUEST_SS_BASE,
-                GUEST_SS_LIMIT,
-                GUEST_SS_ACCESS_RIGHTS,
-            ),
-            (
-                self.ds,
-                GUEST_DS_SELECTOR,
-                GUEST_DS_BASE,
-                GUEST_DS_LIMIT,
-                GUEST_DS_ACCESS_RIGHTS,
-            ),
-            (
-                self.fs,
-                GUEST_FS_SELECTOR,
-                GUEST_FS_BASE,
-                GUEST_FS_LIMIT,
-                GUEST_FS_ACCESS_RIGHTS,
-            ),
-            (
-                self.gs,
-                GUEST_GS_SELECTOR,
-                GUEST_GS_BASE,
-                GUEST_GS_LIMIT,
-                GUEST_GS_ACCESS_RIGHTS,
-            ),
-            (
-                self.ldtr,
-                GUEST_LDTR_SELECTOR,
-                GUEST_LDTR_BASE,
-                GUEST_LDTR_LIMIT,
-                GUEST_LDTR_ACCESS_RIGHTS,
-            ),
-            (
-                self.tr,
-                GUEST_TR_SELECTOR,
-                GUEST_TR_BASE,
-                GUEST_TR_LIMIT,
-                GUEST_TR_ACCESS_RIGHTS,
-            ),
-        ];
 
         let other_fields = [
             (GUEST_RIP, self.rip),
@@ -295,11 +323,11 @@ impl GuestState {
 
         // SAFETY: the caller guarantees VMX operation with a current VMCS.
         unsafe {
-            for (segment, selector, base, limit, access_rights) in segments {
-                write_field(selector, segment.selector.into())?;
-                write_field(base, segment.base)?;
-                write_field(limit, segment.limit.into())?;
-                write_field(access_rights, segment.access_rights.into())?;
+            for (segment, fields) in self.segments().into_iter().zip(SEGMENT_FIELDS) {
+                write_field(fields.selector, segment.selector.into())?;
+                write_field(fields.base, segment.base)?;
+                write_field(fields.limit, segment.limit.into())?;
+                write_field(fields.access_rights, segment.access_rights.into())?;
             }
             for (field, value) in other_fields {
                 write_field(field, value)?;
@@ -312,6 +340,111 @@ impl GuestState {
             }
         }
         Ok(())
+    }
+
+    /// Reads the state back from the current VMCS: the fields
+    /// [`write`](Self::write) writes that this type holds. After a VM exit
+    /// they are the guest's state as the CPU saved it. PAT and EFER are read
+    /// when the entry controls load them, as [`from_current`](Self::from_current)
+    /// decides.
+    ///
+    /// # Safety
+    ///
+    /// VMX operation must be active and a VMCS current on this CPU.
+    pub unsafe fn read() -> Result<Self, GuestStateError> {
+        use fields::*;
+
+        // SAFETY: the caller guarantees VMX operation with a current VMCS.
+        unsafe {
+            let mut segments = [GuestSegment::unusable(0, 0); 8];
+            for (segment, fields) in segments.iter_mut().zip(SEGMENT_FIELDS) {
+                *segment = GuestSegment {
+                    selector: read_field(fields.selector)? as u16,
+                    base: read_field(fields.base)?,
+                    limit: read_field(fields.limit)? as u32,
+                    access_rights: read_field(fields.access_rights)? as u32,
+                };
+            }
+            let [es, cs, ss, ds, fs, gs, ldtr, tr] = segments;
+            let entry_controls = read_field(VM_ENTRY_CONTROLS)?;
+            Ok(Self {
+                rip: read_field(GUEST_RIP)?,
+                rsp: read_field(GUEST_RSP)?,
+                rflags: read_field(GUEST_RFLAGS)?,
+                cr0: read_field(GUEST_CR0)?,
+                cr3: read_field(GUEST_CR3)?,
+                cr4: read_field(GUEST_CR4)?,
+                es,
+                cs,
+                ss,
+                ds,
+                fs,
+                gs,
+                ldtr,
+                tr,
+                gdtr: DescriptorTable {
+                    base: read_field(GUEST_GDTR_BASE)?,
+                    limit: read_field(GUEST_GDTR_LIMIT)? as u16,
+                },
+                idtr: DescriptorTable {
+                    base: read_field(GUEST_IDTR_BASE)?,
+                    limit: read_field(GUEST_IDTR_LIMIT)? as u16,
+                },
+                sysenter_cs: read_field(GUEST_IA32_SYSENTER_CS)?,
+                sysenter_esp: read_field(GUEST_IA32_SYSENTER_ESP)?,
+                sysenter_eip: read_field(GUEST_IA32_SYSENTER_EIP)?,
+                pat: match entry_controls & VM_ENTRY_LOAD_IA32_PAT {
+                    0 => None,
+                    _ => Some(read_field(GUEST_IA32_PAT)?),
+                },
+                efer: match entry_controls & VM_ENTRY_LOAD_IA32_EFER {
+                    0 => None,
+                    _ => Some(read_field(GUEST_IA32_EFER)?),
+                },
+            })
+        }
+    }
+
+    /// Prints the state, a few lines each starting with `prefix`: before
+    /// VMLAUNCH what bring-up wrote, at a stop what the CPU saved. The same
+    /// format both times, so the two can be compared line by line.
+    pub fn report(&self, prefix: fmt::Arguments<'_>) {
+        log!(
+            "{prefix} rip={:#018x} rsp={:#018x} rflags={:#x} cr0={:#x} cr3={:#x} cr4={:#x}",
+            self.rip,
+            self.rsp,
+            self.rflags,
+            self.cr0,
+            self.cr3,
+            self.cr4,
+        );
+        for (name, segment) in [
+            ("cs", self.cs),
+            ("ss", self.ss),
+            ("ds", self.ds),
+            ("es", self.es),
+            ("fs", self.fs),
+            ("gs", self.gs),
+            ("tr", self.tr),
+            ("ldtr", self.ldtr),
+        ] {
+            log!("{prefix} {name:<4} {segment}");
+        }
+        log!(
+            "{prefix} gdtr={:#018x}/{:#06x} idtr={:#018x}/{:#06x}; PAT load={} EFER load={}",
+            self.gdtr.base,
+            self.gdtr.limit,
+            self.idtr.base,
+            self.idtr.limit,
+            self.pat.is_some(),
+            self.efer.is_some(),
+        );
+        log!(
+            "{prefix} sysenter cs={:#x} esp={:#018x} eip={:#018x}",
+            self.sysenter_cs,
+            self.sysenter_esp,
+            self.sysenter_eip,
+        );
     }
 }
 
@@ -354,6 +487,16 @@ fn check_segments(cs: &GuestSegment, tr: &GuestSegment) -> Result<(), GuestState
         });
     }
     Ok(())
+}
+
+/// Reads one field.
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
+unsafe fn read_field(field: u32) -> Result<u64, GuestStateError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    unsafe { vmcs::vmread(field) }.map_err(|error| GuestStateError::Vmcs { field, error })
 }
 
 /// Writes one field and verifies it by reading it back.

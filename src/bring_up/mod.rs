@@ -84,8 +84,9 @@ impl PassthroughState {
             // SAFETY: IA32_KERNEL_GS_BASE exists on every 64-bit CPU, and
             // reading it has no side effect.
             kernel_gs_base: unsafe { vmx::msr::rdmsr(IA32_KERNEL_GS_BASE) },
-            // SAFETY: the COM1 scratch register: COM1 is the UART `serial`
-            // owns, and reading the scratch register has no side effect.
+            // SAFETY: the COM1 scratch register, a byte with no effect on
+            // the UART; reading it has no side effect. Aleph0 prints on
+            // COM2, so this does not disturb its output.
             com1_scratch: unsafe { crate::port::inb(GUEST_SCRATCH_PORT) },
         }
     }
@@ -360,7 +361,13 @@ fn launch_guest(
     // exit bitmaps are never freed.
     let stop = unsafe { vmx::vmcs::launch() };
     report::passthrough_state(before, PassthroughState::read());
-    guest_result(stop)
+    let run = guest_result(stop)?;
+    // The guest has stopped, so no exit handler is counting any more.
+    let stats = vmx::vmexit::vcpu_stats();
+    if stats != vmx::guest::expected_stats(&stats) {
+        return Err(BringUpError::UnexpectedExitStats(stats));
+    }
+    Ok(run)
 }
 
 /// Fills in the current VMCS: controls, EPT pointer, exit bitmaps, host state,

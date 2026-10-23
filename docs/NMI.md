@@ -193,16 +193,18 @@ their own in `emulation.rs` and are not in this table
 | VMCALL | `rax = 0xa1e1`, second main VMCALL | `LastMainVmcall` | stop: finished |
 | anything else | — | `Unexpected` | stop |
 
-Since the emulated-exits step the second main VMCALL also needs every
-emulated exit to have happened (`guest::EXPECTED_EMULATION`); otherwise the
-event is `EmulationMissing` and the guest stops.
+Once the guest has finished, bring-up also checks that every emulated exit
+happened (`guest::expected_stats`, against the vCPU's exit statistics);
+otherwise the run fails with `UnexpectedExitStats`.
 
-The state between exits counts:
+The state between exits holds:
 - main VMCALLs;
 - whether an NMI is pending;
-- NMIs injected;
 - NMIs handled by the guest (its handler's VMCALLs);
-- emulated exits, per instruction.
+- whether the protected page's write was granted.
+
+NMIs injected are counted with the other exit statistics (`nmi_injections`
+in `vmexit::stats`), not in the state, since no decision depends on them.
 
 Main VMCALLs are counted on their own, because NMI exits now interleave
 with them; exit #2 is no longer necessarily the second VMCALL.
@@ -244,7 +246,7 @@ Returning to firmware with SUCCESS.
 ```
 
 What the numbers prove:
-- **RCX at exit #2:** `0x1f6f2a97` means the loop had run `0x20000000 - 0x1f6f2a97 = 0x90d569` rounds (about 9.5 million) when the NMI arrived. The limit was `0x20000000` then; it is `0x04000000` (about 8 s) since a plain run measured 65 s for the old one.
+- **RCX at exit #2:** `0x1f6f2a97` means the loop had run `0x20000000 - 0x1f6f2a97 = 0x90d569` rounds (about 9.5 million) when the NMI arrived. The limit was `0x20000000` then. It is `0x04000000` since a plain run measured 65 s for the old one; PAUSE's speed varies between runs, and the new limit took at most about 2.5 s once, while the `-InjectNmi` NMI came after 18.8 million rounds.
 - **RAX at exit #3:** `0x4e4d49` means the NMI was delivered through the guest's own IDT, to its handler.
 - **RCX at exit #4:** `0x1f6f2a96`, exactly one lower than at exit #2. `iretq` returned to the `dec ecx` at +21, which ran once. The loop then saw `ebx = 1` and went on to VMCALL #2.
 - **RBX at exit #4:** `1`; the handler's signal reached the main code.
@@ -297,7 +299,7 @@ with `rcx = 0`: the loop ran out.
 | Name | Where | What |
 |---|---|---|
 | `GUEST_NMI_MARKER` (`0x4e4d49`) | `guest.rs` | RAX of the guest NMI handler's VMCALL |
-| `GUEST_WAIT_ITERATIONS` (`0x04000000`) | `guest.rs` | rounds of the wait loop, about 8 s on Hyper-V |
+| `GUEST_WAIT_ITERATIONS` (`0x04000000`) | `guest.rs` | rounds of the wait loop, a few seconds on Hyper-V |
 | `GuestMemory::idt` | `guest.rs` | guest IDTR: one gate, vector 2 |
 | `interrupt_gate` | `guest.rs` | encodes a 64-bit interrupt gate |
 | `PIN_BASED_NMI_EXITING`, `PIN_BASED_VIRTUAL_NMIS` | `vmcs/fields.rs` | pin bits 3 and 5 |

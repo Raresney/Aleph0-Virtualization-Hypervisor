@@ -11,8 +11,8 @@ use core::time::Duration;
 use uefi::boot::{self, EventType, TimerTrigger, Tpl};
 use uefi::prelude::*;
 
-/// Prints a tagged line to COM1, and to the firmware console while still in
-/// boot services.
+/// Prints a tagged line to the serial port (COM2), and to the firmware
+/// console while still in boot services.
 ///
 /// Safe in every context: outside the boot-services phase (see
 /// `output::Phase`) the console half is skipped and only serial is written.
@@ -31,13 +31,16 @@ mod port;
 mod serial;
 mod vmx;
 
-/// Prefix for every line this hypervisor prints, on screen and on COM1.
+/// Prefix for every line this hypervisor prints, on screen and on serial.
 pub const TAG: &str = "[Aleph0 Virtualization Hypervisor]";
+
+/// Where Aleph0 prints: COM2, leaving COM1 to the guest.
+const OUTPUT_PORT: serial::SerialPort = serial::SerialPort::COM2;
 
 #[cfg_attr(not(test), entry)]
 fn main() -> Status {
-    // First, so every later line also reaches COM1. Needs no firmware.
-    let serial = serial::init();
+    // First, so every later line also reaches serial. Needs no firmware.
+    let serial = serial::init(OUTPUT_PORT);
 
     log!("Initializing UEFI helpers...");
 
@@ -45,8 +48,8 @@ fn main() -> Status {
 
     log!("UEFI helpers initialized successfully.");
     match serial {
-        Ok(()) => log!("Serial output enabled on COM1 ({:#x}).", serial::COM1),
-        Err(error) => log!("Serial output disabled: {error:?}; console only."),
+        Ok(()) => log!("Serial output enabled on {OUTPUT_PORT}."),
+        Err(error) => log!("Serial output disabled on {OUTPUT_PORT}: {error:?}; console only."),
     }
 
     // Bring-up returns once the guest has stopped, or at the first failure.

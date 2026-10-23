@@ -291,9 +291,10 @@ with ABORTED.`
 
 - Only the planned path ran on real VMX. The other stops (unexpected exit,
   failed VMLAUNCH or VMRESUME) go through the same teardown but have only
-  been compiled. A run with the expected guest RAX changed on purpose would
-  exercise `Unexpected` at exit #1, teardown from exit context, and
-  `ABORTED`.
+  been compiled. The `unexpected-exit-test` Cargo feature changes the
+  expected guest RAX on purpose, which exercises `Unexpected` at main
+  VMCALL #1 (exit #12), the stop report, teardown from exit context, and
+  `ABORTED` (`run-hyperv.ps1 -Features unexpected-exit-test`).
 - NMIs: since the NMI step, NMI exiting is on and NMIs are reinjected into
   the guest's own IDT; see NMI.md.
 - After `ExitBootServices` Aleph0 must stay resident instead of returning

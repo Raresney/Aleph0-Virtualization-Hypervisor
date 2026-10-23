@@ -1,0 +1,25 @@
+# The checks CONTRIBUTING.md requires before every pull request. Nothing here
+# executes VMX instructions; that still needs a boot under Hyper-V.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain and UEFI target from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: rustup component add rustfmt clippy
+      - run: cargo build
+      - run: cargo test-host
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --target x86_64-pc-windows-msvc --tests -- -D warnings

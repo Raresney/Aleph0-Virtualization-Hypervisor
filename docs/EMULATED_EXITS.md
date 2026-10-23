@@ -19,7 +19,7 @@ Code:
 - `src/vmx/exit_decision/emulation.rs`: the handlers for CPUID, RDMSR, WRMSR and IN/OUT, and `cpuid_policy`;
 - `src/vmx/exit_decision/scenario.rs`: the test guest's own exits (EPT write, VMCALLs, NMI);
 - `src/vmx/exit_bitmaps.rs`: the MSR bitmap and the two I/O bitmaps;
-- `src/vmx/vmexit/handler.rs`: `execute`, `prepare_resume`, `queue_general_protection`;
+- `src/vmx/vmexit/handler.rs`: `execute`, `prepare_resume`, `queue_exception`;
 - `src/vmx/vmexit/report.rs`: the report lines;
 - `src/port.rs`: `in`/`out` of 1, 2 and 4 bytes;
 - `src/vmx/guest.rs`: the guest code that causes the exits, and its checks;
@@ -84,14 +84,15 @@ guest: cpuid / rdmsr / wrmsr / in / out
 vmexit_entry (stub)    push the 15 general-purpose registers = RegisterFrame
   ▼
 vmexit_handler(frame)
-  ├─ read_exit   VMCS fields + frame                 ─▶ ExitInfo
-  ├─ judge       decide(state, exit)                 ─▶ ExitEvent::Emulated(Emulation), next state
-  └─ apply       event.action()
-                   = Resume(ResumePlan { emulate: Some(emulation), advance_rip: true, .. })
-       └─ prepare_resume
-            1. execute(emulation, frame)   the real instruction, in root operation;
-                                           result into frame.rax .. frame.rdx
-            2. GUEST_RIP = RIP + VM_EXIT_INSTRUCTION_LEN
+  ├─ read_exit    VMCS fields + frame (prints nothing) ─▶ ExitRead, with its ExitInfo
+  ├─ judge        decide(state, exit)                  ─▶ ExitEvent::Emulated(Emulation), next state
+  ├─ carry_out    event.action()
+  │                 = Resume(ResumePlan { emulate: Some(emulation), advance_rip: true, .. })
+  │    └─ prepare_resume
+  │         1. execute(emulation, frame)   the real instruction, in root operation;
+  │                                        result into frame.rax .. frame.rdx
+  │         2. GUEST_RIP = RIP + VM_EXIT_INSTRUCTION_LEN
+  └─ report_exit  the exit's lines, once its outcome is known
      returns RESUME_GUEST (0)
   ▼
 vmexit_entry (stub)    pop the frame into the guest's registers, VMRESUME
@@ -156,12 +157,16 @@ A worked exit: the guest runs `rdmsr` (`0F 32`, 2 bytes) with
 (say) `0x0000_7A1E_0000_0000` and writes `rax = 0`, `rdx = 0x7A1E`; GUEST_RIP
 moves by 2; the guest continues after its `rdmsr`.
 
-Each emulation handler also counts its exit in `ExitState::emulated`
-(`EmulationCounts`), which section 6 uses. The guest decides how often it
-runs these instructions, so each count saturates at `u32::MAX` instead of
-overflowing: `+= 1` would panic in a debug build, which in exit context
-halts the machine, and wrap to 0 in release. The NMI counts in `ExitState`
-saturate for the same reason.
+The emulation handlers hold for any guest, so they read only the exit
+(`fn(&ExitInfo) -> ExitEvent`) and count nothing. The exit handler counts
+what it carried out in the vCPU's exit statistics (`vmexit::stats`,
+`VcpuStats`), the way KVM keeps `struct kvm_vcpu_stat`: one counter per
+instruction executed for the guest (`cpuid_exits`, `msr_read_exits`,
+`msr_write_exits`, `io_in_exits`, `io_out_exits`), plus `exits`,
+`halt_exits`, `nmi_injections` and `exception_injections`. An exit counts
+only once its resume was prepared, so a WRMSR whose next RIP was invalid,
+and which never ran, is not counted. Section 6 uses them. Each counter is a
+`u64`, which no exit rate overflows.
 
 ## 3. CPUID and its policy
 
@@ -371,7 +376,8 @@ pub const fn io_bit(port: u16) -> (IoBitmap, usize, u8) {
 
 The bit of port *p* is bit `p % 8` of byte `(p & 0x7FFF) / 8` in its page.
 Aleph0 intercepts one port, `0x3FF`, the COM1 scratch register (base `0x3F8`
-+ 7): a byte with no effect on the UART that `serial.rs` never uses. It is
++ 7): a byte with no effect on the UART. COM1 is the guest's; Aleph0 prints
+on COM2. It is
 bit 7 of byte `0x7F` in page A. `write_to_vmcs` writes the pages' addresses
 to `IO_BITMAP_A` (`0x2000`) and `IO_BITMAP_B` (`0x2002`).
 
@@ -384,9 +390,10 @@ against `INTERCEPTED_PORTS`: it passes through the port and size from the
 exit qualification, as the guest would have done itself. This is a known
 property, not a bug in the test: a 4-byte access at `0x3FC` exits, and
 Aleph0 then reaches the real COM1 registers `0x3FC` to `0x3FF` (modem
-control, line status, modem status and scratch), including the ones the
-serial driver uses. The test guest never does that. It is a decision for
-the OS-guest step (section 8).
+control, line status, modem status and scratch): the guest's own UART,
+which it could reach without Aleph0 anyway. Aleph0's serial driver is on
+COM2, out of reach of this rule. The test guest never does that. It is a
+decision for the OS-guest step (section 8).
 
 ### The exit qualification
 
@@ -512,24 +519,31 @@ restore either, and prints `restored=false` below.
   `0xFA11` in EAX. The #UD is an exception exit (reason 0, vector 6), which
   `exit_decision` does not handle, so the guest stops and serial shows the
   marker in RAX.
-- **Aleph0 checks the counts.** A guest that got the right value does not
-  prove the exit happened: with a broken bitmap, `rdmsr` would run directly
-  and return the same value. `ExitState::emulated` counts each emulated exit,
-  and at the last main VMCALL `scenario::vmcall` compares it with
-  `guest::EXPECTED_EMULATION`:
+- **Bring-up checks the exit statistics.** A guest that got the right
+  value does not prove the exit happened: with a broken bitmap, `rdmsr`
+  would run directly and return the same value. Once the guest has
+  finished, bring-up compares the vCPU's statistics with
+  `guest::expected_stats`, as a KVM selftest checks a vCPU's statistics
+  after its run:
 
 ```rust
-pub const EXPECTED_EMULATION: EmulationCounts = EmulationCounts {
-    cpuid: 1,
-    rdmsr: 2,
-    wrmsr: 2,
-    io_in: 2,
-    io_out: 2,
-};
+pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
+    VcpuStats {
+        cpuid_exits: 1,
+        msr_read_exits: 2,
+        msr_write_exits: 2,
+        io_in_exits: 2,
+        io_out_exits: 2,
+        halt_exits: 1,
+        exception_injections: 0,
+        // How many exits and NMIs depends on whether an NMI arrived.
+        ..*actual
+    }
+}
 ```
 
-Any other count gives `EmulationMissing` and stops the guest instead of
-ending the run.
+Any other count fails the run with `UnexpectedExitStats`, which prints both
+sets of statistics, and the application returns `ABORTED`.
 
 ### What serial shows
 
@@ -542,11 +556,11 @@ VM exit #N: RDMSR 0xc0000102 -> 0x...; resuming at rip=...
 VM exit #N: WRMSR 0xc0000102 <- 0x00007a1e00000000; resuming at rip=...
 VM exit #N: IN port 0x3ff size=1 -> 0x...; resuming at rip=...
 VM exit #N: OUT port 0x3ff size=1 value=0xa5; resuming at rip=...
-VM exit #N: emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2.
+VM exit #N: exit statistics: exits=... cpuid_exits=1 msr_read_exits=2 ...
 ```
 
-The last line comes with the final VMCALL. The EPT violation, which was
-exit #1 before this step, is now exit #10.
+The last line comes with the stop report after the final VMCALL. The EPT
+violation, which was exit #1 before this step, is now exit #10.
 
 ### What bring-up checks
 
@@ -672,6 +686,10 @@ Guest finished after 14 VM exits; VMX operation left.
 
 The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 
+> These runs predate the exit statistics. Since then the stop report
+> prints `exit statistics: ...` in place of `emulated exits: ...`, and
+> bring-up, not the last VMCALL, checks the counts.
+
 ## 8. Limits before an OS guest
 
 - **The CPUID decisions of section 3**: the hypervisor-present bit, the
@@ -685,7 +703,7 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
   bitmap's ranges and every other port reaches the hardware without Aleph0
   seeing it (MSRs outside the ranges get a #GP, section 4). The
   multi-port rule (section 5) also lets a wide access that touches `0x3FF`
-  reach its neighbours, the serial driver's registers.
+  reach its neighbours, COM1's other registers, which are the guest's.
 - **The #GP and #UD paths are tested on the host only.** They are
   delivered through the guest's own IDT, which in the test guest has only
   vector 2, so they would find no gate. The test guest never triggers them.
@@ -711,7 +729,7 @@ requests bit 7 itself, so a guest HLT exits on any CPU.
 
 | Exit | Reason | Decision | Resume |
 |---|---|---|---|
-| HLT | 12 | `Halted`, counted as `hlt` in `EmulationCounts` | past the instruction |
+| HLT | 12 | `Halted`, counted in `halt_exits` | past the instruction |
 | MWAIT | 36 | `GuestInvalidOpcode` | inject #UD (`0x80000306`), RIP unchanged |
 | MONITOR | 39 | `GuestInvalidOpcode` | inject #UD, RIP unchanged |
 
@@ -749,8 +767,8 @@ firmware as the guest (#21).
 **The test.** The test guest runs one `hlt` after its I/O checks, with
 IF = 0, so no interrupt could end the halt; only Aleph0 moving RIP past it
 lets the guest go on. The HLT is exit #10, so the EPT violation becomes exit
-#11 and the run has 13 exits (15 with `-InjectNmi`), ending in
-`emulated exits: cpuid=1 rdmsr=2 wrmsr=2 in=2 out=2 hlt=1.`. The HLT line,
+#11 and the run has 13 exits (15 with `-InjectNmi`), whose statistics
+include `halt_exits=1`. The HLT line,
 `HLT; going on at rip=...`, deliberately avoids the text `resuming the
 guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 
@@ -774,4 +792,4 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exception bitmap | all ones for the test guest, 0 for a guest with its own IDT |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
-| `EXPECTED_EMULATION` | cpuid 1, rdmsr 2, wrmsr 2, in 2, out 2, hlt 1 |
+| `guest::expected_stats` | cpuid 1, MSR reads 2, MSR writes 2, in 2, out 2, halt 1, exceptions 0 |

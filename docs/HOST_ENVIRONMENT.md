@@ -180,7 +180,8 @@ blocked.
 that arrives after the exit handler last looked at `NMI_PENDING` and before
 VMRESUME. The exit handler orders its work so that no write can undo it:
 
-1. `judge` takes `NMI_PENDING` before `decide`.
+1. The exit handler takes `NMI_PENDING` (`take_pending_nmi`) just before
+   `judge` calls `decide`.
 2. `prepare_resume` writes the VMCS, including the NMI-window bit
    (VMREAD, change, VMWRITE).
 3. `keep_nmi_window_for_host_nmi` runs last: if `NMI_PENDING` is set again,

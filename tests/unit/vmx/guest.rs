@@ -219,3 +219,27 @@ fn user_idt_is_refused_only_under_smap() {
         Err(GuestMemoryError::IdtBlockedBySmap)
     );
 }
+
+#[test]
+fn expected_stats_keep_what_an_nmi_changes_and_nothing_else() {
+    // A run with -InjectNmi: two more exits, one NMI injected.
+    let with_nmi = VcpuStats {
+        exits: 15,
+        nmi_injections: 1,
+        ..expected_stats(&VcpuStats::ZERO)
+    };
+    assert_eq!(expected_stats(&with_nmi), with_nmi);
+    // A run whose HLT never exited, or that got a #GP it should not have.
+    for wrong in [
+        VcpuStats {
+            halt_exits: 0,
+            ..with_nmi
+        },
+        VcpuStats {
+            exception_injections: 1,
+            ..with_nmi
+        },
+    ] {
+        assert_ne!(expected_stats(&wrong), wrong);
+    }
+}

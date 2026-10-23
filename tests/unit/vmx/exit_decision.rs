@@ -8,9 +8,10 @@
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
 use crate::vmx::guest::{
-    EXPECTED_EMULATION, GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE,
-    GUEST_NMI_MARKER, GUEST_SCRATCH_PORT,
+    GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_NMI_MARKER,
+    GUEST_SCRATCH_PORT, expected_stats,
 };
+use crate::vmx::vmexit::VcpuStats;
 
 const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;
@@ -22,10 +23,8 @@ const NMI_INFO: InterruptionInfo = InterruptionInfo(0x8000_0202);
 const START: ExitState = ExitState {
     main_vmcalls: 0,
     nmi_pending: false,
-    nmis_injected: 0,
     nmis_handled: 0,
     ept_writes_granted: 0,
-    emulated: EXPECTED_EMULATION,
 };
 /// After the EPT violation: the data page is writable, main VMCALL #1 next.
 const WRITTEN: ExitState = ExitState {
@@ -316,16 +315,7 @@ fn repeated_main_vmcall_is_unexpected() {
 
 #[test]
 fn nmi_while_unblocked_is_injected() {
-    assert_eq!(
-        decide(WAITING, nmi(0)),
-        (
-            ExitEvent::NmiInjected,
-            ExitState {
-                nmis_injected: 1,
-                ..WAITING
-            }
-        ),
-    );
+    assert_eq!(decide(WAITING, nmi(0)), (ExitEvent::NmiInjected, WAITING));
 }
 
 #[test]
@@ -362,13 +352,7 @@ fn window_exit_injects_the_pending_nmi() {
     };
     assert_eq!(
         decide(pending, exit(EXIT_REASON_NMI_WINDOW)),
-        (
-            ExitEvent::NmiWindowInjected,
-            ExitState {
-                nmis_injected: 1,
-                ..WAITING
-            }
-        ),
+        (ExitEvent::NmiWindowInjected, WAITING)
     );
 }
 
@@ -395,17 +379,13 @@ fn window_exit_without_a_pending_nmi_is_unexpected() {
 
 #[test]
 fn guest_nmi_handler_vmcall_resumes() {
-    let injected = ExitState {
-        nmis_injected: 1,
-        ..WAITING
-    };
     assert_eq!(
-        decide(injected, vmcall(NMI_MARKER)),
+        decide(WAITING, vmcall(NMI_MARKER)),
         (
             ExitEvent::GuestNmiHandler,
             ExitState {
                 nmis_handled: 1,
-                ..injected
+                ..WAITING
             }
         ),
     );
@@ -419,24 +399,6 @@ fn nmi_handler_vmcalls_saturate_their_count() {
         ..WAITING
     };
     assert_eq!(decide(full, vmcall(NMI_MARKER)), (ExitEvent::GuestNmiHandler, full));
-}
-
-#[test]
-fn injected_nmis_saturate_their_count() {
-    // A guest can send itself NMIs through its Local APIC, as often as it likes.
-    let full = ExitState {
-        nmis_injected: u32::MAX,
-        ..WAITING
-    };
-    assert_eq!(decide(full, nmi(0)), (ExitEvent::NmiInjected, full));
-    let pending = ExitState {
-        nmi_pending: true,
-        ..full
-    };
-    assert_eq!(
-        decide(pending, exit(EXIT_REASON_NMI_WINDOW)),
-        (ExitEvent::NmiWindowInjected, full)
-    );
 }
 
 #[test]
@@ -458,10 +420,8 @@ fn full_nmi_run_finishes_with_both_counts() {
         ExitState {
             main_vmcalls: 2,
             nmi_pending: false,
-            nmis_injected: 1,
             nmis_handled: 1,
             ept_writes_granted: 1,
-            emulated: EXPECTED_EMULATION,
         },
     );
 }
@@ -487,10 +447,8 @@ fn deferred_nmi_run_finishes_with_both_counts() {
         ExitState {
             main_vmcalls: 2,
             nmi_pending: false,
-            nmis_injected: 1,
             nmis_handled: 1,
             ept_writes_granted: 1,
-            emulated: EXPECTED_EMULATION,
         },
     );
 }
@@ -660,7 +618,6 @@ fn each_event_maps_to_its_action() {
             ..ResumePlan::PAST_INSTRUCTION
         })
     );
-    assert_eq!(ExitEvent::EmulationMissing.action(), ExitAction::Unexpected);
     assert_eq!(
         ExitEvent::GuestGeneralProtection.action(),
         ExitAction::Resume(ResumePlan::INJECT_GP)
@@ -679,17 +636,8 @@ fn each_event_maps_to_its_action() {
 }
 
 #[test]
-fn hlt_resumes_past_the_instruction_and_is_counted() {
-    let (event, state) = decide(START, exit(EXIT_REASON_HLT));
-    assert_eq!(event, ExitEvent::Halted);
-    assert_eq!(state.emulated.hlt, START.emulated.hlt + 1);
-    assert_eq!(
-        ExitState {
-            emulated: START.emulated,
-            ..state
-        },
-        START
-    );
+fn hlt_resumes_past_the_instruction() {
+    assert_eq!(decide(START, exit(EXIT_REASON_HLT)), (ExitEvent::Halted, START));
 }
 
 #[test]
@@ -725,21 +673,6 @@ fn injected_invalid_opcode_is_a_hardware_exception_without_error_code() {
     assert_eq!(InterruptionInfo::INVALID_OPCODE, InterruptionInfo(0x8000_0306));
     assert!(!InterruptionInfo::INVALID_OPCODE.delivers_error_code());
     assert!(InterruptionInfo::GENERAL_PROTECTION.delivers_error_code());
-}
-
-#[test]
-fn last_main_vmcall_without_the_hlt_is_emulation_missing() {
-    let no_hlt = ExitState {
-        emulated: EmulationCounts {
-            hlt: 0,
-            ..EXPECTED_EMULATION
-        },
-        ..WAITING
-    };
-    assert_eq!(
-        decide(no_hlt, vmcall(MARKER + 1)),
-        (ExitEvent::EmulationMissing, no_hlt)
-    );
 }
 
 #[test]
@@ -866,38 +799,24 @@ fn cpuid_exit_is_dispatched_to_emulation() {
 }
 
 #[test]
-fn last_main_vmcall_without_the_emulated_exits_is_emulation_missing() {
-    let unemulated = ExitState {
-        emulated: EmulationCounts::default(),
-        ..WAITING
-    };
-    assert_eq!(
-        decide(unemulated, vmcall(MARKER + 1)),
-        (ExitEvent::EmulationMissing, unemulated)
-    );
-}
-
-#[test]
-fn first_main_vmcall_does_not_check_the_emulated_exits() {
-    let unemulated = ExitState {
-        emulated: EmulationCounts::default(),
-        ..WRITTEN
-    };
-    assert_eq!(decide(unemulated, vmcall(MARKER)).0, ExitEvent::MainVmcall);
-}
-
-#[test]
-fn whole_guest_run_from_the_first_exit_finishes() {
+fn whole_guest_run_finishes_with_the_expected_stats() {
+    // As the exit handler counts: every exit, then what a resumed one did.
     let mut state = ExitState::default();
+    let mut stats = VcpuStats::ZERO;
     let mut event = ExitEvent::Unexpected;
     for exit in emulated_exits()
         .into_iter()
         .chain([protected_write(), vmcall(MARKER), vmcall(MARKER + 1)])
     {
+        stats.count_exit();
         (event, state) = decide(state, exit);
+        if let ExitAction::Resume(plan) = event.action() {
+            stats.count_resumed(event, plan);
+        }
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
-    assert_eq!(state.emulated, EXPECTED_EMULATION);
+    assert_eq!(stats, expected_stats(&stats));
+    assert_eq!((stats.exits, stats.nmi_injections), (13, 0));
 }
 
 #[test]
@@ -1011,8 +930,5 @@ fn an_nmi_in_root_operation_at_vmcall_1_reaches_the_guest() {
         }
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
-    assert_eq!(
-        (state.nmis_injected, state.nmis_handled, state.nmi_pending),
-        (1, 1, false)
-    );
+    assert_eq!((state.nmis_handled, state.nmi_pending), (1, false));
 }
