@@ -19,6 +19,8 @@
 //! and checks each result itself. A wrong one ends in `ud2` with
 //! [`GUEST_EMULATION_FAIL_MARKER`] in EAX. MSRs and ports it writes are real
 //! hardware, so it saves each one first and restores it afterwards. Then it
+//! moves its last variable MTRR to [`GUEST_MTRR_BASE`] and back, which
+//! reaches only Aleph0's copy of its MTRRs and the EPT memory types. Then it
 //! runs one `hlt` with IF = 0: only Aleph0 moving RIP past it lets the guest
 //! go on.
 //!
@@ -39,9 +41,12 @@ use core::ptr::NonNull;
 
 use uefi::boot::MemoryType;
 
+use super::cpuid::ADDRESS_SIZES;
 use super::cr::{self, read_cr4};
+use super::ept::SIZE_2M;
 use super::exit_decision::NMI_VECTOR;
 use super::msr::IA32_KERNEL_GS_BASE;
+use super::mtrr::{self, IA32_MTRR_PHYSBASE0, IA32_MTRRCAP, PHYSMASK_VALID};
 use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable, GATE_SIZE};
@@ -93,24 +98,34 @@ pub const GUEST_MSR_VALUE: u64 = 0x0000_7A1E_0000_0000;
 /// back. The guest puts the original back afterwards.
 pub const GUEST_IO_VALUE: u8 = 0xA5;
 
+/// Where the guest moves its last variable MTRR, making it UC: the 2 MiB
+/// region at 2 MiB. Every identity map reaches it (it spans at least 1 GiB),
+/// and UEFI allocates far above it, so nothing the guest runs on is there.
+/// With the range's mask for 2 MiB, EPT maps the region as one UC page;
+/// with its mask for 4 KiB, only the first page is UC, so the region takes
+/// a spare PT.
+pub const GUEST_MTRR_BASE: u64 = SIZE_2M;
+
 /// Value the guest loads into EAX before `ud2` when an emulated instruction
 /// returned the wrong value. The #UD exit (vector 6) stops the guest, and
 /// this marker in RAX on serial says why.
 pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 
 /// The exit statistics a finished run of the guest must end with, given the
-/// run's own (`actual`): one CPUID, two RDMSRs and two WRMSRs of
-/// IA32_KERNEL_GS_BASE, two INs and two OUTs of the COM1 scratch register,
-/// one HLT, and no exception injected. Bring-up compares the two once the
-/// guest has finished. The number of exits and of NMIs injected depend on
-/// whether an NMI arrived during the run, so they are taken from `actual`.
+/// run's own (`actual`): two CPUIDs (leaf 1 and the address sizes), two
+/// RDMSRs and two WRMSRs of IA32_KERNEL_GS_BASE, three RDMSRs and seven
+/// WRMSRs of its last variable MTRR, two INs and two OUTs of the COM1
+/// scratch register, one HLT, and no exception injected. Bring-up compares
+/// the two once the guest has finished. The number of exits and of NMIs
+/// injected depend on whether an NMI arrived during the run, so they are
+/// taken from `actual`.
 pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
     VcpuStats {
-        cpuid_exits: 1,
+        cpuid_exits: 2,
         msr_read_exits: 2,
         msr_write_exits: 2,
-        mtrr_read_exits: 0,
-        mtrr_write_exits: 0,
+        mtrr_read_exits: 3,
+        mtrr_write_exits: 7,
         io_in_exits: 2,
         io_out_exits: 2,
         halt_exits: 1,
@@ -166,6 +181,75 @@ guest_code_start:
     jne guest_emulation_failed
     mov al, sil
     out dx, al
+    // The MTRRs exit through the MSR bitmap; Aleph0 keeps a copy for the
+    // guest and never writes the CPU's. A PHYSMASK holds the address bits
+    // below MAXPHYADDR (CPUID.80000008H:EAX[7:0]): R10 = those bits.
+    mov eax, {address_sizes}
+    cpuid
+    mov ecx, eax
+    mov r10d, 1
+    shl r10, cl
+    dec r10
+    // IA32_MTRRCAP is not intercepted: AL is the number of variable ranges.
+    // Take the last one, ECX = its PHYSBASE, and save its pair in R8D:R9D
+    // and R11D:R12D.
+    mov ecx, {mtrrcap}
+    rdmsr
+    movzx ecx, al
+    lea ecx, [rcx + rcx + {physbase0} - 2]
+    rdmsr
+    mov r8d, eax
+    mov r9d, edx
+    inc ecx
+    rdmsr
+    mov r11d, eax
+    mov r12d, edx
+    // Turn the range off before moving it, as an OS does, then give it
+    // GUEST_MTRR_BASE and type UC. EDX stays 0 for both writes.
+    xor eax, eax
+    xor edx, edx
+    wrmsr
+    dec ecx
+    mov eax, {mtrr_base_uc}
+    wrmsr
+    // Turn it on for 2 MiB: EPT maps the region as one UC page.
+    inc ecx
+    mov r13, r10
+    and r13, -{two_mib}
+    or r13, {physmask_valid}
+    mov eax, r13d
+    mov rdx, r13
+    shr rdx, 32
+    wrmsr
+    // The copy reads back what was written.
+    xor eax, eax
+    xor edx, edx
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    cmp rax, r13
+    jne guest_emulation_failed
+    // Only 4 KiB: the region's pages now differ, so it takes a spare PT.
+    mov r13, r10
+    and r13, -{page_size}
+    or r13, {physmask_valid}
+    mov eax, r13d
+    mov rdx, r13
+    shr rdx, 32
+    wrmsr
+    // Put the pair back: off, base, mask. The region is one WB page again,
+    // and its PT goes back to the spare ones.
+    xor eax, eax
+    xor edx, edx
+    wrmsr
+    dec ecx
+    mov eax, r8d
+    mov edx, r9d
+    wrmsr
+    inc ecx
+    mov eax, r11d
+    mov edx, r12d
+    wrmsr
     // HLT exits (HLT exiting is on). IF = 0, so no interrupt could ever end
     // the halt: the guest goes on only because Aleph0 resumes past it.
     hlt
@@ -233,6 +317,13 @@ guest_code_end:
     msr_high = const (GUEST_MSR_VALUE >> 32) as u32,
     scratch_port = const GUEST_SCRATCH_PORT,
     io_value = const GUEST_IO_VALUE,
+    address_sizes = const ADDRESS_SIZES,
+    mtrrcap = const IA32_MTRRCAP,
+    physbase0 = const IA32_MTRR_PHYSBASE0,
+    mtrr_base_uc = const GUEST_MTRR_BASE | mtrr::MemoryType::Uncacheable as u64,
+    two_mib = const SIZE_2M,
+    page_size = const PAGE_SIZE,
+    physmask_valid = const PHYSMASK_VALID,
 );
 
 unsafe extern "C" {

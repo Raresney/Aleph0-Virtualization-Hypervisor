@@ -6,8 +6,8 @@ use core::arch::x86_64::__cpuid;
 const EXTENDED_MAX: u32 = 0x8000_0000;
 /// CPUID leaf of the extended feature flags.
 const EXTENDED_FEATURES: u32 = 0x8000_0001;
-/// CPUID leaf of the address sizes.
-const ADDRESS_SIZES: u32 = 0x8000_0008;
+/// CPUID leaf of the address sizes: EAX bits 7:0 are MAXPHYADDR.
+pub const ADDRESS_SIZES: u32 = 0x8000_0008;
 /// MAXPHYADDR when CPUID lacks [`ADDRESS_SIZES`]: 36 on a CPU with PAE,
 /// which every 64-bit one has (Intel SDM Vol. 3A, "Physical Address
 /// Size").

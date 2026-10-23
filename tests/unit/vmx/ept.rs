@@ -6,9 +6,10 @@
 
 use super::level::{Pd, Pdpt, Pml4, Pt};
 use super::*;
+use crate::vmx::guest::GUEST_MTRR_BASE;
 use crate::vmx::mtrr::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteProtected as WP};
-use crate::vmx::mtrr::MtrrCapabilities;
 use crate::vmx::mtrr::tests::{enabled, enabled_with_fixed, pc_fixed, range};
+use crate::vmx::mtrr::{MtrrCapabilities, MtrrRegisters, MtrrState};
 
 /// A secondary capability MSR that allows EPT and nothing else.
 const EPT_ALLOWED: ControlCapability = ControlCapability((SECONDARY_ENABLE_EPT as u64) << 32);
@@ -674,4 +675,43 @@ fn the_span_runs_from_the_first_changed_region_to_the_last() {
     ]));
     assert_eq!(retyped.regions, 2);
     assert_eq!(retyped.span, Some((SIZE_2M, 0x4020_0000)));
+}
+
+#[test]
+fn the_test_guests_mtrr_writes_retype_the_region_at_2_mib_and_put_it_back() {
+    // Hyper-V's MTRRs (docs/MTRR.md section 6): default UC, the fixed
+    // ranges WB below 0xA0000 and UC above, range 0 the first 4 GiB WB.
+    let capabilities = MtrrCapabilities::new((1 << 8) | 8, 46).unwrap();
+    let registers = MtrrRegisters::read_with(capabilities, |msr| match msr.address() {
+        0x2FF => 0xC00,
+        0x250 | 0x258 => 0x0606_0606_0606_0606,
+        0x200 => 6,
+        0x201 => 0x3FFF_0000_0800,
+        _ => 0,
+    })
+    .unwrap();
+    let mut state = MtrrState::new(registers).unwrap();
+    let mut map = TypeMap::new(state.mtrrs(), spare_pts(capabilities));
+    let built = TypeMap::new(state.mtrrs(), spare_pts(capabilities));
+    // The guest's WRMSRs to its last variable range (7), in order: whether
+    // they change any type, and how the region at 2 MiB is mapped after.
+    for (address, value, changed, mapping) in [
+        (0x20F, 0, false, RegionMapping::LargePage(WB)),
+        (0x20E, GUEST_MTRR_BASE, false, RegionMapping::LargePage(WB)),
+        (0x20F, 0x3FFF_FFE0_0800, true, RegionMapping::LargePage(UC)),
+        (0x20F, 0x3FFF_FFFF_F800, true, RegionMapping::Pt),
+        (0x20F, 0, true, RegionMapping::LargePage(WB)),
+        (0x20E, 0, false, RegionMapping::LargePage(WB)),
+        (0x20F, 0, false, RegionMapping::LargePage(WB)),
+    ] {
+        let msr = capabilities.msr(address).unwrap();
+        assert_eq!(state.write(msr, value), Ok(changed), "{msr} <- {value:#x}");
+        if changed {
+            let retyped = map.retype(state.mtrrs());
+            assert_eq!(retyped.span, Some((SIZE_2M, 2 * SIZE_2M)), "{msr} <- {value:#x}");
+        }
+        assert_eq!(map.pds[1].mapping(), mapping, "{msr} <- {value:#x}");
+    }
+    // As bring-up built it: the PT the 4 KiB range took is spare again.
+    assert_eq!((map.pds, map.free_len), (built.pds, built.free_len));
 }

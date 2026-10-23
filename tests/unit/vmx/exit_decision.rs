@@ -8,7 +8,7 @@
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
 use crate::vmx::guest::{
-    GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_NMI_MARKER,
+    GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_MTRR_BASE, GUEST_NMI_MARKER,
     GUEST_SCRATCH_PORT, expected_stats,
 };
 use crate::vmx::mtrr::MtrrCapabilities;
@@ -769,6 +769,14 @@ fn emulated_exits() -> Vec<ExitInfo> {
         guest_rax: rax,
         ..exit(EXIT_REASON_IO_INSTRUCTION)
     };
+    // Hyper-V's MTRRs: fixed ranges, eight variable ranges, MAXPHYADDR 46.
+    let mtrr = |basic, msr: u32, value: u64| ExitInfo {
+        guest_rax: value & 0xFFFF_FFFF,
+        guest_rcx: msr.into(),
+        guest_rdx: value >> 32,
+        mtrr: MtrrCapabilities::new((1 << 8) | 8, 46).unwrap(),
+        ..exit(basic)
+    };
     vec![
         ExitInfo {
             guest_rax: 1,
@@ -783,6 +791,23 @@ fn emulated_exits() -> Vec<ExitInfo> {
         io(false, GUEST_IO_VALUE.into()),
         io(true, 0),
         io(false, 0),
+        ExitInfo {
+            guest_rax: 0x8000_0008,
+            ..exit(EXIT_REASON_CPUID)
+        },
+        // Its last variable MTRR, number 7 under Hyper-V: read the pair,
+        // turn it off, move it, 2 MiB, read the mask back, 4 KiB, then off
+        // and back as it was.
+        mtrr(EXIT_REASON_RDMSR, 0x20E, 0),
+        mtrr(EXIT_REASON_RDMSR, 0x20F, 0),
+        mtrr(EXIT_REASON_WRMSR, 0x20F, 0),
+        mtrr(EXIT_REASON_WRMSR, 0x20E, GUEST_MTRR_BASE),
+        mtrr(EXIT_REASON_WRMSR, 0x20F, 0x3FFF_FFE0_0800),
+        mtrr(EXIT_REASON_RDMSR, 0x20F, 0),
+        mtrr(EXIT_REASON_WRMSR, 0x20F, 0x3FFF_FFFF_F800),
+        mtrr(EXIT_REASON_WRMSR, 0x20F, 0),
+        mtrr(EXIT_REASON_WRMSR, 0x20E, 0),
+        mtrr(EXIT_REASON_WRMSR, 0x20F, 0),
         exit(EXIT_REASON_HLT),
     ]
 }
@@ -818,7 +843,7 @@ fn whole_guest_run_finishes_with_the_expected_stats() {
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!(stats, expected_stats(&stats));
-    assert_eq!((stats.exits, stats.nmi_injections), (13, 0));
+    assert_eq!((stats.exits, stats.nmi_injections), (24, 0));
 }
 
 #[test]

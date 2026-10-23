@@ -47,7 +47,7 @@ const DEF_TYPE_ENABLE: u64 = 1 << 11;
 /// `0x200 + 2n` and its PHYSMASK right after.
 pub const IA32_MTRR_PHYSBASE0: u32 = 0x200;
 /// PHYSMASK bit 11: the range is in use.
-const PHYSMASK_VALID: u64 = 1 << 11;
+pub const PHYSMASK_VALID: u64 = 1 << 11;
 /// Bits 7:0 of IA32_MTRR_DEF_TYPE and of a PHYSBASE: a memory type.
 const TYPE_BITS: u64 = 0xFF;
 /// Bits 51:12 of a PHYSBASE or PHYSMASK: the address part. Bits above the
