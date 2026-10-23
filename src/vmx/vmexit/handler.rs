@@ -30,16 +30,16 @@ use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, Emulation, ExitAction, ExitEvent,
-    ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, ResumePlan, UNREADABLE_REASON,
+    ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON,
     after_skipped_instruction, cpuid_policy, decide, is_canonical_48, merge_in,
 };
 use crate::vmx::host;
 use crate::vmx::instruction::VmxFail;
 use crate::vmx::msr;
 use crate::vmx::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, IDT_VECTORING_INFO,
-    VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO,
-    VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, IDT_VECTORING_ERROR_CODE,
+    IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO,
+    VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
 use crate::vmx::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
@@ -273,6 +273,9 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     } else {
         Some(qualification.unwrap_or(0))
     };
+    // Meaningful only when idt_vectoring is valid and carries an error code;
+    // 0 otherwise, so an unreadable field never stops an exit that ignores it.
+    let idt_vectoring_error_code = read_field(IDT_VECTORING_ERROR_CODE).unwrap_or(0) as u32;
     // Meaningful only for EPT exits; decide never looks at it otherwise.
     let guest_physical_for_decide = guest_physical.map_or(Some(0), Result::ok);
     let exit = match (
@@ -292,7 +295,8 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
                 guest_rdx: frame.rdx,
                 interruptibility: blocking as u32,
                 // IDT_VECTORING_INFO has the interruption-information layout.
-                idt_vectoring_valid: InterruptionInfo(vectoring as u32).is_valid(),
+                idt_vectoring: InterruptionInfo(vectoring as u32),
+                idt_vectoring_error_code,
                 qualification,
                 guest_physical,
                 protected_page: protected.map_or(0, |page| page.gpa),
@@ -365,9 +369,22 @@ fn carry_out(event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut Reg
     match event.action() {
         ExitAction::Resume(plan) => {
             let plan = plan.keeping_pending_nmi(next);
-            match prepare_resume(read, plan, frame) {
-                Ok(resumed) => Outcome::Resumed { plan, resumed },
-                Err(failure) => Outcome::ResumeFailed(failure),
+            // Re-deliver an event this exit interrupted mid-delivery. The plan
+            // refuses when it would also advance RIP or inject its own event,
+            // since only one event is injected per VM entry.
+            let plan = match read
+                .exit
+                .and_then(|exit| exit.redelivery(read.length.ok().map(|length| length as u32)))
+            {
+                Some(redelivery) => plan.redelivering(redelivery),
+                None => Some(plan),
+            };
+            match plan {
+                Some(plan) => match prepare_resume(read, plan, frame) {
+                    Ok(resumed) => Outcome::Resumed { plan, resumed },
+                    Err(failure) => Outcome::ResumeFailed(failure),
+                },
+                None => Outcome::ResumeFailed(ResumeFailure::RedeliveryConflict),
             }
         }
         stop => Outcome::Stopped(stop),
@@ -541,6 +558,11 @@ pub(super) enum ResumeFailure {
     NoProtectedPage,
     /// INVEPT failed after the protected page was made writable.
     GrantWrite(VmxFail),
+    /// The exit interrupted an event's delivery, but this exit's plan already
+    /// advances RIP or injects its own event, so the event cannot be
+    /// re-delivered: only one event is injected per VM entry. (A software
+    /// event whose instruction length is unreadable fails the same way.)
+    RedeliveryConflict,
 }
 
 impl fmt::Display for ResumeFailure {
@@ -552,6 +574,9 @@ impl fmt::Display for ResumeFailure {
             Self::Write { what, error } => write!(f, "could not {what} ({error:?})"),
             Self::NoProtectedPage => f.write_str("no protected page to make writable"),
             Self::GrantWrite(error) => write!(f, "could not make the protected page writable (INVEPT {error:?})"),
+            Self::RedeliveryConflict => f.write_str(
+                "an interrupted event cannot be re-delivered while the exit advances RIP or injects its own event",
+            ),
         }
     }
 }
@@ -577,6 +602,7 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
         grant_write,
         emulate,
         inject_exception,
+        redeliver,
     } = plan;
     let rip = read.rip.map_err(|_| ResumeFailure::RipUnreadable)?;
     // Checked before the emulation: with the length unreadable or the new RIP
@@ -630,6 +656,14 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
             error,
         })?;
     }
+    if let Some(redelivery) = redeliver {
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current.
+        unsafe { write_redelivery(redelivery) }.map_err(|error| ResumeFailure::Write {
+            what: "queue the interrupted event for re-delivery",
+            error,
+        })?;
+    }
     if let Some(on) = nmi_window {
         // SAFETY: exit context: VMX root operation, with the guest's VMCS
         // current. `configure_controls` checked that the CPU allows
@@ -673,6 +707,27 @@ unsafe fn queue_exception(exception: InterruptionInfo) -> Result<(), VmcsError> 
             vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
         }
         vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, exception.0.into())
+    }
+}
+
+/// Queues the event `redelivery` describes for the next VM entry: its
+/// interruption info, its error code when it carries one, and its
+/// instruction length for a software interrupt or exception. The
+/// interruption-information field is written last, as for an injection.
+///
+/// # Safety
+///
+/// VMX root operation with the guest's VMCS current.
+unsafe fn write_redelivery(redelivery: Redelivery) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX root operation with a current VMCS.
+    unsafe {
+        if let Some(error_code) = redelivery.error_code {
+            vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, error_code.into())?;
+        }
+        if let Some(length) = redelivery.instruction_len {
+            vmcs::vmwrite(VM_ENTRY_INSTRUCTION_LEN, length.into())?;
+        }
+        vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, redelivery.info.0.into())
     }
 }
 

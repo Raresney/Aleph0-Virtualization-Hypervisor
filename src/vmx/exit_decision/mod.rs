@@ -250,6 +250,40 @@ impl InterruptionInfo {
     pub fn vector(self) -> Option<u8> {
         self.is_valid().then_some(self.0 as u8)
     }
+
+    /// The interruption type (bits 10:8).
+    const fn event_type(self) -> u32 {
+        (self.0 >> 8) & 0b111
+    }
+
+    /// Whether VM entry charges an instruction length for this event:
+    /// software interrupt (type 4), privileged software exception (5) and
+    /// software exception (6). The CPU then needs VM_ENTRY_INSTRUCTION_LEN to
+    /// land RIP past the INT/INT3/INTO it delivers.
+    pub fn needs_instruction_len(self) -> bool {
+        matches!(self.event_type(), 4..=6)
+    }
+
+    /// This field re-armed for VM entry from IDT_VECTORING_INFO: the valid
+    /// bit and the event kept, bits 30:12 cleared. Bit 12 (NMI unblocking
+    /// due to IRET) is an exit-only bit, undefined at entry, and bits 30:13
+    /// are reserved there.
+    pub fn for_reentry(self) -> Self {
+        Self(self.0 & !0x7FFF_F000)
+    }
+}
+
+/// An event the VM exit interrupted mid-delivery, to re-deliver at the next
+/// VM entry (from IDT_VECTORING_INFO; Intel SDM Vol. 3C, "Information for VM
+/// Exits During Event Delivery" and "Event Injection").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Redelivery {
+    /// VM_ENTRY_INTERRUPTION_INFO: the interrupted event, re-armed for entry.
+    pub info: InterruptionInfo,
+    /// VM_ENTRY_EXCEPTION_ERROR_CODE, when the event carries one (bit 11).
+    pub error_code: Option<u32>,
+    /// VM_ENTRY_INSTRUCTION_LEN, for a software interrupt or exception.
+    pub instruction_len: Option<u32>,
 }
 
 /// What the handler read about the current exit.
@@ -268,9 +302,12 @@ pub struct ExitInfo {
     pub guest_rdx: u64,
     /// GUEST_INTERRUPTIBILITY_STATE.
     pub interruptibility: u32,
-    /// IDT_VECTORING_INFO bit 31: the exit interrupted an event's delivery
-    /// through the guest IDT.
-    pub idt_vectoring_valid: bool,
+    /// IDT_VECTORING_INFO: when valid (bit 31), the exit interrupted the
+    /// delivery of this event through the guest IDT, and it is re-delivered.
+    pub idt_vectoring: InterruptionInfo,
+    /// IDT_VECTORING_ERROR_CODE, meaningful when `idt_vectoring` is valid and
+    /// delivers an error code.
+    pub idt_vectoring_error_code: u32,
     /// EXIT_QUALIFICATION. Its layout depends on the reason; [`decide`]
     /// reads it for EPT violations ([`EptQualification`]) and I/O
     /// instructions (`emulation::IoQualification`) only. `read_exit` keeps
@@ -284,6 +321,24 @@ pub struct ExitInfo {
     pub guest_physical: u64,
     /// GPA of the page EPT maps read-only (`ept::protected_page`), 0 if none.
     pub protected_page: u64,
+}
+
+impl ExitInfo {
+    /// The event this exit interrupted mid-delivery, to re-deliver at the
+    /// next VM entry, or `None` when the exit interrupted no delivery.
+    /// `instruction_len` is VM_EXIT_INSTRUCTION_LEN, needed only for a
+    /// software interrupt or exception; `None` when it was unreadable.
+    pub fn redelivery(&self, instruction_len: Option<u32>) -> Option<Redelivery> {
+        if !self.idt_vectoring.is_valid() {
+            return None;
+        }
+        let info = self.idt_vectoring.for_reentry();
+        Some(Redelivery {
+            info,
+            error_code: info.delivers_error_code().then_some(self.idt_vectoring_error_code),
+            instruction_len: info.needs_instruction_len().then_some(instruction_len).flatten(),
+        })
+    }
 }
 
 /// What the handler remembers between exits: the NMI waiting for the guest,
@@ -333,9 +388,6 @@ pub enum ExitEvent {
     NmiDeferred,
     /// The NMI window opened: inject the pending NMI.
     NmiWindowInjected,
-    /// The exit interrupted an event's delivery; re-delivering it is not
-    /// handled.
-    InterruptedDelivery,
     /// The guest wrote its protected data page: grant write and retry the
     /// write.
     EptWriteGranted,
@@ -382,6 +434,11 @@ pub struct ResumePlan {
     /// Write this exception to VM_ENTRY_INTERRUPTION_INFO, with error code 0
     /// when it delivers one. RIP stays on the faulting instruction.
     pub inject_exception: Option<InterruptionInfo>,
+    /// Re-deliver an event the exit interrupted mid-delivery, by writing its
+    /// VM-entry fields. Never set together with `advance_rip`, `inject_nmi`
+    /// or `inject_exception`: only one event is injected per entry
+    /// ([`ResumePlan::redelivering`]).
+    pub redeliver: Option<Redelivery>,
 }
 
 impl ResumePlan {
@@ -393,6 +450,7 @@ impl ResumePlan {
         grant_write: false,
         emulate: None,
         inject_exception: None,
+        redeliver: None,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -405,6 +463,7 @@ impl ResumePlan {
         grant_write: false,
         emulate: None,
         inject_exception: None,
+        redeliver: None,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -415,6 +474,7 @@ impl ResumePlan {
         grant_write: false,
         emulate: None,
         inject_exception: None,
+        redeliver: None,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -425,6 +485,7 @@ impl ResumePlan {
         grant_write: true,
         emulate: None,
         inject_exception: None,
+        redeliver: None,
     };
     /// Inject #GP(0); RIP stays on the faulting instruction, as for any
     /// fault.
@@ -435,6 +496,7 @@ impl ResumePlan {
         grant_write: false,
         emulate: None,
         inject_exception: Some(InterruptionInfo::GENERAL_PROTECTION),
+        redeliver: None,
     };
     /// Inject #UD; RIP stays on the faulting instruction.
     pub const INJECT_UD: Self = Self {
@@ -458,6 +520,27 @@ impl ResumePlan {
         } else {
             self
         }
+    }
+
+    /// This plan with `redelivery` added, or `None` when it cannot be added
+    /// and the guest must stop.
+    ///
+    /// Only one event is injected per VM entry, so a plan that advances RIP
+    /// or injects an NMI or an exception of its own cannot also re-deliver
+    /// one: stop (no double-fault synthesis yet). A software interrupt or
+    /// exception also needs VM_ENTRY_INSTRUCTION_LEN, so an unreadable length
+    /// stops too.
+    pub fn redelivering(self, redelivery: Redelivery) -> Option<Self> {
+        if self.advance_rip || self.inject_nmi || self.inject_exception.is_some() {
+            return None;
+        }
+        if redelivery.info.needs_instruction_len() && redelivery.instruction_len.is_none() {
+            return None;
+        }
+        Some(Self {
+            redeliver: Some(redelivery),
+            ..self
+        })
     }
 }
 
@@ -501,9 +584,7 @@ impl ExitEvent {
             Self::Halted => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
             Self::GuestInvalidOpcode => ExitAction::Resume(ResumePlan::INJECT_UD),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::InterruptedDelivery | Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => {
-                ExitAction::Unexpected
-            }
+            Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => ExitAction::Unexpected,
         }
     }
 }
@@ -511,14 +592,14 @@ impl ExitEvent {
 /// Decides what `exit` is, given what happened before (`state`), and
 /// returns the event with the state for the next exit.
 ///
-/// A VM-entry failure or an interrupted delivery is never handled, whatever
-/// the reason. Every other exit goes to the handler for its reason.
+/// A VM-entry failure is never handled, whatever the reason. Every other
+/// exit goes to the handler for its reason. An exit that interrupted an
+/// event's delivery (`exit.idt_vectoring` valid) is still judged by its
+/// reason; the handler re-delivers the event with the plan's `redeliver`
+/// (built by [`ExitInfo::redelivery`] and [`ResumePlan::redelivering`]).
 pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
-    }
-    if exit.idt_vectoring_valid {
-        return (ExitEvent::InterruptedDelivery, state);
     }
     match exit.reason.basic {
         EXIT_REASON_CPUID => (emulation::cpuid(&exit), state),

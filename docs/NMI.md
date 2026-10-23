@@ -183,7 +183,7 @@ their own in `emulation.rs` and are not in this table
 | Exit | Condition | Event | Action |
 |---|---|---|---|
 | any | VM-entry failure | `Unexpected` | stop |
-| any | IDT-vectoring info valid (the exit interrupted an event's delivery) | `InterruptedDelivery` | stop |
+| any | IDT-vectoring info valid (the exit interrupted an event's delivery) | the reason's own event | re-deliver the event on top of the plan (section 8) |
 | reason 0, NMI | no STI/MOV SS/NMI blocking | `NmiInjected` | inject, RIP unchanged, window off |
 | reason 0, NMI | some blocking | `NmiDeferred` | NMI pending, window on |
 | reason 8 | NMI pending, still blocked (STI) | `NmiDeferred` | keep waiting |
@@ -277,9 +277,20 @@ with `rcx = 0`: the loop ran out.
   would run to end the STI shadow, so it would loop. Today's guest never
   executes STI (IF = 0). Before an OS guest (`sti; hlt`), bound the deferrals
   or inject once STI is the only blocker.
-- **Interrupted delivery.** An exit with IDT-vectoring info valid (an event
-  cut off while being delivered) stops the guest instead of re-delivering
-  the event.
+- **Interrupted delivery** is now re-delivered. An exit whose IDT-vectoring
+  info is valid interrupted an event the CPU was delivering through the
+  guest IDT. `decide` judges the exit by its reason as usual; the handler
+  then re-delivers the interrupted event by writing it to the VM-entry
+  fields (`VM_ENTRY_INTERRUPTION_INFO` with bits 30:12 cleared, the error
+  code when bit 11 is set, and the instruction length for a software
+  interrupt or exception), with RIP left where it is. Only one event is
+  injected per VM entry, so a plan that advances RIP or injects its own
+  event cannot also re-deliver one: the guest stops (no double-fault
+  synthesis yet). The test guest's case is the reinjected NMI whose delivery
+  faults on the read-only data page: an EPT violation that grants write and
+  re-delivers the NMI. The remaining pieces of this (the STI window above,
+  NMI blocking after a fault in IRET, external-interrupt passthrough) are
+  tracked in issue #26.
 - **Ordinary interrupts.** External-interrupt exiting comes with an OS guest
   that runs with IF = 1.
 

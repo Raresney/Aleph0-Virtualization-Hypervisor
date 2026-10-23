@@ -280,9 +280,6 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::GuestInvalidOpcode => crate::serial_println!(
             "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
         ),
-        ExitEvent::InterruptedDelivery => crate::serial_println!(
-            "{tag} VM exit #{number}: the exit interrupted an event's delivery through the guest IDT; Aleph0 does not re-deliver it."
-        ),
         ExitEvent::Unexpected => crate::serial_println!(
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),
