@@ -6,6 +6,10 @@
 //! only for ports whose bit is set. Everything else reaches the hardware
 //! directly. That is a correct passthrough even for MSRs whose guest value
 //! is a VMCS field: while the guest runs, the CPU holds the guest's value.
+//! It keeps the guest's value away from Aleph0 only where VM exit loads the
+//! host's back: IA32_PAT when the CPU allows the controls that switch it
+//! (`vmcs::configure_controls`), but not IA32_EFER yet, whose bits other
+//! than LME and LMA stay as the guest wrote them.
 //!
 //! ```text
 //! MSR bitmap, one 4 KiB page (Intel SDM Vol. 3C, "MSR-Bitmap Address"):

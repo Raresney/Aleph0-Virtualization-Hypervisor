@@ -258,6 +258,16 @@ whose guest value is a VMCS field (IA32_GS_BASE, IA32_EFER, IA32_PAT,
 IA32_SYSENTER_*): while the guest runs, the CPU holds the guest's value, so
 the guest reads and writes its own.
 
+That is correct for the guest. For Aleph0 it is safe only where VM exit
+loads the host's value back. The SYSENTER MSRs and the FS and GS bases
+always are (`HOST_*` fields). IA32_PAT is when the CPU allows "save
+IA32_PAT" and "load IA32_PAT" on VM exit and "load IA32_PAT" on VM entry,
+which `configure_controls` then turns on (`vmcs::pat_switch`): otherwise a
+guest that made PAT entry 0 UC or WC would set the memory type of every one
+of Aleph0's accesses, whose page tables select that entry. IA32_EFER is not
+switched yet: its bits other than LME and LMA stay as the guest wrote them
+([HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md) section 9).
+
 ### The trap: emulating an MSR the VMCS holds
 
 An *intercepted* MSR is different. Aleph0 emulates it with a real

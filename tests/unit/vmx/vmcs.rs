@@ -5,6 +5,7 @@
 //! private items.
 
 use super::*;
+use crate::vmx::msr::ControlCapability;
 
 #[test]
 fn an_unsupported_control_is_a_vmcs_error() {
@@ -113,4 +114,35 @@ fn a_guest_with_its_own_idt_takes_its_own_exceptions() {
         DesiredControls::minimal_64_bit_guest(GuestKind::OwnIdt).exception_bitmap,
         0
     );
+}
+
+/// Capability MSRs that allow exactly the VM-exit controls `exit` and the
+/// VM-entry controls `entry`, and require none.
+fn allowing(exit: u32, entry: u32) -> VmcsControlMsrs {
+    VmcsControlMsrs {
+        basic: 0,
+        pinbased: ControlCapability(0),
+        primary: ControlCapability(0),
+        exit: ControlCapability(u64::from(exit) << 32),
+        entry: ControlCapability(u64::from(entry) << 32),
+        secondary: ControlCapability(0),
+        ept_vpid_cap: 0,
+    }
+}
+
+#[test]
+fn the_pat_is_switched_when_the_cpu_allows_all_three_controls() {
+    // Exit bits 18 (save IA32_PAT) and 19 (load IA32_PAT), entry bit 14
+    // (load IA32_PAT).
+    let save_and_load = (1 << 18) | (1 << 19);
+    assert_eq!(pat_switch(&allowing(save_and_load, 1 << 14)), (save_and_load, 1 << 14));
+    // With any one missing, none: the guest's writes would be lost at VM
+    // entry, or one PAT would still serve both.
+    for (exit, entry) in [(1 << 19, 1 << 14), (1 << 18, 1 << 14), (save_and_load, 0)] {
+        assert_eq!(
+            pat_switch(&allowing(exit, entry)),
+            (0, 0),
+            "exit={exit:#x} entry={entry:#x}"
+        );
+    }
 }
