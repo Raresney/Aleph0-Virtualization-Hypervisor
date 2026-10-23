@@ -40,6 +40,32 @@ use crate::vmx::msr::rdmsr;
 /// part is bits 51:12.
 const MAX_PHYSICAL_ADDRESS_BITS: u8 = 52;
 
+/// Just past the PHYSMASK of variable range [`MAX_VARIABLE_RANGES`] - 1:
+/// 0x240.
+const VARIABLE_END: u32 = IA32_MTRR_PHYSBASE0 + 2 * MAX_VARIABLE_RANGES as u32;
+
+/// Every address an MTRR MSR has on some CPU, whether or not this one has
+/// it: IA32_MTRR_DEF_TYPE, the fixed-range MSRs, and PHYSBASEn and
+/// PHYSMASKn of the first [`MAX_VARIABLE_RANGES`] variable ranges
+/// (0x200..0x240).
+///
+/// The MSR bitmap intercepts all of them (`exit_bitmaps`), and the guest
+/// gets #GP for those the CPU lacks ([`MtrrCapabilities::msr`] is `None`),
+/// as it would on bare metal. So whether the guest reaches a real MTRR
+/// never depends on IA32_MTRRCAP counting every one the CPU has.
+pub fn every_msr_address() -> impl Iterator<Item = u32> {
+    core::iter::once(IA32_MTRR_DEF_TYPE)
+        .chain(FIXED_RANGES.iter().map(|&(msr, ..)| msr))
+        .chain(IA32_MTRR_PHYSBASE0..VARIABLE_END)
+}
+
+/// Whether `address` is one of [`every_msr_address`].
+pub fn is_msr_address(address: u32) -> bool {
+    address == IA32_MTRR_DEF_TYPE
+        || FIXED_RANGES.iter().any(|&(msr, ..)| msr == address)
+        || (IA32_MTRR_PHYSBASE0..VARIABLE_END).contains(&address)
+}
+
 /// What IA32_MTRRCAP and CPUID say about the MTRR MSRs: which of them
 /// exist, and which bits of a PHYSBASE or PHYSMASK are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

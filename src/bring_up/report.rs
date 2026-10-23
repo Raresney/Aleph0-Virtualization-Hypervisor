@@ -183,7 +183,8 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
 }
 
 /// Prints where the exit bitmaps are and what they intercept: the MSRs
-/// passed through, the MTRR MSRs `mtrr` lists, and the ports.
+/// passed through, every MTRR address, of which the guest's copy holds
+/// those `mtrr` lists, and the ports.
 pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, mtrr: MtrrCapabilities) {
     log!(
         "Exit bitmaps allocated: MSR={:#018x} I/O A={:#018x} I/O B={:#018x}.",
@@ -192,12 +193,14 @@ pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, mtrr: MtrrCapabilities) {
         bitmaps.io_b_address(),
     );
     log!("Intercepted MSRs (read and write): {INTERCEPTED_MSRS:x?}; intercepted ports: {INTERCEPTED_PORTS:x?}.");
+    let addresses = vmx::mtrr::every_msr_address().count();
     match mtrr.msrs().count() {
-        0 => log!("No MTRR MSRs to intercept: the CPU has no MTRRs."),
+        0 => log!("Intercepted MTRR addresses (read and write): all {addresses}, which get #GP: the CPU has no MTRRs."),
         count => log!(
-            "Intercepted MTRR MSRs (read and write), which the guest reads and writes in a copy: IA32_MTRR_DEF_TYPE, {} fixed-range MSRs and {} variable ranges ({count} MSRs).",
+            "Intercepted MTRR addresses (read and write): all {addresses}. The guest reads and writes a copy of the {count} MSRs the CPU has (IA32_MTRR_DEF_TYPE, {} fixed-range MSRs and {} variable ranges); the other {} get #GP.",
             if mtrr.fixed() { vmx::mtrr::FIXED_MSRS } else { 0 },
             mtrr.variable_count(),
+            addresses - count,
         ),
     }
 }

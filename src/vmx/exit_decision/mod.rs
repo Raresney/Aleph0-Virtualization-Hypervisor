@@ -408,8 +408,8 @@ pub enum ExitEvent {
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
     /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
-    /// bitmap, a non-canonical value for an intercepted one, or a value its
-    /// MTRRs would refuse.
+    /// bitmap, an MTRR address the CPU has no MSR at, a non-canonical value
+    /// for an intercepted MSR, or a value its MTRRs would refuse.
     GuestGeneralProtection,
     /// HLT: resume past it at once. The guest's next instruction runs as if
     /// an interrupt had woken it.

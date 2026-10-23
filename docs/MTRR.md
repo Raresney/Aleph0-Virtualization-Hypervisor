@@ -263,13 +263,19 @@ of them reaches the CPU. That causes two problems:
 Aleph0 now keeps a copy of the MTRRs for the guest, and never writes the
 CPU's. KVM does the same per vCPU (`vcpu->arch.mtrr_state`).
 
-- The MSR bitmap intercepts RDMSR and WRMSR of every MTRR MSR the CPU has:
-  `IA32_MTRR_DEF_TYPE`, the 11 fixed-range MSRs if `IA32_MTRRCAP` says they
-  exist, and the PHYSBASE/PHYSMASK pair of each variable range it counts
-  (`ExitBitmaps::allocate`, from `MtrrCapabilities::msrs`). Under Hyper-V
-  that is 28 MSRs. `IA32_MTRRCAP` itself is read-only and stays the
-  guest's: RDMSR of it does not exit to Aleph0, and WRMSR faults as on bare
-  metal.
+- The MSR bitmap intercepts RDMSR and WRMSR of every address an MTRR MSR
+  can have (`mtrr::every_msr_address`): `IA32_MTRR_DEF_TYPE`, the 11
+  fixed-range MSRs, and the PHYSBASE/PHYSMASK pairs of the 32 variable
+  ranges Aleph0 can keep (`0x200..0x240`), 76 addresses. The copy holds
+  those the CPU has (`MtrrCapabilities::msrs`): `IA32_MTRR_DEF_TYPE`, the
+  fixed-range MSRs if `IA32_MTRRCAP` says they exist, and one pair per
+  variable range it counts, 28 MSRs under Hyper-V. The guest gets #GP for
+  the others, as a CPU without them gives. Intercepting only the MSRs the
+  CPU has would pass the others through to the CPU: safe only as long as
+  `IA32_MTRRCAP` counts every MTRR the CPU (or the VMM below Aleph0)
+  implements, which nothing checks. `IA32_MTRRCAP` itself is read-only and
+  stays the guest's: RDMSR of it does not exit to Aleph0, and WRMSR faults
+  as on bare metal.
 - The copy starts as the CPU's MTRRs, read at bring-up, and lives in exit
   context (`vmexit/guest_mtrrs.rs`), like the vCPU's statistics.
 - **RDMSR** reads the copy, so the guest reads back what it wrote.
@@ -285,6 +291,7 @@ CPU's. KVM does the same per vCPU (`vcpu->arch.mtrr_state`).
 | an MTRR MSR the CPU has, RDMSR | the copy | `Emulated(MtrrRead)` |
 | an MTRR MSR the CPU has, WRMSR of a value the CPU takes | the copy, then EPT | `Emulated(MtrrWrite)` |
 | an MTRR MSR the CPU has, WRMSR of a value the CPU refuses | #GP(0), copy unchanged | `GuestGeneralProtection` |
+| an MTRR address the CPU has no MSR at, RDMSR or WRMSR | #GP(0) | `GuestGeneralProtection` |
 
 ### 7.3 What WRMSR refuses
 
@@ -378,7 +385,7 @@ Bring-up adds a line for the intercepted MSRs, and the spare PTs to the
 
 ```text
 EPT built: identity 0x0..0x80000000 (2 GiB), 15 table pages, 2 of them PTs for 2 MiB regions mapped in 4 KiB pages and 9 spare PTs for the guest's MTRR writes; data page ... read-only (R=1 W=0 X=0).
-Intercepted MTRR MSRs (read and write), which the guest reads and writes in a copy: IA32_MTRR_DEF_TYPE, 11 fixed-range MSRs and 8 variable ranges (28 MSRs).
+Intercepted MTRR addresses (read and write): all 76. The guest reads and writes a copy of the 28 MSRs the CPU has (IA32_MTRR_DEF_TYPE, 11 fixed-range MSRs and 8 variable ranges); the other 48 get #GP.
 ```
 
 The test guest moves its last variable range, range 7, to the 2 MiB at

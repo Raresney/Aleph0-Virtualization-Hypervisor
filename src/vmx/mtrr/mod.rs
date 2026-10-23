@@ -29,7 +29,7 @@ use super::page::PAGE_SIZE;
 
 mod registers;
 
-pub use registers::{MtrrCapabilities, MtrrMsr, MtrrRegisters, MtrrState, read};
+pub use registers::{MtrrCapabilities, MtrrMsr, MtrrRegisters, MtrrState, every_msr_address, is_msr_address, read};
 
 /// IA32_MTRRCAP: bits 7:0 count the variable ranges, bit 8 says the fixed
 /// ranges exist.

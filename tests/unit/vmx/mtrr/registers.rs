@@ -102,6 +102,32 @@ fn a_cpu_without_mtrrs_has_no_mtrr_msr() {
 fn mtrrcap_itself_is_not_among_the_msrs() {
     // Read-only: WRMSR to it always faults, and the guest reads the CPU's.
     assert!(hyper_v().msrs().all(|msr| msr.address() != IA32_MTRRCAP));
+    assert!(!is_msr_address(IA32_MTRRCAP));
+}
+
+#[test]
+fn every_mtrr_address_is_def_type_the_fixed_ones_and_32_pairs() {
+    let addresses: Vec<u32> = every_msr_address().collect();
+    assert_eq!(addresses.len(), 1 + 11 + 64);
+    assert_eq!(addresses[..2], [0x2FF, 0x250]);
+    assert_eq!(addresses[11..13], [0x26F, 0x200]);
+    assert_eq!(addresses.last(), Some(&0x23F));
+    // Exactly the addresses `is_msr_address` accepts, in the MSR bitmap's
+    // low range.
+    for address in 0..0x2000 {
+        assert_eq!(is_msr_address(address), addresses.contains(&address), "{address:#x}");
+    }
+}
+
+#[test]
+fn every_msr_a_cpu_can_have_is_an_mtrr_address() {
+    let widest = MtrrCapabilities::new((1 << 8) | MAX_VARIABLE_RANGES as u64, 52).unwrap();
+    assert_eq!(widest.msrs().count(), every_msr_address().count());
+    assert!(widest.msrs().all(|msr| is_msr_address(msr.address())));
+    // Its neighbours are not: IA32_PAT, and IA32_MC0_CTL2 above the fixed
+    // ranges.
+    assert!(!is_msr_address(0x277));
+    assert!(!is_msr_address(0x280));
 }
 
 #[test]

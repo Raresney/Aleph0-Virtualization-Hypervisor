@@ -14,7 +14,7 @@ use crate::vmx::exit_decision::{
     ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax, wrmsr_value,
 };
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
-use crate::vmx::mtrr::{FIXED_END, MtrrMsr, Mtrrs};
+use crate::vmx::mtrr::{self, FIXED_END, MtrrMsr, Mtrrs};
 use crate::vmx::page::PAGE_SIZE;
 use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmcs::fields::GUEST_LINEAR_ADDRESS;
@@ -339,8 +339,9 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
 }
 
 /// Prints why the guest gets a #GP at its RDMSR or WRMSR: for a WRMSR of
-/// one of its MTRRs, what the CPU refuses in the value; otherwise, that the
-/// MSR is outside the MSR bitmap or the value is not canonical.
+/// one of its MTRRs, what the CPU refuses in the value; for an MTRR address
+/// the CPU has no MSR at, that; otherwise, that the MSR is outside the MSR
+/// bitmap or the value is not canonical.
 fn report_general_protection(number: u64, exit: Option<ExitInfo>, rip: u64) {
     let tag = crate::TAG;
     let msr = exit.map_or(0, |exit| exit.guest_rcx as u32);
@@ -351,9 +352,13 @@ fn report_general_protection(number: u64, exit: Option<ExitInfo>, rip: u64) {
             let value = wrmsr_value(&exit);
             exit.mtrr.check(mtrr, value).err().map(|error| (mtrr, value, error))
         });
+    let absent_mtrr = exit.is_some_and(|exit| mtrr::is_msr_address(msr) && exit.mtrr.msr(msr).is_none());
     match refused_mtrr {
         Some((mtrr, value, error)) => crate::serial_println!(
             "{tag} VM exit #{number}: WRMSR {msr:#x} ({mtrr}) <- {value:#018x} refused: {error}; the guest's MTRRs unchanged; injecting #GP(0) at rip={rip:#018x}."
+        ),
+        None if absent_mtrr => crate::serial_println!(
+            "{tag} VM exit #{number}: MSR {msr:#x} is an MTRR address this CPU has no MSR at (see IA32_MTRRCAP); injecting #GP(0) at rip={rip:#018x}."
         ),
         None => crate::serial_println!(
             "{tag} VM exit #{number}: MSR {msr:#x} is outside the MSR bitmap, or the WRMSR value is not canonical; injecting #GP(0) at rip={rip:#018x}."

@@ -248,7 +248,7 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let (ept, types) = unsafe { Ept::build(guest.data_page(), invept, mtrrs.mtrrs(), ept::spare_pts(capabilities)) }?;
     report::ept(&ept, &types, guest.data_page());
 
-    let bitmaps = ExitBitmaps::allocate(capabilities)?;
+    let bitmaps = ExitBitmaps::allocate()?;
     report::exit_bitmaps(&bitmaps, capabilities);
     vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
 

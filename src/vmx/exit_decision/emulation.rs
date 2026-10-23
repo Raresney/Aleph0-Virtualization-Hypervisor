@@ -13,7 +13,8 @@
 //! the memory types of Aleph0's own accesses in root operation, so the
 //! guest's RDMSR and WRMSR of them reach a copy instead
 //! (`vmexit::guest_mtrrs`), and a value WRMSR would refuse gets the #GP it
-//! would get on bare metal.
+//! would get on bare metal. So does an MTRR address the CPU has no MSR at,
+//! which the MSR bitmap intercepts too.
 //!
 //! HLT is decided here too, but never executed: Aleph0 resumes past it (see
 //! [`hlt`]).
@@ -26,7 +27,7 @@ use core::arch::x86_64::CpuidResult;
 
 use super::{ExitEvent, ExitInfo};
 use crate::vmx::exit_bitmaps::{INTERCEPTED_MSRS, MsrAccess, msr_bit};
-use crate::vmx::mtrr::{MtrrCapabilities, MtrrMsr};
+use crate::vmx::mtrr::{self, MtrrCapabilities, MtrrMsr};
 
 /// An instruction the exit handler executes for the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,11 @@ enum MsrRoute {
     Intercepted,
     /// One of the guest's MTRRs: read or write its copy.
     Mtrr(MtrrMsr),
+    /// An address an MTRR has on some CPU, but not on this one (a variable
+    /// range past IA32_MTRRCAP's count, the fixed ranges without
+    /// IA32_MTRRCAP.FIX, any of them without MTRRs). The bitmap intercepts
+    /// these too, and the guest gets the #GP a CPU without the MSR gives.
+    AbsentMtrr,
     /// Outside both MSR-bitmap ranges, so it exits whatever the bitmap
     /// says. Aleph0 does not know it exists, and a real RDMSR/WRMSR of a
     /// missing MSR would #GP in the host, so the guest gets the #GP.
@@ -122,6 +128,8 @@ fn route(msr: u32, mtrr: MtrrCapabilities) -> MsrRoute {
         MsrRoute::Intercepted
     } else if let Some(msr) = mtrr.msr(msr) {
         MsrRoute::Mtrr(msr)
+    } else if mtrr::is_msr_address(msr) {
+        MsrRoute::AbsentMtrr
     } else {
         MsrRoute::NotIntercepted
     }
@@ -133,7 +141,7 @@ pub(super) fn rdmsr(exit: &ExitInfo) -> ExitEvent {
     match route(msr, exit.mtrr) {
         MsrRoute::Intercepted => ExitEvent::Emulated(Emulation::Rdmsr { msr }),
         MsrRoute::Mtrr(msr) => ExitEvent::Emulated(Emulation::MtrrRead { msr }),
-        MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
+        MsrRoute::AbsentMtrr | MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
         MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }
 }
@@ -160,7 +168,7 @@ pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
             Ok(()) => ExitEvent::Emulated(Emulation::MtrrWrite { msr, value }),
             Err(_) => ExitEvent::GuestGeneralProtection,
         },
-        MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
+        MsrRoute::AbsentMtrr | MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
         MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }
 }

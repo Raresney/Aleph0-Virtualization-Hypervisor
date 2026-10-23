@@ -8,7 +8,7 @@ use super::*;
 use crate::vmx::exit_decision::{
     EXIT_REASON_CPUID, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_WRMSR, ExitReason, InterruptionInfo,
 };
-use crate::vmx::mtrr::MtrrCapabilities;
+use crate::vmx::mtrr::{self, MtrrCapabilities};
 
 /// CPUID leaf 1 as a Hyper-V guest with nested virtualization sees it: VMX
 /// (ECX bit 5) set.
@@ -293,6 +293,9 @@ fn rdmsr_is_emulated_only_for_the_intercepted_msrs() {
         let event = rdmsr(&msr_exit(EXIT_REASON_RDMSR, msr.into(), 0, 0));
         if INTERCEPTED_MSRS.contains(&msr) {
             assert_eq!(event, ExitEvent::Emulated(Emulation::Rdmsr { msr }), "MSR {msr:#x}");
+        } else if mtrr::is_msr_address(msr) {
+            // An MTRR address, none of which this guest (no MTRRs) has.
+            assert_eq!(event, ExitEvent::GuestGeneralProtection, "MSR {msr:#x}");
         } else {
             // In range with its bit clear: it should never have exited, so the bitmap is broken.
             assert_eq!(event, ExitEvent::Unexpected, "MSR {msr:#x}");
@@ -311,6 +314,8 @@ fn wrmsr_is_emulated_only_for_the_intercepted_msrs() {
                 ExitEvent::Emulated(Emulation::Wrmsr { msr, value: 0 }),
                 "MSR {msr:#x}"
             );
+        } else if mtrr::is_msr_address(msr) {
+            assert_eq!(event, ExitEvent::GuestGeneralProtection, "MSR {msr:#x}");
         } else {
             assert_eq!(event, ExitEvent::Unexpected, "MSR {msr:#x}");
         }
@@ -378,16 +383,42 @@ fn an_mtrr_value_the_cpu_refuses_gets_a_general_protection_fault() {
 }
 
 #[test]
-fn mtrr_msrs_the_guest_lacks_mean_a_broken_bitmap() {
-    // Variable range 8 does not exist with eight ranges, IA32_MTRRCAP is not
-    // intercepted, and before bring-up publishes the guest's MTRRs none is.
+fn mtrr_addresses_the_cpu_has_no_msr_at_get_a_general_protection_fault() {
+    let without_fixed = MtrrCapabilities::new(8, 46).unwrap();
     for (mtrr, msr) in [
+        // Variable ranges 8 and 31 with eight ranges.
         (hyper_v_mtrrs(), 0x210),
-        (hyper_v_mtrrs(), 0xFE),
+        (hyper_v_mtrrs(), 0x23F),
+        // A fixed-range MSR without IA32_MTRRCAP.FIX.
+        (without_fixed, 0x250),
+        // Any of them on a CPU without MTRRs.
         (MtrrCapabilities::NONE, 0x2FF),
+        (MtrrCapabilities::NONE, 0x200),
     ] {
         let access = |basic| ExitInfo {
             mtrr,
+            ..msr_exit(basic, msr, 0, 0)
+        };
+        assert_eq!(
+            rdmsr(&access(EXIT_REASON_RDMSR)),
+            ExitEvent::GuestGeneralProtection,
+            "{msr:#x}"
+        );
+        assert_eq!(
+            wrmsr(&access(EXIT_REASON_WRMSR)),
+            ExitEvent::GuestGeneralProtection,
+            "{msr:#x}"
+        );
+    }
+}
+
+#[test]
+fn msrs_next_to_the_mtrrs_that_are_not_intercepted_mean_a_broken_bitmap() {
+    // IA32_MTRRCAP stays the guest's, and 0x240 is past the variable ranges
+    // Aleph0 keeps: neither should ever exit.
+    for msr in [0xFE, 0x240] {
+        let access = |basic| ExitInfo {
+            mtrr: hyper_v_mtrrs(),
             ..msr_exit(basic, msr, 0, 0)
         };
         assert_eq!(rdmsr(&access(EXIT_REASON_RDMSR)), ExitEvent::Unexpected, "{msr:#x}");
@@ -396,7 +427,7 @@ fn mtrr_msrs_the_guest_lacks_mean_a_broken_bitmap() {
 }
 
 #[test]
-fn each_bitmap_msr_is_passed_through_kept_in_the_mtrr_copy_or_never_exits() {
+fn each_bitmap_msr_is_passed_through_kept_in_the_mtrr_copy_refused_or_never_exits() {
     let mtrrs = hyper_v_mtrrs();
     for msr in bitmap_msr_indexes() {
         let event = rdmsr(&mtrr_exit(EXIT_REASON_RDMSR, msr, 0));
@@ -404,6 +435,8 @@ fn each_bitmap_msr_is_passed_through_kept_in_the_mtrr_copy_or_never_exits() {
             ExitEvent::Emulated(Emulation::Rdmsr { msr })
         } else if let Some(mtrr) = mtrrs.msr(msr) {
             ExitEvent::Emulated(Emulation::MtrrRead { msr: mtrr })
+        } else if mtrr::is_msr_address(msr) {
+            ExitEvent::GuestGeneralProtection
         } else {
             ExitEvent::Unexpected
         };

@@ -216,7 +216,7 @@ RDMSR and WRMSR cause a VM exit depending on one primary control:
 Aleph0 turns the control on (`DesiredControls::minimal_64_bit_guest`).
 `ExitBitmaps::allocate` makes three zeroed pages (this one and the two I/O
 bitmaps of section 5) and sets the bits of `INTERCEPTED_MSRS`, of every
-MTRR MSR the CPU has, and of `INTERCEPTED_PORTS`; `write_to_vmcs` writes the
+address an MTRR MSR can have, and of `INTERCEPTED_PORTS`; `write_to_vmcs` writes the
 MSR bitmap's address to
 `MSR_BITMAP` (`0x2004`). The page has four quarters:
 
@@ -830,7 +830,7 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exit reason 10 / 31 / 32 / 30 | CPUID / RDMSR / WRMSR / I/O instruction |
 | MSR bitmap quarters | `0x000` read low, `0x400` read high, `0x800` write low, `0xC00` write high |
 | I/O bit of port *p* | bit `p % 8` of byte `(p & 0x7FFF) / 8`, page A below `0x8000` |
-| Intercepted | `IA32_KERNEL_GS_BASE` (`0xC0000102`), every MTRR MSR the CPU has (a copy, not passed through), port `0x3FF` |
+| Intercepted | `IA32_KERNEL_GS_BASE` (`0xC0000102`), every MTRR address (a copy of the MSRs the CPU has, #GP for the others; never passed through), port `0x3FF` |
 | I/O qualification | 2:0 size − 1, 3 IN, 4 string, 5 REP, 6 immediate, 31:16 port |
 | CPUID policy | CPUID.1:ECX bit 5 (VMX) cleared |
 | Injected #GP | `0x80000B0D`, error code 0, RIP unchanged |
