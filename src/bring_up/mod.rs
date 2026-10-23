@@ -236,7 +236,7 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
 
     let (controls, invept) = check_vmx_support()?;
 
-    let mtrrs = vmx::mtrr::read()?;
+    let mtrrs = vmx::mtrr::read()?.decode()?;
     report::mtrrs(&mtrrs);
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the data page's address its GPA.
