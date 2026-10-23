@@ -150,7 +150,9 @@ same memory. Only the permissions can now differ.
 2. Counts the 2 MiB regions that need a PT (`split_regions`): those whose
    pages differ in memory type ([MTRR.md](MTRR.md)), and the one holding
    the guest's data page.
-3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs.
+3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs, plus spare
+   PTs for regions the guest's MTRR writes split later (`spare_pts`), and a
+   stack of the free PTs' indices.
 4. Points PML4 entry 0 at the PDPT and PDPT entry *i* at PD *i*.
 5. Fills every PD entry with a 2 MiB page, RWX, of the region's memory
    type, except for the regions counted in step 2. Their PD entry points to
@@ -159,6 +161,13 @@ same memory. Only the permissions can now differ.
 
 2 MiB pages keep the tables small. Only the regions that need a 4 KiB
 exception pay for a PT.
+
+`Ept::build` also returns the `TypeTables` the exit handler keeps: the PDs,
+the PTs with the spare ones, and the free stack. When the guest writes its
+MTRRs, `TypeTables::apply` rewrites the entries whose memory type changed,
+takes a spare PT for a region whose pages come to differ in type, gives the
+PT of a region of one type again back, and runs INVEPT (section 7,
+[MTRR.md](MTRR.md) section 7).
 
 On Hyper-V (2 GiB of RAM), before the memory types came from the MTRRs
 (every page was WB, and the data page's region had the only PT):
@@ -289,8 +298,9 @@ Like other VMX instructions it reports failure through CF/ZF;
 Strictly, this INVEPT is not needed: an EPT violation already drops the
 cached translations for the address that caused it, so the retried write
 would see W = 1 anyway. It is still the architectural way to publish an
-EPT change, and changes not caused by a violation (protecting a page while
-the guest runs, for example) will need it.
+EPT change, and changes not caused by a violation need it. The first such
+change is a guest MTRR write: `TypeTables::apply` changes the memory types
+of entries the CPU may have cached, then runs the same INVEPT.
 
 ## 8. The Hyper-V runs
 
@@ -361,8 +371,6 @@ section 10).
 
 ## 10. What is not covered yet
 
-- **Following the guest's MTRR changes.** The memory types are copied
-  from the MTRRs once, at bring-up ([MTRR.md](MTRR.md), section 7).
 - **Hiding Aleph0's own pages** (section 9). Each of them must become not
   present in EPT, with the access redirected or a #PF injected, or be
   mapped to a zero-filled shadow page. Aleph0 then has to track every page

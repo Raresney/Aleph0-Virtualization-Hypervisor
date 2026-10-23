@@ -20,6 +20,7 @@ Code:
 - `src/vmx/exit_decision/scenario.rs`: the test guest's own exits (EPT write, VMCALLs, NMI);
 - `src/vmx/exit_bitmaps.rs`: the MSR bitmap and the two I/O bitmaps;
 - `src/vmx/vmexit/handler.rs`: `execute`, `prepare_resume`, `queue_exception`;
+- `src/vmx/vmexit/guest_mtrrs.rs`: the guest's copy of its MTRRs, which its RDMSR and WRMSR of them reach;
 - `src/vmx/vmexit/report.rs`: the report lines;
 - `src/port.rs`: `in`/`out` of 1, 2 and 4 bytes;
 - `src/vmx/guest.rs`: the guest code that causes the exits, and its checks;
@@ -214,8 +215,9 @@ RDMSR and WRMSR cause a VM exit depending on one primary control:
 
 Aleph0 turns the control on (`DesiredControls::minimal_64_bit_guest`).
 `ExitBitmaps::allocate` makes three zeroed pages (this one and the two I/O
-bitmaps of section 5) and sets the bits of `INTERCEPTED_MSRS` and
-`INTERCEPTED_PORTS`; `write_to_vmcs` writes the MSR bitmap's address to
+bitmaps of section 5) and sets the bits of `INTERCEPTED_MSRS`, of every
+MTRR MSR the CPU has, and of `INTERCEPTED_PORTS`; `write_to_vmcs` writes the
+MSR bitmap's address to
 `MSR_BITMAP` (`0x2004`). The page has four quarters:
 
 ```text
@@ -291,15 +293,21 @@ IA32_KERNEL_GS_BASE is safe because VM entry and exit do not switch it (it
 has no VMCS field) and Aleph0 never runs SWAPGS: the CPU's value is the
 guest's.
 
-### The three routes
+### The four routes
 
-An RDMSR or WRMSR exit takes one of three routes, chosen by `route`:
+An RDMSR or WRMSR exit takes one of four routes, chosen by `route`:
 
 | MSR | Route | Event |
 |---|---|---|
 | in `INTERCEPTED_MSRS` | emulate with the real RDMSR/WRMSR | `Emulated` |
+| an MTRR MSR the guest has (`ExitInfo::mtrr`) | read or write the guest's copy; a WRMSR value the CPU would refuse gets #GP(0) | `Emulated(MtrrRead)`, `Emulated(MtrrWrite)`, `GuestGeneralProtection` |
 | outside both ranges (`msr_bit` is `None`) | inject #GP(0) into the guest | `GuestGeneralProtection` |
 | in range, bit clear | it should never have exited: the bitmap is broken; stop | `Unexpected` |
+
+The MTRRs are the one intercepted MSR family Aleph0 does not pass through:
+the CPU's still set the memory types of Aleph0's own accesses in root
+operation, so the guest reads and writes a copy, and EPT follows the copy
+([MTRR.md](MTRR.md) section 7).
 
 The middle row is what hardware does for an MSR that does not exist.
 Aleph0 does not know whether such an MSR exists, and a real RDMSR/WRMSR of a
@@ -513,6 +521,27 @@ it back. If a check fails after its first WRMSR or OUT, it jumps to
 `guest_emulation_failed` and `ud2` **without** restoring; bring-up does not
 restore either, and prints `restored=false` below.
 
+Then the guest moves its last variable MTRR and puts it back, which reaches
+only Aleph0's copy of its MTRRs and the EPT memory types ([MTRR.md](MTRR.md)
+section 7). It reads `IA32_MTRRCAP`, which does not exit, for the number of
+variable ranges, and MAXPHYADDR from CPUID to build the masks. Eleven more
+exits follow, numbered here as under Hyper-V, where the last range is 7:
+
+| # | Instruction | What it does |
+|---|---|---|
+| 10 | `cpuid` leaf 0x80000008 | MAXPHYADDR, in EAX bits 7:0 |
+| 11, 12 | `rdmsr` of PHYSBASE7, PHYSMASK7 | saves the pair, from the copy |
+| 13 | `wrmsr` PHYSMASK7 ← 0 | turns the range off |
+| 14 | `wrmsr` PHYSBASE7 ← `GUEST_MTRR_BASE` | `0x200000`, type UC |
+| 15 | `wrmsr` PHYSMASK7 ← 2 MiB, valid | EPT maps the region at 2 MiB as one UC page |
+| 16 | `rdmsr` PHYSMASK7 | reads the mask back, all 64 bits |
+| 17 | `wrmsr` PHYSMASK7 ← 4 KiB, valid | the region takes a spare PT: its first page UC, the rest WB |
+| 18 | `wrmsr` PHYSMASK7 ← 0 | the region is one WB page again; its PT is spare again |
+| 19, 20 | `wrmsr` PHYSBASE7, PHYSMASK7 | puts the pair back |
+
+`hlt` is then exit #21, the EPT violation #22, and the main VMCALLs #23 and
+#24.
+
 ### Two checks, because one is not enough
 
 - **The guest checks the values.** A wrong result ends in `ud2` with
@@ -529,9 +558,11 @@ restore either, and prints `restored=false` below.
 ```rust
 pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
     VcpuStats {
-        cpuid_exits: 1,
+        cpuid_exits: 2,
         msr_read_exits: 2,
         msr_write_exits: 2,
+        mtrr_read_exits: 3,
+        mtrr_write_exits: 7,
         io_in_exits: 2,
         io_out_exits: 2,
         halt_exits: 1,
@@ -543,7 +574,10 @@ pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
 ```
 
 Any other count fails the run with `UnexpectedExitStats`, which prints both
-sets of statistics, and the application returns `ABORTED`.
+sets of statistics, and the application returns `ABORTED`. MTRR accesses
+have counters of their own, so one passed through to the CPU by mistake
+would show as a wrong `msr_*_exits` and `mtrr_*_exits`, not as the right
+total.
 
 ### What serial shows
 
@@ -556,8 +590,13 @@ VM exit #N: RDMSR 0xc0000102 -> 0x...; resuming at rip=...
 VM exit #N: WRMSR 0xc0000102 <- 0x00007a1e00000000; resuming at rip=...
 VM exit #N: IN port 0x3ff size=1 -> 0x...; resuming at rip=...
 VM exit #N: OUT port 0x3ff size=1 value=0xa5; resuming at rip=...
-VM exit #N: exit statistics: exits=... cpuid_exits=1 msr_read_exits=2 ...
+VM exit #N: RDMSR 0x20f (IA32_MTRR_PHYSMASK7) -> 0x00003fffffe00800, from the guest's MTRRs; resuming at rip=...
+VM exit #N: WRMSR 0x20f (IA32_MTRR_PHYSMASK7) <- 0x0000000000000000, into the guest's MTRRs; the CPU's IA32_MTRR_PHYSMASK7 stays 0x0000000000000000.
+VM exit #N: exit statistics: exits=... cpuid_exits=2 msr_read_exits=2 msr_write_exits=2 mtrr_read_exits=3 mtrr_write_exits=7 ...
 ```
+
+An MTRR write that changes types adds the guest's MTRRs and the EPT
+regions that changed ([MTRR.md](MTRR.md) section 7.6).
 
 The last line comes with the stop report after the final VMCALL. The EPT
 violation, which was exit #1 before this step, is now exit #10.
@@ -574,6 +613,14 @@ Passthrough state before the guest PassthroughState { kernel_gs_base: <hex>, com
 
 `restored=true` shows the guest put both back; `restored=false` means its
 check failed after a write.
+
+The MTRRs are the opposite case: the guest must never reach the CPU's. So
+bring-up reads them before and after the guest too, and stops with
+`MtrrsChanged` if they differ:
+
+```text
+MTRRs after the guest: the CPU's unchanged=true; the guest's copy restored=true.
+```
 
 ## 7. On Hyper-V
 
@@ -699,9 +746,9 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
   them (except the test guest's VMCALLs, in `scenario.rs`); they reach the
   `_` arm and stop the guest. An OS runs XSETBV early.
 - **String and REP I/O** stop the guest (section 5).
-- **Only one MSR and one port are intercepted.** Every other MSR inside the
-  bitmap's ranges and every other port reaches the hardware without Aleph0
-  seeing it (MSRs outside the ranges get a #GP, section 4). The
+- **Only one MSR, the MTRRs and one port are intercepted.** Every other
+  MSR inside the bitmap's ranges and every other port reaches the hardware
+  without Aleph0 seeing it (MSRs outside the ranges get a #GP, section 4). The
   multi-port rule (section 5) also lets a wide access that touches `0x3FF`
   reach its neighbours, COM1's other registers, which are the guest's.
 - **The #GP and #UD paths are tested on the host only.** They are
@@ -783,7 +830,7 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exit reason 10 / 31 / 32 / 30 | CPUID / RDMSR / WRMSR / I/O instruction |
 | MSR bitmap quarters | `0x000` read low, `0x400` read high, `0x800` write low, `0xC00` write high |
 | I/O bit of port *p* | bit `p % 8` of byte `(p & 0x7FFF) / 8`, page A below `0x8000` |
-| Intercepted | `IA32_KERNEL_GS_BASE` (`0xC0000102`), port `0x3FF` |
+| Intercepted | `IA32_KERNEL_GS_BASE` (`0xC0000102`), every MTRR MSR the CPU has (a copy, not passed through), port `0x3FF` |
 | I/O qualification | 2:0 size − 1, 3 IN, 4 string, 5 REP, 6 immediate, 31:16 port |
 | CPUID policy | CPUID.1:ECX bit 5 (VMX) cleared |
 | Injected #GP | `0x80000B0D`, error code 0, RIP unchanged |
@@ -792,4 +839,4 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exception bitmap | all ones for the test guest, 0 for a guest with its own IDT |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
-| `guest::expected_stats` | cpuid 1, MSR reads 2, MSR writes 2, in 2, out 2, halt 1, exceptions 0 |
+| `guest::expected_stats` | cpuid 2, MSR reads 2, MSR writes 2, MTRR reads 3, MTRR writes 7, in 2, out 2, halt 1, exceptions 0 |
