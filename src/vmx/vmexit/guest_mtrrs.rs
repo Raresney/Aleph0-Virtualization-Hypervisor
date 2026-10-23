@@ -16,6 +16,7 @@
 
 use core::cell::UnsafeCell;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::vmx::ept::{InveptType, Retyped, TypeTables};
 use crate::vmx::instruction::VmxFail;
@@ -27,31 +28,58 @@ struct GuestMtrrs {
     types: TypeTables,
 }
 
-struct Cell(UnsafeCell<Option<GuestMtrrs>>);
+struct Cell {
+    guest: UnsafeCell<Option<GuestMtrrs>>,
+    /// Set while [`with`] lends out `guest`, so that a call from inside its
+    /// closure is refused instead of making a second `&mut` to it.
+    in_use: AtomicBool,
+}
 
 // SAFETY: Aleph0 runs one vCPU on one CPU. Bring-up writes the cell
 // ([`publish`]) before the guest runs; then only the exit handler uses it,
 // with interrupts off, and the host NMI handler never touches it; bring-up
 // reads it again once the guest has stopped. Nobody keeps a reference past
-// the call that made it ([`with`]).
+// the call that made it, and `in_use` refuses a call made while one is
+// lent out ([`with`]).
 unsafe impl Sync for Cell {}
 
-static GUEST_MTRRS: Cell = Cell(UnsafeCell::new(None));
+static GUEST_MTRRS: Cell = Cell {
+    guest: UnsafeCell::new(None),
+    in_use: AtomicBool::new(false),
+};
 
 /// Gives the exit handler the guest's MTRRs, starting as `state` (the
 /// CPU's), and `types`, the EPT tables whose memory types follow them. For
 /// bring-up, before VMLAUNCH. `types` comes from the one `Ept::build`, so
 /// there is only ever one guest to publish.
 pub fn publish(state: MtrrState, types: TypeTables) {
-    // SAFETY: no exit handler runs before VMLAUNCH (see `Cell`).
-    unsafe { *GUEST_MTRRS.0.get() = Some(GuestMtrrs { state, types }) };
+    // SAFETY: no exit handler runs before VMLAUNCH, and bring-up holds no
+    // reference from `with` here (see `Cell`).
+    unsafe { *GUEST_MTRRS.guest.get() = Some(GuestMtrrs { state, types }) };
 }
 
-/// Calls `f` with the guest's MTRRs, or returns `None` before [`publish`].
-fn with<R>(f: impl FnOnce(&mut GuestMtrrs) -> R) -> Option<R> {
+/// Why [`with`] could not lend out the guest's MTRRs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unavailable {
+    /// Before [`publish`].
+    NotPublished,
+    /// A call from inside another `with`'s closure.
+    InUse,
+}
+
+/// Calls `f` with the guest's MTRRs. Refused before [`publish`], and from
+/// inside another call's `f`, which would otherwise hold a second `&mut` to
+/// them.
+fn with<R>(f: impl FnOnce(&mut GuestMtrrs) -> R) -> Result<R, Unavailable> {
+    if GUEST_MTRRS.in_use.swap(true, Ordering::Acquire) {
+        return Err(Unavailable::InUse);
+    }
     // SAFETY: bring-up and the exit handler never run at the same time,
-    // and the reference does not outlive `f` (see `Cell`).
-    unsafe { (*GUEST_MTRRS.0.get()).as_mut().map(f) }
+    // `in_use` makes this the only reference, and it does not outlive `f`
+    // (see `Cell`).
+    let result = unsafe { (*GUEST_MTRRS.guest.get()).as_mut().map(f) };
+    GUEST_MTRRS.in_use.store(false, Ordering::Release);
+    result.ok_or(Unavailable::NotPublished)
 }
 
 /// The guest's MTRR MSRs, for `decide`: [`MtrrCapabilities::NONE`] before
@@ -63,12 +91,12 @@ pub(super) fn capabilities() -> MtrrCapabilities {
 /// The guest's MTRR MSRs as they stand, or `None` before [`publish`]. For
 /// bring-up, once the guest has stopped.
 pub fn registers() -> Option<MtrrRegisters> {
-    with(|guest| guest.state.registers().clone())
+    with(|guest| guest.state.registers().clone()).ok()
 }
 
 /// What RDMSR of `msr` returns the guest: its copy's value.
 pub(super) fn read(msr: MtrrMsr) -> Result<u64, MtrrAccessFailure> {
-    with(|guest| guest.state.registers().get(msr)).ok_or(MtrrAccessFailure::NotPublished)
+    with(|guest| guest.state.registers().get(msr)).map_err(MtrrAccessFailure::from)
 }
 
 /// What a guest WRMSR of an MTRR came to.
@@ -88,16 +116,28 @@ pub(super) struct MtrrWrite {
 pub(super) enum MtrrAccessFailure {
     /// Bring-up never published the guest's MTRRs.
     NotPublished,
+    /// Reached again from inside an access to them.
+    InUse,
     /// The copy refused the value.
     Refused(MtrrError),
     /// INVEPT failed after EPT took the new types.
     Invept(VmxFail),
 }
 
+impl From<Unavailable> for MtrrAccessFailure {
+    fn from(unavailable: Unavailable) -> Self {
+        match unavailable {
+            Unavailable::NotPublished => Self::NotPublished,
+            Unavailable::InUse => Self::InUse,
+        }
+    }
+}
+
 impl fmt::Display for MtrrAccessFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotPublished => f.write_str("the guest's MTRRs were never set up"),
+            Self::InUse => f.write_str("the guest's MTRRs were reached again while already in use"),
             Self::Refused(error) => write!(f, "the guest's MTRRs refused the write ({error})"),
             Self::Invept(error) => write!(f, "EPT took the guest's MTRR types, but INVEPT failed ({error:?})"),
         }
@@ -128,12 +168,16 @@ pub(super) unsafe fn write(msr: MtrrMsr, value: u64) -> Result<MtrrWrite, MtrrAc
             invept: retyped.changed().then(|| guest.types.invept()),
         })
     })
-    .unwrap_or(Err(MtrrAccessFailure::NotPublished))
+    .unwrap_or_else(|unavailable| Err(unavailable.into()))
 }
 
 /// Calls `f` with the memory types the guest's MTRRs give and the EPT
 /// tables that carry them, for the exit handler's report. `None` before
 /// [`publish`].
 pub(super) fn inspect<R>(f: impl FnOnce(&Mtrrs, &TypeTables) -> R) -> Option<R> {
-    with(|guest| f(guest.state.mtrrs(), &guest.types))
+    with(|guest| f(guest.state.mtrrs(), &guest.types)).ok()
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/vmx/vmexit/guest_mtrrs.rs"]
+mod tests;

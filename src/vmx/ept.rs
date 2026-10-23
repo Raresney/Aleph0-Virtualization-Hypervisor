@@ -836,8 +836,11 @@ impl FreePts<'_> {
     /// Puts the PT at `index` back: no PD entry points at it any more.
     fn give_back(&mut self, index: usize) {
         // The stack has room for every PT, and each is either in use or on
-        // it once, so the slot is always there.
-        if let Some(slot) = self.stack.get_mut(*self.len) {
+        // it once, so the slot is always there. A full stack means a PT was
+        // given back twice: a bug in `retype`, not something a guest can do.
+        let slot = self.stack.get_mut(*self.len);
+        debug_assert!(slot.is_some(), "PT {index} given back to a full free stack");
+        if let Some(slot) = slot {
             *slot = index as u32;
             *self.len += 1;
         }
