@@ -38,6 +38,21 @@
     runs in VMX root operation), unexpected-exit-test (the guest stops at
     main VMCALL #1 as an unexpected exit), or trace-exits (every VM exit
     printed in full).
+
+.PARAMETER ProcessorCount
+    vCPUs to give the VM: 2 by default, 1 with -InjectNmi, which refuses any
+    other count.
+
+.PARAMETER Kernel
+    A Linux EFI image, such as run\linux\linux.efi from
+    scripts/linux/build.sh, to put on the ESP as \EFI\aleph0\linux.efi, next
+    to Aleph0.
+
+.PARAMETER WithoutAleph0
+    Boots the -Kernel image directly: it becomes \EFI\BOOT\BOOTX64.EFI in
+    Aleph0's place, and Aleph0 is not built. Nothing writes COM2 then, and
+    the kernel's console is COM1, so COM1 streams to this console (and
+    run\guest-serial.log) instead.
 #>
 param(
     [string]$VMName   = "Aleph0Test",
@@ -47,7 +62,11 @@ param(
     [string]$GuestPipeName = "aleph0-com1",
     [switch]$NoSerial,
     [switch]$InjectNmi,
-    [string]$Features = ""
+    [string]$Features = "",
+    [ValidateRange(1, 1024)]
+    [int]$ProcessorCount = $(if ($InjectNmi) { 1 } else { 2 }),
+    [string]$Kernel = "",
+    [switch]$WithoutAleph0
 )
 
 # See run.ps1 for why $ErrorActionPreference is not set to "Stop" globally.
@@ -91,23 +110,44 @@ if ($InjectNmi -and $NoSerial) {
     Write-Error "-InjectNmi needs the serial stream; do not combine it with -NoSerial."
     exit 1
 }
-
-# 1. Build
-$cargoArgs = @("build")
-if ($Release) { $cargoArgs += "--release" }
-if ($Features) { $cargoArgs += @("--features", $Features) }
-Write-Host "==> cargo $($cargoArgs -join ' ')" -ForegroundColor Cyan
-Push-Location $root
-cargo @cargoArgs
-$buildExit = $LASTEXITCODE
-Pop-Location
-if ($buildExit -ne 0) {
-    Write-Error "cargo build failed (exit code $buildExit)."
-    exit $buildExit
-}
-if (-not (Test-Path $efiSrc)) {
-    Write-Error "Compiled binary not found at $efiSrc"
+# Debug-VM may deliver the NMI to any vCPU, and only the one running Aleph0's
+# guest turns it into a VM exit.
+if ($InjectNmi -and $ProcessorCount -ne 1) {
+    Write-Error "-InjectNmi needs one vCPU; do not combine it with -ProcessorCount $ProcessorCount."
     exit 1
+}
+if ($Kernel -and -not (Test-Path -LiteralPath $Kernel -PathType Leaf)) {
+    Write-Error "Kernel image $Kernel not found; scripts/linux/build.sh builds run\linux\linux.efi."
+    exit 1
+}
+if ($WithoutAleph0 -and -not $Kernel) {
+    Write-Error "-WithoutAleph0 boots the -Kernel image; pass -Kernel."
+    exit 1
+}
+# The NMI job waits for a line only Aleph0 prints.
+if ($WithoutAleph0 -and $InjectNmi) {
+    Write-Error "-InjectNmi needs Aleph0; do not combine it with -WithoutAleph0."
+    exit 1
+}
+
+# 1. Build, unless Aleph0 is not on the ESP at all
+if (-not $WithoutAleph0) {
+    $cargoArgs = @("build")
+    if ($Release) { $cargoArgs += "--release" }
+    if ($Features) { $cargoArgs += @("--features", $Features) }
+    Write-Host "==> cargo $($cargoArgs -join ' ')" -ForegroundColor Cyan
+    Push-Location $root
+    cargo @cargoArgs
+    $buildExit = $LASTEXITCODE
+    Pop-Location
+    if ($buildExit -ne 0) {
+        Write-Error "cargo build failed (exit code $buildExit)."
+        exit $buildExit
+    }
+    if (-not (Test-Path $efiSrc)) {
+        Write-Error "Compiled binary not found at $efiSrc"
+        exit 1
+    }
 }
 
 try {
@@ -143,7 +183,13 @@ try {
 
         $bootDir = "$($part.DriveLetter):\EFI\BOOT"
         New-Item -ItemType Directory -Force -ErrorAction Stop -Path $bootDir | Out-Null
-        Copy-Item -Force -ErrorAction Stop $efiSrc (Join-Path $bootDir "BOOTX64.EFI")
+        $bootImage = if ($WithoutAleph0) { $Kernel } else { $efiSrc }
+        Copy-Item -Force -ErrorAction Stop -LiteralPath $bootImage -Destination (Join-Path $bootDir "BOOTX64.EFI")
+        if ($Kernel) {
+            $kernelDir = "$($part.DriveLetter):\EFI\aleph0"
+            New-Item -ItemType Directory -Force -ErrorAction Stop -Path $kernelDir | Out-Null
+            Copy-Item -Force -ErrorAction Stop -LiteralPath $Kernel -Destination (Join-Path $kernelDir "linux.efi")
+        }
 
         $part | Set-Partition -GptType $espType -ErrorAction Stop
     } finally {
@@ -165,10 +211,7 @@ try {
     Set-VMFirmware -VMName $VMName -FirstBootDevice (Get-VMHardDiskDrive -VMName $VMName) -ErrorAction Stop
     # Nested virtualization requires static memory.
     Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $false -StartupBytes ($MemoryMB * 1MB) -ErrorAction Stop
-    # One vCPU for -InjectNmi: Debug-VM may deliver the NMI to any vCPU, and
-    # only the one running Aleph0's guest turns it into a VM exit.
-    $cpuCount = if ($InjectNmi) { 1 } else { 2 }
-    Set-VMProcessor -VMName $VMName -Count $cpuCount -ExposeVirtualizationExtensions $true -ErrorAction Stop
+    Set-VMProcessor -VMName $VMName -Count $ProcessorCount -ExposeVirtualizationExtensions $true -ErrorAction Stop
     # COM ports -> named pipes. Gen 2 VMs have no COM ports in the UI; this
     # is the only way to attach them. Aleph0 prints on COM2; COM1 is the
     # guest's.
@@ -216,8 +259,9 @@ if ($InjectNmi) {
 #    Each reader runs as a job (in its own process, with this session's
 #    elevation) and connects as soon as Start-VM creates its pipe. COM2,
 #    Aleph0's output, streams to this console and run\serial.log; COM1, the
-#    guest's, goes to run\guest-serial.log only. Ctrl+C stops the streaming
-#    here; the jobs themselves end when the VM turns off.
+#    guest's, goes to run\guest-serial.log only. With -WithoutAleph0 nothing
+#    writes COM2, so only COM1 is read, and it streams too. Ctrl+C stops the
+#    streaming here; the jobs themselves end when the VM turns off.
 function Start-SerialReader([string]$Pipe, [string]$Log, [switch]$Quiet) {
     Start-Job -ArgumentList (Join-Path $PSScriptRoot "read-serial.ps1"), $Pipe, $Log, $Quiet.IsPresent -ScriptBlock {
         param($readerScript, $pipeName, $logName, $quiet)
@@ -228,12 +272,14 @@ function Start-SerialReader([string]$Pipe, [string]$Log, [switch]$Quiet) {
 $serialJob = $null
 $guestSerialJob = $null
 if (-not $NoSerial) {
-    $serialJob = Start-SerialReader -Pipe $PipeName -Log "serial.log"
-    $guestSerialJob = Start-SerialReader -Pipe $GuestPipeName -Log "guest-serial.log" -Quiet
+    if (-not $WithoutAleph0) {
+        $serialJob = Start-SerialReader -Pipe $PipeName -Log "serial.log"
+    }
+    $guestSerialJob = Start-SerialReader -Pipe $GuestPipeName -Log "guest-serial.log" -Quiet:(-not $WithoutAleph0)
     # A reader's first output is its "Waiting for" line, printed right before
     # it starts connecting.
     $readyDeadline = (Get-Date).AddSeconds(30)
-    foreach ($job in $serialJob, $guestSerialJob) {
+    foreach ($job in @($serialJob, $guestSerialJob) | Where-Object { $_ }) {
         while ($job.ChildJobs[0].Information.Count -eq 0 -and
                $job.State -in 'NotStarted', 'Running' -and
                (Get-Date) -lt $readyDeadline) {
@@ -250,7 +296,8 @@ if ($serialJob) {
     Receive-Job -Job $serialJob -Wait -AutoRemoveJob
 }
 if ($guestSerialJob) {
-    # Only its own status lines: it saves the guest's lines without printing.
+    # Only its own status lines, unless -WithoutAleph0: otherwise it saves the
+    # guest's lines without printing.
     Receive-Job -Job $guestSerialJob -Wait -AutoRemoveJob
 }
 
