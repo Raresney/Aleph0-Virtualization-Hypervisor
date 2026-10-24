@@ -1,0 +1,21 @@
+#!/bin/busybox sh
+# /init of the first-boot Linux target: prints what later issues need to know
+# about the VM on the console (ttyS0, COM1), then starts a shell there. Every
+# line ends in a newline, since read-serial.ps1 logs whole lines only.
+/bin/busybox mount -t proc proc /proc
+/bin/busybox --install -s /bin
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+echo "aleph0-linux: init"
+echo "aleph0-linux: nproc $(nproc)"
+echo "aleph0-linux: cmdline $(cat /proc/cmdline)"
+# The same address as in System.map: nokaslr took effect.
+echo "aleph0-linux: $(grep -w _text /proc/kallsyms)"
+echo "aleph0-linux: clocksource $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+echo "aleph0-linux: $(grep -m 1 '^flags' /proc/cpuinfo)"
+echo "aleph0-linux: iomem"
+cat /proc/iomem
+echo "aleph0-linux: uptime $(cat /proc/uptime)"
+echo "aleph0-linux: shell"
+exec setsid cttyhack sh
