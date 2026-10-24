@@ -446,22 +446,21 @@ The test guest moves its last variable range, range 7, to the 2 MiB at
 range off, gives it that base and type UC, turns it on for 2 MiB, reads
 the mask back, narrows it to 4 KiB, then turns it off and restores the
 pair. On the Hyper-V layout of section 6, where range 7 is unused, the
-writes should print as below. These lines show the format the code prints
-and the values the host tests compute for that layout; the Hyper-V run is
-still to be recorded.
+write that turns it on for 2 MiB was exit #15 and printed these lines, the
+values the host tests compute for that layout:
 
 ```text
-VM exit #N: WRMSR 0x20f (IA32_MTRR_PHYSMASK7) <- 0x00003fffffe00800, into the guest's MTRRs; the CPU's IA32_MTRR_PHYSMASK7 stays 0x0000000000000000.
-VM exit #N: guest MTRRs: enabled, default type UC; fixed ranges enabled; 8 variable ranges, 2 in use.
-VM exit #N: guest MTRR variable range 0: base=0x000000000000 mask=0x3fff00000000 WB
-VM exit #N: guest MTRR variable range 7: base=0x000000200000 mask=0x3fffffe00000 UC
-VM exit #N: EPT: 1 region(s) retyped (0 split into a spare PT, 0 merged back into one 2 MiB page); 9 spare PT(s) left; INVEPT single-context.
-VM exit #N: EPT 0x000000200000..0x000000400000: 2 MiB pages, UC
+VM exit #15: WRMSR 0x20f (IA32_MTRR_PHYSMASK7) <- 0x00003fffffe00800, into the guest's MTRRs; the CPU's IA32_MTRR_PHYSMASK7 stays 0x0000000000000000.
+VM exit #15: guest MTRRs: enabled, default type UC; fixed ranges enabled; 8 variable ranges, 2 in use.
+VM exit #15: guest MTRR variable range 0: base=0x000000000000 mask=0x3fff00000000 WB
+VM exit #15: guest MTRR variable range 7: base=0x000000200000 mask=0x3fffffe00000 UC
+VM exit #15: EPT: 1 region(s) retyped (0 split into a spare PT, 0 merged back into one 2 MiB page); 9 spare PT(s) left; INVEPT single-context.
+VM exit #15: EPT 0x000000200000..0x000000400000: 2 MiB pages, UC
 ```
 
-Then, for the 4 KiB mask, `1 split into a spare PT`, `8 spare PT(s) left`
-and `4 KiB pages (a PT each)`; for turning the range off, `1 merged back
-into one 2 MiB page`, `9 spare PT(s) left` and `2 MiB pages, WB`. A write
+Then, for the 4 KiB mask (exit #17), `1 split into a spare PT`, `8 spare
+PT(s) left` and `4 KiB pages (a PT each)`; for turning the range off
+(exit #18), `1 merged back into one 2 MiB page`, `9 spare PT(s) left` and `2 MiB pages, WB`. A write
 that changes no type prints `every address keeps its memory type; EPT
 unchanged`, and a refused one, host-tested only since the test guest's IDT
 has no #GP gate:
