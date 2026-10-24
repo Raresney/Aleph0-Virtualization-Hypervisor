@@ -1,4 +1,4 @@
-//! Unit tests for `src/vmx/mtrr.rs`.
+//! Unit tests for `src/vmx/mtrr/mod.rs`.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
@@ -383,4 +383,28 @@ fn runs_in_4k_blocks_show_the_fixed_ranges() {
 #[test]
 fn no_runs_for_an_empty_span() {
     assert_eq!(mtrrs(WB, &[]).runs(0, SIZE_2M).count(), 0);
+}
+
+#[test]
+fn mtrrs_print_as_bring_up_reports_them() {
+    assert_eq!(
+        Mtrrs::Unsupported.to_string(),
+        "not supported (CPUID); all memory is treated as WB"
+    );
+    assert_eq!(
+        Mtrrs::Disabled.to_string(),
+        "disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC"
+    );
+    // Hyper-V's layout: eight variable ranges, the first making 4 GiB WB.
+    let mut variable = [(0, 0); 8];
+    variable[0] = range(0, 4 * SIZE_1G, WB);
+    let mtrrs = Mtrrs::decode(enabled_with_fixed(UC), Some(pc_fixed()), &variable).unwrap();
+    assert_eq!(
+        mtrrs.to_string(),
+        "enabled, default type UC; fixed ranges enabled; 8 variable ranges, 1 in use"
+    );
+    assert_eq!(
+        as_enabled(&mtrrs).variable_ranges()[0].to_string(),
+        "variable range 0: base=0x000000000000 mask=0x007f00000000 WB"
+    );
 }

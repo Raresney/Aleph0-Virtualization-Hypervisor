@@ -25,6 +25,10 @@ pub struct VcpuStats {
     pub msr_read_exits: u64,
     /// WRMSRs executed for the guest.
     pub msr_write_exits: u64,
+    /// RDMSRs of the guest's MTRRs, answered from its copy.
+    pub mtrr_read_exits: u64,
+    /// WRMSRs of the guest's MTRRs, written to its copy.
+    pub mtrr_write_exits: u64,
     /// INs executed for the guest.
     pub io_in_exits: u64,
     /// OUTs executed for the guest.
@@ -44,6 +48,8 @@ impl VcpuStats {
         cpuid_exits: 0,
         msr_read_exits: 0,
         msr_write_exits: 0,
+        mtrr_read_exits: 0,
+        mtrr_write_exits: 0,
         io_in_exits: 0,
         io_out_exits: 0,
         halt_exits: 0,
@@ -65,6 +71,8 @@ impl VcpuStats {
             Some(Emulation::Cpuid { .. }) => self.cpuid_exits += 1,
             Some(Emulation::Rdmsr { .. }) => self.msr_read_exits += 1,
             Some(Emulation::Wrmsr { .. }) => self.msr_write_exits += 1,
+            Some(Emulation::MtrrRead { .. }) => self.mtrr_read_exits += 1,
+            Some(Emulation::MtrrWrite { .. }) => self.mtrr_write_exits += 1,
             Some(Emulation::In { .. }) => self.io_in_exits += 1,
             Some(Emulation::Out { .. }) => self.io_out_exits += 1,
             None => {}
@@ -90,6 +98,8 @@ impl fmt::Display for VcpuStats {
             cpuid_exits,
             msr_read_exits,
             msr_write_exits,
+            mtrr_read_exits,
+            mtrr_write_exits,
             io_in_exits,
             io_out_exits,
             halt_exits,
@@ -99,7 +109,8 @@ impl fmt::Display for VcpuStats {
         write!(
             f,
             "exits={exits} cpuid_exits={cpuid_exits} msr_read_exits={msr_read_exits} \
-             msr_write_exits={msr_write_exits} io_in_exits={io_in_exits} io_out_exits={io_out_exits} \
+             msr_write_exits={msr_write_exits} mtrr_read_exits={mtrr_read_exits} \
+             mtrr_write_exits={mtrr_write_exits} io_in_exits={io_in_exits} io_out_exits={io_out_exits} \
              halt_exits={halt_exits} nmi_injections={nmi_injections} exception_injections={exception_injections}"
         )
     }

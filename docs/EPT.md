@@ -12,7 +12,7 @@ How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 
 Code:
 - `src/vmx/ept.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
-- `src/vmx/mtrr.rs`: the memory type of each address, from the MTRRs (see [MTRR.md](MTRR.md));
+- `src/vmx/mtrr/mod.rs`: the memory type of each address, from the MTRRs (see [MTRR.md](MTRR.md));
 - `src/vmx/guest.rs`: the data page and the guest code that writes it;
 - `src/vmx/exit_decision/`: which EPT violation is accepted (`scenario.rs`, reached from `decide` in `mod.rs`);
 - `src/vmx/vmexit/`: the handler that reports and applies it;
@@ -147,10 +147,15 @@ same memory. Only the permissions can now differ.
 1. Reads the UEFI memory map and takes the highest address any region
    reaches, rounded up to 1 GiB (`identity_map_end`). Every region counts,
    whatever its type. One PDPT reaches 512 GiB, so that is the limit.
-2. Counts the 2 MiB regions that need a PT (`split_regions`): those whose
-   pages differ in memory type ([MTRR.md](MTRR.md)), and the one holding
+2. Gathers the memory map's RAM into sorted, merged ranges (`RamMap`):
+   RAM takes the MTRRs' memory type, and everything else (MMIO, reserved
+   memory, holes) is UC (`EptTypes`, [MTRR.md](MTRR.md) section 5).
+   Counts the 2 MiB regions that need a PT (`split_regions`): those whose
+   pages differ in memory type or are only partly RAM, and the one holding
    the guest's data page.
-3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs.
+3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs, plus spare
+   PTs for regions the guest's MTRR writes split later (`spare_pts`), and a
+   stack of the free PTs' indices.
 4. Points PML4 entry 0 at the PDPT and PDPT entry *i* at PD *i*.
 5. Fills every PD entry with a 2 MiB page, RWX, of the region's memory
    type, except for the regions counted in step 2. Their PD entry points to
@@ -159,6 +164,13 @@ same memory. Only the permissions can now differ.
 
 2 MiB pages keep the tables small. Only the regions that need a 4 KiB
 exception pay for a PT.
+
+`Ept::build` also returns the `TypeTables` the exit handler keeps: the PDs,
+the PTs with the spare ones, and the free stack. When the guest writes its
+MTRRs, `TypeTables::apply` rewrites the entries whose memory type changed,
+takes a spare PT for a region whose pages come to differ in type, gives the
+PT of a region of one type again back, and runs INVEPT (section 7,
+[MTRR.md](MTRR.md) section 7).
 
 On Hyper-V (2 GiB of RAM), before the memory types came from the MTRRs
 (every page was WB, and the data page's region had the only PT):
@@ -289,8 +301,9 @@ Like other VMX instructions it reports failure through CF/ZF;
 Strictly, this INVEPT is not needed: an EPT violation already drops the
 cached translations for the address that caused it, so the retried write
 would see W = 1 anyway. It is still the architectural way to publish an
-EPT change, and changes not caused by a violation (protecting a page while
-the guest runs, for example) will need it.
+EPT change, and changes not caused by a violation need it. The first such
+change is a guest MTRR write: `TypeTables::apply` changes the memory types
+of entries the CPU may have cached, then runs the same INVEPT.
 
 ## 8. The Hyper-V runs
 
@@ -361,8 +374,6 @@ section 10).
 
 ## 10. What is not covered yet
 
-- **Following the guest's MTRR changes.** The memory types are copied
-  from the MTRRs once, at bring-up ([MTRR.md](MTRR.md), section 7).
 - **Hiding Aleph0's own pages** (section 9). Each of them must become not
   present in EPT, with the access redirected or a #PF injected, or be
   mapped to a zero-filled shadow page. Aleph0 then has to track every page
@@ -389,7 +400,7 @@ section 10).
 | `EPT_POINTER` | `0x201A`; low bits `0x1E` = WB, 4 levels |
 | `IA32_VMX_PROCBASED_CTLS2` | `0x48B` |
 | `IA32_VMX_EPT_VPID_CAP` | `0x48C`; bits 6, 14, 16, 20, 25/26 required |
-| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs; 0 = UC, 6 = WB), 6 IPAT, 7 2 MiB page |
+| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs for RAM, UC for the rest; 0 = UC, 6 = WB), 6 IPAT, 7 2 MiB page |
 | Exit reason 48 | EPT violation: `GUEST_PHYSICAL_ADDRESS` `0x2400`, `GUEST_LINEAR_ADDRESS` `0x640A` |
 | Exit reason 49 | EPT misconfiguration: never handled |
 | Qualification | 0 read, 1 write, 2 fetch, 3/4/5 R/W/X allowed, 7 linear valid, 8 translated access, 12 NMI-unblocking IRET |

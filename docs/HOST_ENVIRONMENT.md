@@ -265,8 +265,12 @@ VM exit #15: ... NMIs: 1 reinjected, 1 handled by the guest.
 - **The guest's own tables** once the firmware runs as the guest: #21.
 - **Hiding these pages from the guest** through EPT: after the first boot.
 - **Per-CPU tables** for several vCPUs: after the first boot.
-- **Host PAT and EFER**: the exit controls do not load them, so the guest's
-  values still apply to host accesses.
+- **Host EFER**: the exit controls do not load it, so the bits of the
+  guest's value other than LME and LMA (NXE, SCE) still apply to host
+  accesses. IA32_PAT is switched when the CPU allows the controls for it
+  (`vmcs::pat_switch`: VM exit saves the guest's and loads `HOST_IA32_PAT`,
+  VM entry loads the guest's); on a CPU without them the guest's PAT still
+  applies to host accesses too.
 
 ## Cheat sheet
 

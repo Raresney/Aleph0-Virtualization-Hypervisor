@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::vmx::exit_decision::{ExitAction, IoSize};
+use crate::vmx::mtrr::MtrrCapabilities;
 
 /// The statistics after one resumed exit of `event`, with its own plan.
 fn after(event: ExitEvent) -> VcpuStats {
@@ -29,6 +30,7 @@ fn each_emulated_instruction_has_its_own_counter() {
     let emulated = |emulation| after(ExitEvent::Emulated(emulation));
     let port = 0x3FF;
     let size = IoSize::Byte;
+    let def_type = MtrrCapabilities::new(8, 46).unwrap().msr(0x2FF).unwrap();
     for (stats, counter) in [
         (emulated(Emulation::Cpuid { leaf: 1, subleaf: 0 }), "cpuid_exits"),
         (emulated(Emulation::Rdmsr { msr: 0xC000_0102 }), "msr_read_exits"),
@@ -38,6 +40,14 @@ fn each_emulated_instruction_has_its_own_counter() {
                 value: 0,
             }),
             "msr_write_exits",
+        ),
+        (emulated(Emulation::MtrrRead { msr: def_type }), "mtrr_read_exits"),
+        (
+            emulated(Emulation::MtrrWrite {
+                msr: def_type,
+                value: 0xC06,
+            }),
+            "mtrr_write_exits",
         ),
         (emulated(Emulation::In { port, size }), "io_in_exits"),
         (emulated(Emulation::Out { port, size, value: 0 }), "io_out_exits"),
@@ -80,7 +90,7 @@ fn stats_print_as_one_line_of_named_counters() {
     };
     assert_eq!(
         stats.to_string(),
-        "exits=13 cpuid_exits=1 msr_read_exits=2 msr_write_exits=2 io_in_exits=2 io_out_exits=2 \
-         halt_exits=1 nmi_injections=0 exception_injections=0"
+        "exits=13 cpuid_exits=1 msr_read_exits=2 msr_write_exits=2 mtrr_read_exits=0 mtrr_write_exits=0 \
+         io_in_exits=2 io_out_exits=2 halt_exits=1 nmi_injections=0 exception_injections=0"
     );
 }

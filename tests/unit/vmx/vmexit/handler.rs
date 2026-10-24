@@ -87,3 +87,15 @@ fn only_a_resumed_outcome_lets_the_guest_go_on() {
     assert!(Outcome::Stopped(ExitAction::Finished).stops());
     assert_eq!(Outcome::Stopped(ExitAction::Finished).action(), ExitAction::Finished);
 }
+
+#[test]
+fn guest_mtrr_failures_say_what_went_wrong() {
+    assert_eq!(
+        ResumeFailure::GuestMtrrs(MtrrAccessFailure::NotPublished).to_string(),
+        "the guest's MTRRs were never set up"
+    );
+    assert_eq!(
+        ResumeFailure::GuestMtrrs(MtrrAccessFailure::Invept(VmxFail::Invalid)).to_string(),
+        "EPT took the guest's MTRR types, but INVEPT failed (Invalid)"
+    );
+}

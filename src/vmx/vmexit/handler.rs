@@ -21,6 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use core::fmt;
 
+use super::guest_mtrrs::{self, MtrrAccessFailure, MtrrWrite};
 use super::history::{self, ExitRecord};
 use super::policy::{self, COUNTERS, MAX_LEVEL, exit_detail};
 use super::report::{ExitReport, report_exit, report_stop};
@@ -36,6 +37,7 @@ use crate::vmx::exit_decision::{
 use crate::vmx::host;
 use crate::vmx::instruction::VmxFail;
 use crate::vmx::msr;
+use crate::vmx::mtrr::MtrrMsr;
 use crate::vmx::vmcs::fields::{
     EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, IDT_VECTORING_ERROR_CODE,
     IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO,
@@ -263,6 +265,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     let interruptibility = read_field(GUEST_INTERRUPTIBILITY_STATE);
     let idt_vectoring = read_field(IDT_VECTORING_INFO);
     let protected = ept::protected_page();
+    let mtrr = guest_mtrrs::capabilities();
 
     // Only EPT and I/O exits are judged by EXIT_QUALIFICATION. For any other
     // exit an unreadable one (reported later) does not matter.
@@ -300,6 +303,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
                 qualification,
                 guest_physical,
                 protected_page: protected.map_or(0, |page| page.gpa),
+                mtrr,
             })
         }
         // An unreadable field is reported later; without it the exit cannot
@@ -453,6 +457,17 @@ pub(super) enum EmulationOutcome {
     Rdmsr { msr: u32, value: u64 },
     /// WRMSR wrote `value` to `msr`.
     Wrmsr { msr: u32, value: u64 },
+    /// RDMSR of the guest's MTRR `msr` returned `value`, from its copy.
+    MtrrRead { msr: MtrrMsr, value: u64 },
+    /// WRMSR wrote `value` to the guest's MTRR `msr`, in its copy, with
+    /// what EPT made of it (`write`). The CPU's own MSR holds `cpu_value`,
+    /// read after the write, which it leaves alone.
+    MtrrWrite {
+        msr: MtrrMsr,
+        value: u64,
+        cpu_value: u64,
+        write: MtrrWrite,
+    },
     /// IN of `size` from `port` read `value`.
     In { port: u16, size: IoSize, value: u32 },
     /// OUT of `value` (`size` wide) to `port`.
@@ -460,9 +475,10 @@ pub(super) enum EmulationOutcome {
 }
 
 /// Executes `emulation` in root operation and writes its result into the
-/// guest's registers in `frame`.
-fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome {
-    match emulation {
+/// guest's registers in `frame`. Only an access to the guest's MTRRs can
+/// fail.
+fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationOutcome, ResumeFailure> {
+    Ok(match emulation {
         Emulation::Cpuid { leaf, subleaf } => {
             // In root operation CPUID returns the processor's values (under
             // Hyper-V: what Hyper-V shows Aleph0).
@@ -498,6 +514,28 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome 
             unsafe { msr::wrmsr(msr, value) };
             EmulationOutcome::Wrmsr { msr, value }
         }
+        Emulation::MtrrRead { msr } => {
+            let value = guest_mtrrs::read(msr).map_err(ResumeFailure::GuestMtrrs)?;
+            // RDMSR writes EAX and EDX, which zero-extends them.
+            frame.rax = value & 0xFFFF_FFFF;
+            frame.rdx = value >> 32;
+            EmulationOutcome::MtrrRead { msr, value }
+        }
+        Emulation::MtrrWrite { msr, value } => {
+            // SAFETY: exit context: VMX root operation, the guest stopped at
+            // this exit.
+            let write = unsafe { guest_mtrrs::write(msr, value) }.map_err(ResumeFailure::GuestMtrrs)?;
+            // SAFETY: `decide` routes only the MTRR MSRs the CPU has to the
+            // copy, and reading one has no side effects. Read for the report,
+            // which shows the CPU's untouched.
+            let cpu_value = unsafe { msr::rdmsr(msr.address()) };
+            EmulationOutcome::MtrrWrite {
+                msr,
+                value,
+                cpu_value,
+                write,
+            }
+        }
         Emulation::In { port, size } => {
             // SAFETY: the guest asked for exactly this access, which it could
             // have made without Aleph0, and IN/OUT at CPL 0 in root operation
@@ -526,7 +564,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> EmulationOutcome 
             }
             EmulationOutcome::Out { port, size, value }
         }
-    }
+    })
 }
 
 /// How the guest goes on after [`prepare_resume`].
@@ -558,6 +596,8 @@ pub(super) enum ResumeFailure {
     NoProtectedPage,
     /// INVEPT failed after the protected page was made writable.
     GrantWrite(VmxFail),
+    /// RDMSR or WRMSR of the guest's MTRRs failed.
+    GuestMtrrs(MtrrAccessFailure),
     /// The exit interrupted an event's delivery, but this exit's plan already
     /// advances RIP or injects its own event, so the event cannot be
     /// re-delivered: only one event is injected per VM entry. (A software
@@ -574,6 +614,7 @@ impl fmt::Display for ResumeFailure {
             Self::Write { what, error } => write!(f, "could not {what} ({error:?})"),
             Self::NoProtectedPage => f.write_str("no protected page to make writable"),
             Self::GrantWrite(error) => write!(f, "could not make the protected page writable (INVEPT {error:?})"),
+            Self::GuestMtrrs(failure) => write!(f, "{failure}"),
             Self::RedeliveryConflict => f.write_str(
                 "an interrupted event cannot be re-delivered while the exit advances RIP or injects its own event",
             ),
@@ -616,7 +657,7 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
     };
     // Before RIP moves: the guest resumes past the instruction with its
     // result already in its registers.
-    let emulated = emulate.map(|emulation| execute(emulation, frame));
+    let emulated = emulate.map(|emulation| execute(emulation, frame)).transpose()?;
 
     let resume_rip = if let Some(next) = advance_to {
         write_for_resume(GUEST_RIP, next, "advance guest RIP")?;

@@ -26,7 +26,8 @@ pub enum BringUpError {
     ExitBitmaps(ExitBitmapsError),
     VmxNotSupportedByCpu,
     VmxDisabledByFirmware,
-    /// The MTRRs hold something Aleph0 cannot copy into EPT. Before VMXON.
+    /// An MTRR MSR holds a value the CPU would refuse, or the MTRRs hold
+    /// something Aleph0 cannot copy into EPT. Before VMXON.
     Mtrr(MtrrError),
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
     /// failed. Both happen before VMXON.
@@ -61,6 +62,9 @@ pub enum BringUpError {
         number: u64,
         reason: ExitReason,
     },
+    /// The CPU's MTRRs read differently after the guest than before: a
+    /// guest write reached them instead of the guest's copy.
+    MtrrsChanged,
     /// The guest finished, but its exit statistics differ from what the
     /// test guest does (`guest::expected_stats`): an emulated exit is
     /// missing or came twice.
@@ -186,13 +190,7 @@ pub fn report_error(error: BringUpError) {
         BringUpError::ExitBitmaps(error) => log!("Exit bitmap allocation failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
-        BringUpError::Mtrr(MtrrError::ReservedType { msr, value }) => {
-            log!("MTRR setup failed: MSR {msr:#x} gives a range the reserved memory type {value}.")
-        }
-        BringUpError::Mtrr(MtrrError::TooManyVariableRanges { count }) => log!(
-            "MTRR setup failed: IA32_MTRRCAP reports {count} variable ranges, more than the {} Aleph0 keeps.",
-            vmx::mtrr::MAX_VARIABLE_RANGES,
-        ),
+        BringUpError::Mtrr(error) => log!("MTRR setup failed: {error}."),
         BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(
             "EPT setup failed: the memory map reaches {end:#x}, past the {:#x} one PDPT maps.",
             vmx::ept::MAX_IDENTITY_MAP,
@@ -230,6 +228,9 @@ pub fn report_error(error: BringUpError) {
             vmx::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
         ),
+        BringUpError::MtrrsChanged => {
+            log!("The CPU's MTRRs changed while the guest ran: a guest write reached them, not its copy.")
+        }
         BringUpError::UnexpectedExitStats(stats) => log!(
             "Guest finished, but its exit statistics were {stats}; expected {}.",
             vmx::guest::expected_stats(&stats),

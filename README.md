@@ -21,8 +21,12 @@ Verified on Hyper-V with nested virtualization:
 - [x] Enters VMX root operation and fills in a complete VMCS
 - [x] Runs root operation on its own page tables, GDT, TSS and IDT
 - [x] Launches a minimal guest and resumes it with VMRESUME after each exit
-- [x] EPT identity map with the memory types the MTRRs give; a read-only guest
-      page whose write exits to Aleph0, which grants the write and retries it
+- [x] EPT identity map with the memory types the MTRRs give to RAM, and UC for
+      MMIO and everything else; a read-only guest page whose write exits to
+      Aleph0, which grants the write and retries it
+- [x] Keeps the guest's MTRR writes in a copy, never the CPU's, with the #GP
+      of a value the CPU would refuse, and gives EPT the types the copy gives
+      (host-tested; the Hyper-V run is still to be recorded)
 - [x] Emulates CPUID, RDMSR/WRMSR and IN/OUT by passthrough, with MSR and I/O
       bitmaps limiting which MSRs and ports exit
 - [x] Catches an NMI that arrives while the guest runs and reinjects it into
@@ -142,13 +146,13 @@ diagnostics that run before VMXON.
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
-| `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT |
-| `src/vmx/mtrr.rs` | The MTRRs: reading and checking them, and the memory type of each address, which the EPT entries copy |
+| `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT, and the memory types that follow the guest's MTRRs, with spare PTs |
+| `src/vmx/mtrr/` | The MTRRs: decoding them and the memory type of each address, which the EPT entries copy (`mod.rs`); the MTRR MSRs a CPU has, the values WRMSR refuses, reading them, and the guest's copy (`registers.rs`) |
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the guest stops |
-| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
-| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
+| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); the guest's copy of its MTRRs (`guest_mtrrs.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
+| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
@@ -164,7 +168,7 @@ references it relies on:
 - [PAGE_TABLE_WALK.md](docs/PAGE_TABLE_WALK.md): page tables and how Aleph0 walks them
 - [HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md): the page tables, GDT, TSS and IDT that VM exits load, and NMIs in root operation
 - [EPT.md](docs/EPT.md): the second translation stage, the identity map and the intentional EPT violation
-- [MTRR.md](docs/MTRR.md): memory types, the MTRRs and how EPT entries get them
+- [MTRR.md](docs/MTRR.md): memory types, the MTRRs, how EPT entries get them, and the guest's copy of its MTRRs
 - [EMULATED_EXITS.md](docs/EMULATED_EXITS.md): CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation
 - [NMI.md](docs/NMI.md): catching NMIs in the guest and reinjecting them
 - [CLEAN_STOP.md](docs/CLEAN_STOP.md): stopping the guest, leaving VMX and returning to firmware

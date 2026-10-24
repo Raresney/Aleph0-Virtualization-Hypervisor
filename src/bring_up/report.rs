@@ -5,12 +5,13 @@
 
 use super::PassthroughState;
 use crate::vmx;
+use crate::vmx::ept::{Ept, TypeTables};
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
 use crate::vmx::host::{HostEnvironment, InterruptStack};
 use crate::vmx::msr::VmcsControlMsrs;
-use crate::vmx::mtrr::{MemoryType, Mtrrs};
+use crate::vmx::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
 
 /// Prints the segmentation state of the context tables, which the guest
 /// state copies and the host GDT keeps the selectors of.
@@ -86,57 +87,41 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
 /// default type, each variable range in use, and the types the fixed ranges
 /// give the first MiB.
 pub(super) fn mtrrs(mtrrs: &Mtrrs) {
-    let enabled = match mtrrs {
-        Mtrrs::Unsupported => {
-            log!("MTRRs: not supported (CPUID); all memory is treated as WB.");
-            return;
-        }
-        Mtrrs::Disabled => {
-            log!("MTRRs: disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC.");
-            return;
-        }
-        Mtrrs::Enabled(enabled) => enabled,
+    log!("MTRRs: {mtrrs}.");
+    let Mtrrs::Enabled(enabled) = mtrrs else {
+        return;
     };
-    log!(
-        "MTRRs: enabled, default type {}; fixed ranges {}; {} variable ranges, {} in use.",
-        enabled.default_type().name(),
-        if enabled.fixed_enabled() { "enabled" } else { "disabled" },
-        enabled.variable_count(),
-        enabled.variable_ranges().len(),
-    );
     for range in enabled.variable_ranges() {
-        log!(
-            "MTRR variable range {}: base={:#014x} mask={:#014x} {}",
-            range.number,
-            range.base,
-            range.mask,
-            range.memory_type.name(),
-        );
+        log!("MTRR {range}");
     }
     if enabled.fixed_enabled() {
         for run in mtrrs.runs(vmx::mtrr::FIXED_END, vmx::page::PAGE_SIZE as u64) {
-            log!(
-                "MTRR fixed {:#07x}..{:#07x}: {}",
-                run.start,
-                run.end,
-                type_name(run.memory_type)
-            );
+            log!("MTRR fixed {:#07x}..{:#07x}: {}", run.start, run.end, run.type_name());
         }
     }
 }
 
-/// Prints the EPT identity map [`Ept::build`](vmx::ept::Ept::build) made,
-/// and how its PD entries map each run of 2 MiB regions: read back from the
-/// entries, so the lines show what the CPU walks.
-pub(super) fn ept(ept: &vmx::ept::Ept, data_page: u64) {
+/// Prints the EPT identity map [`Ept::build`] made, and how its PD entries
+/// (`types`) map each run of 2 MiB regions: read back from the entries, so
+/// the lines show what the CPU walks.
+pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
     log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages and {} spare PTs for the guest's MTRR writes; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
         ept.end(),
         ept.end() >> 30,
         ept.table_pages(),
         ept.split_regions(),
+        ept.spare_pts(),
     );
-    for run in ept.region_runs() {
+    let ram = types.ram().ranges();
+    log!(
+        "EPT memory types: the MTRRs' for the {} RAM range(s) of the UEFI memory map, UC for everything else (MMIO, reserved memory, holes).",
+        ram.len()
+    );
+    for &(start, end) in ram {
+        log!("EPT RAM {start:#014x}..{end:#014x}");
+    }
+    for run in types.region_runs(0, ept.end()) {
         log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
     }
 }
@@ -168,15 +153,6 @@ pub(super) fn host_environment(host: &HostEnvironment, firmware_cr3: u64) {
     for stack in InterruptStack::ALL {
         let (name, ist, top) = (stack.name(), stack.ist(), host.interrupt_stack_top(stack));
         log!("Host interrupt stack: {name} IST{ist} top={top:#018x}.");
-    }
-}
-
-/// A run's type for the report: its name, or "mixed" for blocks whose pages
-/// differ.
-fn type_name(memory_type: Option<MemoryType>) -> &'static str {
-    match memory_type {
-        Some(memory_type) => memory_type.name(),
-        None => "mixed (4 KiB pages)",
     }
 }
 
@@ -214,8 +190,10 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     );
 }
 
-/// Prints where the exit bitmaps are and what they intercept.
-pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps) {
+/// Prints where the exit bitmaps are and what they intercept: the MSRs
+/// passed through, every MTRR address, of which the guest's copy holds
+/// those `mtrr` lists, and the ports.
+pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, mtrr: MtrrCapabilities) {
     log!(
         "Exit bitmaps allocated: MSR={:#018x} I/O A={:#018x} I/O B={:#018x}.",
         bitmaps.msr_address(),
@@ -223,6 +201,34 @@ pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps) {
         bitmaps.io_b_address(),
     );
     log!("Intercepted MSRs (read and write): {INTERCEPTED_MSRS:x?}; intercepted ports: {INTERCEPTED_PORTS:x?}.");
+    let addresses = vmx::mtrr::every_msr_address().count();
+    match mtrr.msrs().count() {
+        0 => log!("Intercepted MTRR addresses (read and write): all {addresses}, which get #GP: the CPU has no MTRRs."),
+        count => log!(
+            "Intercepted MTRR addresses (read and write): all {addresses}. The guest reads and writes a copy of the {count} MSRs the CPU has (IA32_MTRR_DEF_TYPE, {} fixed-range MSRs and {} variable ranges); the other {} get #GP.",
+            if mtrr.fixed() { vmx::mtrr::FIXED_MSRS } else { 0 },
+            mtrr.variable_count(),
+            addresses - count,
+        ),
+    }
+}
+
+/// Prints whether the CPU's MTRRs read the same after the guest
+/// (`before`, `after`), and whether the guest left its copy (`guest`) as
+/// it found it. Still in the exit phase, so serial only.
+pub(super) fn mtrrs_after_guest(
+    before: &Result<MtrrRegisters, MtrrError>,
+    after: &Result<MtrrRegisters, MtrrError>,
+    guest: Option<&MtrrRegisters>,
+) {
+    match (before, after) {
+        (Ok(before), Ok(after)) => log!(
+            "MTRRs after the guest: the CPU's unchanged={}; the guest's copy restored={}.",
+            before == after,
+            guest == Some(before),
+        ),
+        (Err(error), _) | (_, Err(error)) => log!("MTRRs after the guest: the CPU's could not be read: {error}."),
+    }
 }
 
 /// Prints the host state the guest reached through passthrough emulation,
