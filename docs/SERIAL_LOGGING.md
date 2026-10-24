@@ -260,6 +260,9 @@ Aleph0's lines only.
 - `-NoSerial` skips both readers (the ports stay attached). You can also
   connect with PuTTY: connection type *Serial*, serial line
   `\\.\pipe\aleph0-com2`.
+- With `-WithoutAleph0`, which boots the Linux target in Aleph0's place
+  ([LINUX_GUEST.md](LINUX_GUEST.md)), nothing writes COM2: the runner starts
+  only the COM1 reader, and it prints the kernel's console in the window too.
 
 ### QEMU
 
