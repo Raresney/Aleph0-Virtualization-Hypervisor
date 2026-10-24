@@ -26,7 +26,7 @@ Verified on Hyper-V with nested virtualization:
       Aleph0, which grants the write and retries it
 - [x] Keeps the guest's MTRR writes in a copy, never the CPU's, with the #GP
       of a value the CPU would refuse, and gives EPT the types the copy gives
-      (host-tested; the Hyper-V run is still to be recorded)
+      (the #GP host-tested only)
 - [x] Emulates CPUID, RDMSR/WRMSR and IN/OUT by passthrough, with MSR and I/O
       bitmaps limiting which MSRs and ports exit
 - [x] Catches an NMI that arrives while the guest runs and reinjects it into
