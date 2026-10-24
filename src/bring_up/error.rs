@@ -65,6 +65,10 @@ pub enum BringUpError {
     /// The CPU's MTRRs read differently after the guest than before: a
     /// guest write reached them instead of the guest's copy.
     MtrrsChanged,
+    /// The exit handler wrote the lowest word of the VM-exit stack: it used
+    /// all of it and may have run on into the memory below, which nothing
+    /// guards.
+    VmExitStackFull,
     /// The guest finished, but its exit statistics differ from what the
     /// test guest does (`guest::expected_stats`): an emulated exit is
     /// missing or came twice.
@@ -231,6 +235,10 @@ pub fn report_error(error: BringUpError) {
         BringUpError::MtrrsChanged => {
             log!("The CPU's MTRRs changed while the guest ran: a guest write reached them, not its copy.")
         }
+        BringUpError::VmExitStackFull => log!(
+            "The exit handler used all {} bytes of the VM-exit stack and may have overwritten the memory below it.",
+            vmx::vmexit::VM_EXIT_STACK_SIZE,
+        ),
         BringUpError::UnexpectedExitStats(stats) => log!(
             "Guest finished, but its exit statistics were {stats}; expected {}.",
             vmx::guest::expected_stats(&stats),

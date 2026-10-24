@@ -90,7 +90,7 @@ Three stacks are in play, and only the first one holds the saved frame:
 | Stack | Who uses it | While the guest runs |
 |---|---|---|
 | firmware stack | `main`, `run`, `launch`, `vmx_launch` | frozen; nothing writes it |
-| VM-exit stack (4 pages, `HOST_RSP`) | the exit stub and handler | every exit starts at its top again |
+| VM-exit stack (16 pages, `HOST_RSP`) | the exit stub and handler | every exit starts at its top again |
 | guest stack page | the guest | the guest's RSP |
 
 The guest runs with IF = 0, and every guest exception exits (exception

@@ -370,11 +370,19 @@ fn launch_guest(
     // state; the exit stack, guest pages, EPT tables, host environment and
     // exit bitmaps are never freed.
     let stop = unsafe { vmx::vmcs::launch() };
+    // SAFETY: the guest has stopped, so no exit handler runs on the stack.
+    let stack_used = unsafe { vmexit_stack.used() };
+    log!("VM-exit stack: {stack_used} of {VM_EXIT_STACK_SIZE} bytes used.");
     report::passthrough_state(before, PassthroughState::read());
     let mtrrs_after = vmx::mtrr::read();
     // The guest has stopped, so no exit handler writes its MTRRs any more.
     let guest_mtrrs = vmx::vmexit::guest_mtrr_registers();
     report::mtrrs_after_guest(&mtrrs_before, &mtrrs_after, guest_mtrrs.as_ref());
+    // Before the guest's own result: an overflow corrupts whatever lies below
+    // the stack, and the guest's stop may only be its consequence.
+    if stack_used == VM_EXIT_STACK_SIZE {
+        return Err(BringUpError::VmExitStackFull);
+    }
     let run = guest_result(stop)?;
     // The guest has stopped, so no exit handler is counting any more.
     let stats = vmx::vmexit::vcpu_stats();
