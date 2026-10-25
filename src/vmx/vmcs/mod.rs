@@ -19,7 +19,8 @@
 //!    even on a freshly zeroed page.
 //! 3. [`VmcsRegion::vmptrld`] — make it the *current* VMCS. From here on
 //!    [`vmread`]/[`vmwrite`] act on it implicitly, with no address operand.
-//! 4. [`vmwrite`] the fields, then [`launch`] (VMLAUNCH).
+//! 4. [`vmwrite`] the fields, then [`launch`] or [`launch_in_place`]
+//!    (VMLAUNCH).
 //!
 //! [`VmcsRegion::create_current`] runs steps 1-3.
 //!
@@ -42,7 +43,7 @@ use core::arch::asm;
 pub mod fields;
 mod launch;
 
-pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpected, launch};
+pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpected, launch, launch_in_place};
 
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
@@ -84,19 +85,39 @@ impl DesiredControls {
     }
 }
 
-/// Which guest the VMCS is set up for.
+/// Which guest Aleph0 runs. The kind decides where the guest starts
+/// (`guest_state::GuestEntry`), which exceptions exit ([`exception_bitmap`]),
+/// how its exits are decided (`exit_decision::decide`), and where a stop
+/// ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestKind {
-    /// Aleph0's built-in test guest (`vmx::guest`): its IDT has only the NMI
-    /// gate.
+    /// Aleph0's built-in test guest (`vmx::guest`), the regression mode. Its
+    /// IDT has only the NMI gate, and its scripted VMCALLs end the run. A
+    /// stop returns to bring-up ([`launch`]), and bring-up then leaves VMX
+    /// operation.
     BuiltInTest,
-    /// A guest with its own full IDT, such as the firmware or an OS, which
-    /// handles its own faults.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "selected once the firmware runs as the guest (#21)")
-    )]
-    OwnIdt,
+    /// The running firmware, virtualized in place ([`launch_in_place`]). It
+    /// has its own full IDT and handles its own faults. It never finishes,
+    /// and a stop halts: the firmware has reused the stack the launch ran
+    /// on.
+    Firmware,
+}
+
+impl GuestKind {
+    /// The guest this build runs: the built-in test guest with the
+    /// `test-guest` Cargo feature, the firmware otherwise.
+    pub const SELECTED: Self = if cfg!(feature = "test-guest") {
+        Self::BuiltInTest
+    } else {
+        Self::Firmware
+    };
+
+    /// Whether a stop of this guest returns to bring-up, through the frame
+    /// [`launch`] saved. [`launch_in_place`] saves none, so a stop of the
+    /// firmware halts.
+    pub const fn stop_returns_to_bring_up(self) -> bool {
+        matches!(self, Self::BuiltInTest)
+    }
 }
 
 /// The exception bitmap for `kind`.
@@ -107,14 +128,14 @@ pub enum GuestKind {
 /// exception arrive as exit reason 0, where the handler prints the vector;
 /// its `ud2` paths rely on that.
 ///
-/// A guest with its own IDT takes its own faults (Linux builds its early
-/// page tables from #PF), so nothing exits. NMIs still exit, through the
-/// NMI-exiting pin control, not this bitmap; a fault the guest cannot handle
-/// ends in a triple fault (reason 2), which stops it.
+/// The firmware has its own IDT and takes its own faults, as an OS will
+/// (Linux builds its early page tables from #PF), so nothing exits. NMIs
+/// still exit, through the NMI-exiting pin control, not this bitmap; a fault
+/// the guest cannot handle ends in a triple fault (reason 2), which stops it.
 pub const fn exception_bitmap(kind: GuestKind) -> u32 {
     match kind {
         GuestKind::BuiltInTest => u32::MAX,
-        GuestKind::OwnIdt => 0,
+        GuestKind::Firmware => 0,
     }
 }
 

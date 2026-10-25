@@ -36,6 +36,7 @@ cargo build                                            # the .efi
 cargo test-host                                        # host unit tests
 cargo fmt --check                                      # rustfmt.toml: 120 columns
 cargo clippy                                           # lints for the UEFI build
+cargo clippy --features test-guest                     # lints for the regression mode
 cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
 ```
 
@@ -123,9 +124,18 @@ Host tests cannot prove that VM entry succeeds or that an exit behaves as
 planned. A change that affects what runs in VMX operation needs a boot:
 
 ```powershell
-.\scripts\run-hyperv.ps1              # from an elevated PowerShell session
-.\scripts\run-hyperv.ps1 -InjectNmi   # also exercises NMI reinjection
+# From an elevated PowerShell session.
+.\scripts\run-hyperv.ps1 -ProcessorCount 1   # the firmware, virtualized in place
+.\scripts\run-hyperv.ps1 -TestGuest          # the test guest: the regression mode
+.\scripts\run-hyperv.ps1 -InjectNmi          # the test guest, with NMI reinjection
 ```
+
+A default build virtualizes the running firmware: Aleph0 returns to it in
+VMX non-root operation, and it runs until an exit Aleph0 does not handle,
+which halts after the stop's report. The test guest (Cargo feature
+`test-guest`) runs a fixed script, then teardown, and returns `SUCCESS`, so
+its exits can be compared run by run. A change to VM exits is checked in
+both modes.
 
 VM-exit diagnostics appear only on serial (the PowerShell window and
 `run\serial.log`). Put the relevant serial lines in the pull request, and

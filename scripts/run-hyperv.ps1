@@ -26,10 +26,18 @@
     Do not read the COM ports after starting the VM. Both stay attached, so
     read-serial.ps1 can connect later.
 
+.PARAMETER TestGuest
+    Builds the regression mode (Cargo feature test-guest): Aleph0 runs its
+    built-in test guest, stops it after its scripted VMCALLs, leaves VMX
+    operation and returns to firmware with SUCCESS. Without it, Aleph0
+    virtualizes the running firmware in place and returns to it in VMX
+    non-root operation.
+
 .PARAMETER InjectNmi
-    Gives the VM one vCPU and, as soon as serial shows the guest resumed
-    after its first VMCALL, injects an NMI with Debug-VM. Tests NMI exiting
-    and reinjection; the result appears on serial.
+    Gives the VM one vCPU, runs the test guest (-TestGuest), and, as soon as
+    serial shows the guest resumed after its first VMCALL, injects an NMI
+    with Debug-VM. Tests NMI exiting and reinjection; the result appears on
+    serial.
 
 .PARAMETER Features
     Cargo features to build with, comma-separated, for the test-only
@@ -38,7 +46,8 @@
     runs in VMX root operation), unexpected-exit-test (the guest stops at
     main VMCALL #1 as an unexpected exit), ept-misconfig-test (the guest's
     Local APIC read is an EPT misconfiguration, which stops it with a walk
-    of the tables), or trace-exits (every VM exit printed in full).
+    of the tables), or trace-exits (every VM exit printed in full). All but
+    host-fault-test and trace-exits turn on test-guest themselves.
 
 .PARAMETER ProcessorCount
     vCPUs to give the VM: 2 by default, 1 with -InjectNmi, which refuses any
@@ -62,6 +71,7 @@ param(
     [string]$PipeName = "aleph0-com2",
     [string]$GuestPipeName = "aleph0-com1",
     [switch]$NoSerial,
+    [switch]$TestGuest,
     [switch]$InjectNmi,
     [string]$Features = "",
     [ValidateRange(1, 1024)]
@@ -135,7 +145,10 @@ if ($WithoutAleph0 -and $InjectNmi) {
 if (-not $WithoutAleph0) {
     $cargoArgs = @("build")
     if ($Release) { $cargoArgs += "--release" }
-    if ($Features) { $cargoArgs += @("--features", $Features) }
+    # The NMI job waits for a line only the test guest's VMCALLs print.
+    $cargoFeatures = @($Features -split ',' | Where-Object { $_ })
+    if ($TestGuest -or $InjectNmi) { $cargoFeatures += "test-guest" }
+    if ($cargoFeatures) { $cargoArgs += @("--features", ($cargoFeatures -join ',')) }
     Write-Host "==> cargo $($cargoArgs -join ' ')" -ForegroundColor Cyan
     Push-Location $root
     cargo @cargoArgs

@@ -24,9 +24,10 @@ use core::fmt;
 use super::guest_mtrrs::{self, MtrrAccessFailure, MtrrWrite};
 use super::history::{self, ExitRecord};
 use super::policy::{self, COUNTERS, MAX_LEVEL, exit_detail};
-use super::report::{ExitReport, report_exit, report_stop};
+use super::report::{ExitReport, after_stop, report_exit, report_stop};
 use super::stats::{self, VcpuStats};
 use super::{RegisterFrame, read_field};
+use crate::output::Phase;
 use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
@@ -43,7 +44,7 @@ use crate::vmx::vmcs::fields::{
     IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO,
     VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
-use crate::vmx::vmcs::{self, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
+use crate::vmx::vmcs::{self, GuestKind, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
 /// Exits so far per basic reason ([`policy::counter`]), including the
 /// current one: for the print policy and the histogram every stop prints.
@@ -113,8 +114,9 @@ fn next_rip(rip: u64, length: u64) -> Option<u64> {
 /// VM-exit handler: decides what the exit is (`exit_decision::decide`),
 /// carries that out, prints the exit over serial, then tells the entry stub
 /// what to do. It returns [`RESUME_GUEST`] after preparing the VMCS for the
-/// guest to go on (the stub then executes VMRESUME), or a stop value (the
-/// stub then returns it from `vmcs::launch` to bring-up).
+/// guest to go on (the stub then executes VMRESUME), or, for the test guest,
+/// a stop value (the stub then returns it from `vmcs::launch` to bring-up).
+/// A stop of the firmware halts here ([`halt_unless_returnable`]).
 ///
 /// Runs on the VM-exit stack with interrupts off. It may only use things
 /// that need no firmware: VMREAD/VMWRITE (the VMCS is still current) and the
@@ -125,11 +127,13 @@ fn next_rip(rip: u64, length: u64) -> Option<u64> {
 #[unsafe(no_mangle)]
 extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     // First, so every line below (and any panic) skips the firmware console.
-    // Bring-up switches it back once it has left VMX operation.
-    crate::output::set_phase(crate::output::Phase::VmExit);
+    // Put back when the guest resumes. After a stop that returns, bring-up
+    // switches it back once it has left VMX operation.
+    let phase = crate::output::set_phase(Phase::VmExit);
     #[cfg(feature = "host-fault-test")]
     host::fault_on_purpose();
 
+    let guest = GuestKind::SELECTED;
     let number = stats::update(VcpuStats::count_exit);
     // SAFETY: the entry stub passes a pointer to the frame it just pushed on
     // the exit stack. It stays put until this returns and nothing else
@@ -138,7 +142,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     let read = read_exit(frame);
     let host_nmi = host::take_pending_nmi();
-    let (event, next) = judge(read.exit, host_nmi);
+    let (event, next) = judge(guest, read.exit, host_nmi);
     let outcome = carry_out(event, &read, next, frame);
     if let Outcome::Resumed { plan, .. } = outcome {
         stats::update(|stats| stats.count_resumed(event, plan));
@@ -148,6 +152,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let basic = read.reason().map_or(UNREADABLE_REASON, |reason| reason.basic);
     let count = count_exit(basic);
     report_exit(&ExitReport {
+        guest,
         number,
         count,
         detail: exit_detail(count, outcome.stops(), read.unreadable(), MAX_LEVEL),
@@ -159,6 +164,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     });
     if outcome.stops() {
         report_stop(number, frame, &exits_by_reason());
+        halt_unless_returnable(guest);
     } else {
         #[cfg(feature = "host-nmi-test")]
         if event == ExitEvent::MainVmcall {
@@ -166,8 +172,19 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
         }
         // Last, after every VMCS write of this exit.
         keep_nmi_window_for_host_nmi(number);
+        crate::output::set_phase(phase);
     }
     stub_return(outcome.action(), number, read.raw_reason())
+}
+
+/// Halts after a stop of a `guest` whose stop cannot return to bring-up
+/// (`GuestKind::stop_returns_to_bring_up`): the firmware, launched in place,
+/// has reused the stack `vmcs::launch_in_place` ran on, and no frame was
+/// saved to jump back to. The stop's report is already on serial.
+fn halt_unless_returnable(guest: GuestKind) {
+    if !guest.stop_returns_to_bring_up() {
+        crate::output::halt_forever();
+    }
 }
 
 /// What [`read_exit`] read about one exit. Each VMCS field keeps its VMREAD
@@ -326,14 +343,14 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     }
 }
 
-/// Decides what `exit` is with the state kept between exits, and keeps the
-/// state for the next one. An NMI that arrived in root operation since the
-/// last exit (`host_nmi`) is pending for the guest first. An exit that could
-/// not be read is unexpected.
-fn judge(exit: Option<ExitInfo>, host_nmi: bool) -> (ExitEvent, ExitState) {
+/// Decides what `exit` of `guest` is with the state kept between exits, and
+/// keeps the state for the next one. An NMI that arrived in root operation
+/// since the last exit (`host_nmi`) is pending for the guest first. An exit
+/// that could not be read is unexpected.
+fn judge(guest: GuestKind, exit: Option<ExitInfo>, host_nmi: bool) -> (ExitEvent, ExitState) {
     let state = load_state().with_host_nmi(host_nmi);
     let (event, next) = match exit {
-        Some(exit) => decide(state, exit),
+        Some(exit) => decide(guest, state, exit),
         None => (ExitEvent::Unexpected, state),
     };
     store_state(next);
@@ -776,9 +793,13 @@ unsafe fn write_redelivery(redelivery: Redelivery) -> Result<(), VmcsError> {
 /// the guest; `rflags` is RFLAGS right after it, and `frame` the guest's
 /// registers, which the stub pushed again. Prints why, then the same stop
 /// report as an exit that stops the guest, and returns the stop value the
-/// stub hands back to bring-up.
+/// stub hands back to bring-up, or halts for the firmware.
 #[unsafe(no_mangle)]
 extern "efiapi" fn vmresume_failed(rflags: u64, frame: *const RegisterFrame) -> u64 {
+    // The handler put the guest's phase back before VMRESUME; this is exit
+    // context again.
+    crate::output::set_phase(Phase::VmExit);
+    let guest = GuestKind::SELECTED;
     let tag = crate::TAG;
     match vmcs::resume_failure(rflags) {
         // SAFETY: a VmFailValid implies VMX operation with a current VMCS,
@@ -792,12 +813,13 @@ extern "efiapi" fn vmresume_failed(rflags: u64, frame: *const RegisterFrame) -> 
         },
         error => crate::serial_println!("{tag} VMRESUME failed: {error:?}"),
     }
-    crate::serial_println!("{tag} VMRESUME failed; stopping the guest; returning to bring-up.");
+    crate::serial_println!("{tag} VMRESUME failed; stopping the guest; {}.", after_stop(guest));
     // SAFETY: the stub passes the frame it just pushed on the exit stack,
     // which stays put until this returns.
     let frame = unsafe { &*frame };
     // The VMRESUME belongs to the last exit, so its number heads the report.
     report_stop(stats::snapshot().exits, frame, &exits_by_reason());
+    halt_unless_returnable(guest);
     encode_resume_failed(rflags)
 }
 

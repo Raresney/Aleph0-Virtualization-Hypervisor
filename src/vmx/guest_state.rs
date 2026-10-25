@@ -5,17 +5,18 @@
 //! guest will have must therefore be written here first.
 //!
 //! The simplest valid 64-bit state is a copy of what the host CPU is running
-//! with right now, since that state demonstrably works:
+//! with right now, since that state demonstrably works. Only RIP, RSP,
+//! RFLAGS and IDTR depend on the guest ([`GuestEntry`]):
 //!
 //! | Guest field                  | Value                                     |
 //! |------------------------------|-------------------------------------------|
-//! | RIP, RSP                     | the guest code page and guest stack top   |
-//! | RFLAGS                       | `0x2`: only the always-1 bit; IF = 0, AC = 0 |
+//! | RIP, RSP                     | test guest: its code page and stack top; firmware: the instruction after VMLAUNCH and the stack it runs on |
+//! | RFLAGS                       | test guest: `0x2`, only the always-1 bit (IF = 0, AC = 0); firmware: the running RFLAGS, IF included |
 //! | CR0, CR3, CR4                | the host's (same page tables, same modes) |
 //! | CS, SS, DS, ES, FS, GS, TR   | the host's selectors, decoded from the GDT |
 //! | LDTR                         | unusable (UEFI does not use an LDT)       |
 //! | GDTR                         | the host's table                          |
-//! | IDTR                         | the guest's own IDT (`GuestMemory::idt`)  |
+//! | IDTR                         | test guest: its own IDT (`GuestMemory::idt`); firmware: the firmware's |
 //! | SYSENTER MSRs                | the host's                                |
 //! | DR7, IA32_DEBUGCTL           | `0x400` (reset value), `0`                |
 //! | PAT, EFER                    | the host's, only if the entry controls load them |
@@ -27,8 +28,11 @@
 //! the guest gets the host's EFER.NXE either way, which the shared page
 //! tables need (see [`super::paging`]).
 //!
-//! The guest shares the host's GDT, TSS and page tables, and has an IDT of
-//! its own for NMIs. That is fine for a test guest, but it is not isolation.
+//! The guest shares the host's GDT, TSS and page tables. The test guest has
+//! an IDT of its own for NMIs; the firmware keeps its own IDT, and stays on
+//! Aleph0's GDT copy with its TSS, since VM entry needs a busy TSS in TR and
+//! Hyper-V's firmware never loads one. That is a bring-up stage, not
+//! isolation.
 //!
 //! [`GuestState::write`] reads every field back after writing it. As with
 //! the host fields, that proves storage only: the CPU checks the state when
@@ -202,6 +206,38 @@ pub enum GuestStateError {
     Vmcs { field: u32, error: VmcsError },
 }
 
+/// Where the guest starts: the part of its state that is not a copy of the
+/// running CPU's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestEntry {
+    /// At `rip` on the stack `rsp`, with interrupts off (RFLAGS `0x2`) and the
+    /// IDT `idtr`: the built-in test guest.
+    At { rip: u64, rsp: u64, idtr: DescriptorTable },
+    /// In place: the code after VMLAUNCH goes on as the guest, on the stack
+    /// it runs on, with the RFLAGS it has there, and the IDT `idtr`, the
+    /// firmware's. Only VMLAUNCH knows that RIP, RSP and RFLAGS, so
+    /// `vmcs::launch_in_place` writes them; until then the fields hold
+    /// placeholders: 0, 0 and `0x2`.
+    InPlace { idtr: DescriptorTable },
+}
+
+impl GuestEntry {
+    /// GUEST_RIP, GUEST_RSP and GUEST_RFLAGS to write before VMLAUNCH.
+    fn registers(self) -> (u64, u64, u64) {
+        match self {
+            Self::At { rip, rsp, .. } => (rip, rsp, INITIAL_RFLAGS),
+            Self::InPlace { .. } => (0, 0, INITIAL_RFLAGS),
+        }
+    }
+
+    /// GUEST_IDTR.
+    fn idtr(self) -> DescriptorTable {
+        match self {
+            Self::At { idtr, .. } | Self::InPlace { idtr } => idtr,
+        }
+    }
+}
+
 /// The complete guest state, captured from the host and ready to write.
 #[derive(Debug, Clone, Copy)]
 pub struct GuestState {
@@ -231,15 +267,16 @@ pub struct GuestState {
 }
 
 impl GuestState {
-    /// Captures the host's current state, with the guest's own `rip`, `rsp`
-    /// and `idtr`, and checks CS and TR.
+    /// Captures the host's current state, with the guest's own RIP, RSP,
+    /// RFLAGS and IDTR from `entry`, and checks CS and TR.
     ///
     /// # Safety
     ///
     /// VMX operation must be active with the controls already written to the
     /// current VMCS (they decide whether PAT and EFER are needed). The host
     /// GDT must be live and stable.
-    pub unsafe fn from_current(rip: u64, rsp: u64, idtr: DescriptorTable) -> Result<Self, GuestStateError> {
+    pub unsafe fn from_current(entry: GuestEntry) -> Result<Self, GuestStateError> {
+        let (rip, rsp, rflags) = entry.registers();
         // SAFETY: the caller guarantees a live, stable host GDT, and UEFI
         // runs in long mode.
         let host = unsafe { segment::read_all() };
@@ -259,7 +296,7 @@ impl GuestState {
             Self {
                 rip,
                 rsp,
-                rflags: INITIAL_RFLAGS,
+                rflags,
                 cr0: cr::read_cr0(),
                 cr3: cr::read_cr3(),
                 cr4: cr::read_cr4(),
@@ -272,7 +309,7 @@ impl GuestState {
                 ldtr: GuestSegment::unusable(0, 0),
                 tr: segment_from_gdt(gdt, host.tr, Some(host.tr_base))?,
                 gdtr: host.gdtr,
-                idtr,
+                idtr: entry.idtr(),
                 sysenter_cs: u64::from(msr::rdmsr(msr::IA32_SYSENTER_CS) as u32),
                 sysenter_esp: msr::rdmsr(msr::IA32_SYSENTER_ESP),
                 sysenter_eip: msr::rdmsr(msr::IA32_SYSENTER_EIP),

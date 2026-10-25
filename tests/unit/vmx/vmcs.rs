@@ -108,10 +108,16 @@ fn every_exception_of_the_built_in_test_guest_exits() {
 }
 
 #[test]
-fn a_guest_with_its_own_idt_takes_its_own_exceptions() {
-    assert_eq!(exception_bitmap(GuestKind::OwnIdt), 0);
+fn only_a_stop_of_the_test_guest_returns_to_bring_up() {
+    assert!(GuestKind::BuiltInTest.stop_returns_to_bring_up());
+    assert!(!GuestKind::Firmware.stop_returns_to_bring_up());
+}
+
+#[test]
+fn the_firmware_takes_its_own_exceptions() {
+    assert_eq!(exception_bitmap(GuestKind::Firmware), 0);
     assert_eq!(
-        DesiredControls::minimal_64_bit_guest(GuestKind::OwnIdt).exception_bitmap,
+        DesiredControls::minimal_64_bit_guest(GuestKind::Firmware).exception_bitmap,
         0
     );
 }

@@ -149,13 +149,19 @@ fn protected_write_qualification_matches_its_bits() {
 
 #[test]
 fn write_to_the_protected_page_is_granted() {
-    assert_eq!(decide(START, protected_write()), (ExitEvent::EptWriteGranted, WRITTEN));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, protected_write()),
+        (ExitEvent::EptWriteGranted, WRITTEN)
+    );
 }
 
 #[test]
 fn write_to_another_page_stops_with_the_violation() {
     let elsewhere = ept_violation(PROTECTED_PAGE + 0x1000, PROTECTED_WRITE);
-    assert_eq!(decide(START, elsewhere), (ExitEvent::EptViolation, START));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, elsewhere),
+        (ExitEvent::EptViolation, START)
+    );
 }
 
 #[test]
@@ -164,7 +170,7 @@ fn a_violation_on_a_device_page_stops_with_the_violation() {
     // means the map is wrong.
     let read = EPT_ACCESS_READ | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
     assert_eq!(
-        decide(START, ept_violation(0xFEE0_0030, read)),
+        decide(GuestKind::BuiltInTest, START, ept_violation(0xFEE0_0030, read)),
         (ExitEvent::EptViolation, START)
     );
 }
@@ -176,7 +182,10 @@ fn violation_with_nothing_protected_stops_with_the_violation() {
         protected_page: 0,
         ..ept_violation(0, PROTECTED_WRITE)
     };
-    assert_eq!(decide(START, unprotected), (ExitEvent::EptViolation, START));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, unprotected),
+        (ExitEvent::EptViolation, START)
+    );
 }
 
 #[test]
@@ -184,11 +193,11 @@ fn read_or_fetch_violation_stops_with_the_violation() {
     let read = EPT_ACCESS_READ | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
     let fetch = EPT_ACCESS_FETCH | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
     assert_eq!(
-        decide(START, ept_violation(PROTECTED_PAGE, read)).0,
+        decide(GuestKind::BuiltInTest, START, ept_violation(PROTECTED_PAGE, read)).0,
         ExitEvent::EptViolation
     );
     assert_eq!(
-        decide(START, ept_violation(PROTECTED_PAGE, fetch)).0,
+        decide(GuestKind::BuiltInTest, START, ept_violation(PROTECTED_PAGE, fetch)).0,
         ExitEvent::EptViolation
     );
 }
@@ -196,38 +205,50 @@ fn read_or_fetch_violation_stops_with_the_violation() {
 #[test]
 fn write_to_a_page_already_writable_stops_with_the_violation() {
     let writable = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_PAGE_WRITABLE);
-    assert_eq!(decide(START, writable).0, ExitEvent::EptViolation);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, writable).0,
+        ExitEvent::EptViolation
+    );
 }
 
 #[test]
 fn write_to_an_unreadable_page_stops_with_the_violation() {
     let unreadable = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE & !EPT_PAGE_READABLE);
-    assert_eq!(decide(START, unreadable).0, ExitEvent::EptViolation);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, unreadable).0,
+        ExitEvent::EptViolation
+    );
 }
 
 #[test]
 fn second_violation_on_the_page_stops_with_the_violation() {
     // Write was granted once; another violation means the grant did not
     // take effect.
-    assert_eq!(decide(WRITTEN, protected_write()), (ExitEvent::EptViolation, WRITTEN));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, protected_write()),
+        (ExitEvent::EptViolation, WRITTEN)
+    );
 }
 
 #[test]
 fn violation_during_nmi_unblocking_iret_stops_with_the_violation() {
     let iret = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET);
-    assert_eq!(decide(START, iret).0, ExitEvent::EptViolation);
+    assert_eq!(decide(GuestKind::BuiltInTest, START, iret).0, ExitEvent::EptViolation);
 }
 
 #[test]
 fn violation_on_a_guest_page_table_access_stops_with_the_violation() {
     // Bit 7 without bit 8: the CPU was reading a guest page table.
     let walk = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE & !EPT_TRANSLATED_ACCESS);
-    assert_eq!(decide(START, walk).0, ExitEvent::EptViolation);
+    assert_eq!(decide(GuestKind::BuiltInTest, START, walk).0, ExitEvent::EptViolation);
     let no_linear = ept_violation(
         PROTECTED_PAGE,
         PROTECTED_WRITE & !(EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS),
     );
-    assert_eq!(decide(START, no_linear).0, ExitEvent::EptViolation);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, no_linear).0,
+        ExitEvent::EptViolation
+    );
 }
 
 #[test]
@@ -236,7 +257,10 @@ fn ept_misconfiguration_stops_with_its_own_event() {
         guest_physical: PROTECTED_PAGE,
         ..exit(EXIT_REASON_EPT_MISCONFIG)
     };
-    assert_eq!(decide(START, misconfig), (ExitEvent::EptMisconfig, START));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, misconfig),
+        (ExitEvent::EptMisconfig, START)
+    );
 }
 
 #[test]
@@ -248,12 +272,18 @@ fn the_ept_stops_stop_the_guest() {
 
 #[test]
 fn main_vmcall_before_the_violation_means_ept_did_not_protect() {
-    assert_eq!(decide(START, vmcall(MARKER)), (ExitEvent::EptWriteMissing, START));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, vmcall(MARKER)),
+        (ExitEvent::EptWriteMissing, START)
+    );
 }
 
 #[test]
 fn first_main_vmcall_resumes() {
-    assert_eq!(decide(WRITTEN, vmcall(MARKER)), (ExitEvent::MainVmcall, WAITING));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, vmcall(MARKER)),
+        (ExitEvent::MainVmcall, WAITING)
+    );
 }
 
 #[test]
@@ -262,7 +292,10 @@ fn first_main_vmcall_with_a_wrong_seed_is_a_data_page_mismatch() {
         guest_rcx: 0xDA7B,
         ..vmcall(MARKER)
     };
-    assert_eq!(decide(WRITTEN, wrong_seed), (ExitEvent::DataPageMismatch, WRITTEN));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, wrong_seed),
+        (ExitEvent::DataPageMismatch, WRITTEN)
+    );
 }
 
 #[test]
@@ -272,7 +305,10 @@ fn first_main_vmcall_with_a_wrong_value_is_a_data_page_mismatch() {
         guest_rdx: GUEST_DATA_SEED.into(),
         ..vmcall(MARKER)
     };
-    assert_eq!(decide(WRITTEN, unwritten), (ExitEvent::DataPageMismatch, WRITTEN));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, unwritten),
+        (ExitEvent::DataPageMismatch, WRITTEN)
+    );
 }
 
 #[test]
@@ -282,7 +318,10 @@ fn data_page_values_compare_as_32_bits() {
         guest_rdx: (1 << 32) | u64::from(GUEST_EPT_VALUE),
         ..vmcall(MARKER)
     };
-    assert_eq!(decide(WRITTEN, high_bits), (ExitEvent::MainVmcall, WAITING));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, high_bits),
+        (ExitEvent::MainVmcall, WAITING)
+    );
 }
 
 #[test]
@@ -292,13 +331,16 @@ fn second_main_vmcall_does_not_check_the_data_page() {
         guest_rcx: 0x1FFF_0000,
         ..vmcall(MARKER + 1)
     };
-    assert_eq!(decide(WAITING, counting).0, ExitEvent::LastMainVmcall);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, counting).0,
+        ExitEvent::LastMainVmcall
+    );
 }
 
 #[test]
 fn second_main_vmcall_without_an_nmi_finishes() {
     assert_eq!(
-        decide(WAITING, vmcall(MARKER + 1)),
+        decide(GuestKind::BuiltInTest, WAITING, vmcall(MARKER + 1)),
         (
             ExitEvent::LastMainVmcall,
             ExitState {
@@ -314,7 +356,7 @@ fn plain_run_finishes_after_the_violation_and_two_vmcalls() {
     let mut state = START;
     let mut event = ExitEvent::Unexpected;
     for exit in [protected_write(), vmcall(MARKER), vmcall(MARKER + 1)] {
-        (event, state) = decide(state, exit);
+        (event, state) = decide(GuestKind::BuiltInTest, state, exit);
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!(
@@ -330,25 +372,34 @@ fn plain_run_finishes_after_the_violation_and_two_vmcalls() {
 fn repeated_main_vmcall_is_unexpected() {
     // RAX unchanged: the guest ran the same VMCALL again, so RIP was not
     // advanced past it.
-    assert_eq!(decide(WAITING, vmcall(MARKER)), (ExitEvent::Unexpected, WAITING));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, vmcall(MARKER)),
+        (ExitEvent::Unexpected, WAITING)
+    );
 }
 
 #[test]
 fn nmi_while_unblocked_is_injected() {
-    assert_eq!(decide(WAITING, nmi(0)), (ExitEvent::NmiInjected, WAITING));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, nmi(0)),
+        (ExitEvent::NmiInjected, WAITING)
+    );
 }
 
 #[test]
 fn nmi_while_blocked_by_sti_waits_for_the_window() {
     // The SDM requires bit 0 to be 0 for an NMI injection, so STI blocking
     // defers the NMI just like NMI blocking does.
-    assert_eq!(decide(WAITING, nmi(BLOCKING_BY_STI)).0, ExitEvent::NmiDeferred);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, nmi(BLOCKING_BY_STI)).0,
+        ExitEvent::NmiDeferred
+    );
 }
 
 #[test]
 fn nmi_while_blocked_by_nmi_waits_for_the_window() {
     assert_eq!(
-        decide(WAITING, nmi(BLOCKING_BY_NMI)),
+        decide(GuestKind::BuiltInTest, WAITING, nmi(BLOCKING_BY_NMI)),
         (
             ExitEvent::NmiDeferred,
             ExitState {
@@ -361,7 +412,10 @@ fn nmi_while_blocked_by_nmi_waits_for_the_window() {
 
 #[test]
 fn nmi_while_blocked_by_mov_ss_waits_for_the_window() {
-    assert_eq!(decide(WAITING, nmi(BLOCKING_BY_MOV_SS)).0, ExitEvent::NmiDeferred);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, nmi(BLOCKING_BY_MOV_SS)).0,
+        ExitEvent::NmiDeferred
+    );
 }
 
 #[test]
@@ -371,7 +425,7 @@ fn window_exit_injects_the_pending_nmi() {
         ..WAITING
     };
     assert_eq!(
-        decide(pending, exit(EXIT_REASON_NMI_WINDOW)),
+        decide(GuestKind::BuiltInTest, pending, exit(EXIT_REASON_NMI_WINDOW)),
         (ExitEvent::NmiWindowInjected, WAITING)
     );
 }
@@ -386,13 +440,16 @@ fn window_exit_while_still_blocked_keeps_waiting() {
         interruptibility: BLOCKING_BY_STI,
         ..exit(EXIT_REASON_NMI_WINDOW)
     };
-    assert_eq!(decide(pending, still_blocked), (ExitEvent::NmiDeferred, pending));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, pending, still_blocked),
+        (ExitEvent::NmiDeferred, pending)
+    );
 }
 
 #[test]
 fn window_exit_without_a_pending_nmi_is_unexpected() {
     assert_eq!(
-        decide(WAITING, exit(EXIT_REASON_NMI_WINDOW)),
+        decide(GuestKind::BuiltInTest, WAITING, exit(EXIT_REASON_NMI_WINDOW)),
         (ExitEvent::Unexpected, WAITING)
     );
 }
@@ -400,7 +457,7 @@ fn window_exit_without_a_pending_nmi_is_unexpected() {
 #[test]
 fn guest_nmi_handler_vmcall_resumes() {
     assert_eq!(
-        decide(WAITING, vmcall(NMI_MARKER)),
+        decide(GuestKind::BuiltInTest, WAITING, vmcall(NMI_MARKER)),
         (
             ExitEvent::GuestNmiHandler,
             ExitState {
@@ -418,7 +475,10 @@ fn nmi_handler_vmcalls_saturate_their_count() {
         nmis_handled: u32::MAX,
         ..WAITING
     };
-    assert_eq!(decide(full, vmcall(NMI_MARKER)), (ExitEvent::GuestNmiHandler, full));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, full, vmcall(NMI_MARKER)),
+        (ExitEvent::GuestNmiHandler, full)
+    );
 }
 
 #[test]
@@ -432,7 +492,7 @@ fn full_nmi_run_finishes_with_both_counts() {
         vmcall(NMI_MARKER),
         vmcall(MARKER + 1),
     ] {
-        (event, state) = decide(state, exit);
+        (event, state) = decide(GuestKind::BuiltInTest, state, exit);
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!(
@@ -459,7 +519,7 @@ fn deferred_nmi_run_finishes_with_both_counts() {
     let mut state = START;
     let mut event = ExitEvent::Unexpected;
     for exit in exits {
-        (event, state) = decide(state, exit);
+        (event, state) = decide(GuestKind::BuiltInTest, state, exit);
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!(
@@ -485,7 +545,10 @@ fn a_vectoring_exit_is_still_judged_by_its_reason() {
         idt_vectoring: VECTORING_NMI,
         ..vmcall(MARKER)
     };
-    assert_eq!(decide(WRITTEN, interrupted).0, ExitEvent::MainVmcall);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, interrupted).0,
+        ExitEvent::MainVmcall
+    );
 }
 
 #[test]
@@ -497,7 +560,7 @@ fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
         idt_vectoring: VECTORING_NMI,
         ..protected_write()
     };
-    let (event, _) = decide(START, interrupted);
+    let (event, _) = decide(GuestKind::BuiltInTest, START, interrupted);
     assert_eq!(event, ExitEvent::EptWriteGranted);
     let plan = match event.action() {
         ExitAction::Resume(plan) => plan,
@@ -591,7 +654,10 @@ fn entry_failure_is_unexpected() {
         },
         ..vmcall(MARKER)
     };
-    assert_eq!(decide(START, failed), (ExitEvent::Unexpected, START));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, failed),
+        (ExitEvent::Unexpected, START)
+    );
 }
 
 #[test]
@@ -600,7 +666,10 @@ fn exception_exit_is_unexpected() {
         interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
-    assert_eq!(decide(WAITING, page_fault), (ExitEvent::Unexpected, WAITING));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, page_fault),
+        (ExitEvent::Unexpected, WAITING)
+    );
 }
 
 #[test]
@@ -657,7 +726,10 @@ fn each_event_maps_to_its_action() {
 
 #[test]
 fn hlt_resumes_past_the_instruction() {
-    assert_eq!(decide(START, exit(EXIT_REASON_HLT)), (ExitEvent::Halted, START));
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, START, exit(EXIT_REASON_HLT)),
+        (ExitEvent::Halted, START)
+    );
 }
 
 #[test]
@@ -668,7 +740,7 @@ fn hlt_in_an_sti_shadow_is_decided_the_same() {
         interruptibility: BLOCKING_BY_STI,
         ..exit(EXIT_REASON_HLT)
     };
-    assert_eq!(decide(START, in_shadow).0, ExitEvent::Halted);
+    assert_eq!(decide(GuestKind::BuiltInTest, START, in_shadow).0, ExitEvent::Halted);
 }
 
 #[test]
@@ -683,7 +755,10 @@ fn skipping_an_instruction_ends_sti_and_mov_ss_blocking_only() {
 #[test]
 fn mwait_and_monitor_inject_invalid_opcode() {
     for basic in [EXIT_REASON_MWAIT, EXIT_REASON_MONITOR] {
-        assert_eq!(decide(START, exit(basic)), (ExitEvent::GuestInvalidOpcode, START));
+        assert_eq!(
+            decide(GuestKind::BuiltInTest, START, exit(basic)),
+            (ExitEvent::GuestInvalidOpcode, START)
+        );
     }
 }
 
@@ -838,7 +913,7 @@ fn cpuid_exit_is_dispatched_to_emulation() {
         ..exit(EXIT_REASON_CPUID)
     };
     assert_eq!(
-        decide(START, cpuid).0,
+        decide(GuestKind::BuiltInTest, START, cpuid).0,
         ExitEvent::Emulated(Emulation::Cpuid { leaf: 1, subleaf: 0 })
     );
 }
@@ -854,7 +929,7 @@ fn whole_guest_run_finishes_with_the_expected_stats() {
         .chain([protected_write(), vmcall(MARKER), vmcall(MARKER + 1)])
     {
         stats.count_exit();
-        (event, state) = decide(state, exit);
+        (event, state) = decide(GuestKind::BuiltInTest, state, exit);
         if let ExitAction::Resume(plan) = event.action() {
             stats.count_resumed(event, plan);
         }
@@ -881,11 +956,11 @@ fn msr_exits_are_dispatched_to_emulation() {
         ..exit(basic)
     };
     assert_eq!(
-        decide(START, msr(EXIT_REASON_RDMSR)).0,
+        decide(GuestKind::BuiltInTest, START, msr(EXIT_REASON_RDMSR)).0,
         ExitEvent::Emulated(Emulation::Rdmsr { msr: 0xC000_0102 })
     );
     assert!(matches!(
-        decide(START, msr(EXIT_REASON_WRMSR)).0,
+        decide(GuestKind::BuiltInTest, START, msr(EXIT_REASON_WRMSR)).0,
         ExitEvent::Emulated(Emulation::Wrmsr { msr: 0xC000_0102, .. })
     ));
 }
@@ -897,7 +972,7 @@ fn io_exit_is_dispatched_to_emulation() {
         ..exit(EXIT_REASON_IO_INSTRUCTION)
     };
     assert_eq!(
-        decide(START, byte_in).0,
+        decide(GuestKind::BuiltInTest, START, byte_in).0,
         ExitEvent::Emulated(Emulation::In {
             port: 0x3FF,
             size: IoSize::Byte
@@ -955,7 +1030,7 @@ fn without_a_pending_nmi_the_plan_is_unchanged() {
 fn an_nmi_in_root_operation_at_vmcall_1_reaches_the_guest() {
     // Main VMCALL #1, with an NMI that arrived while Aleph0 handled the EPT
     // violation before it.
-    let (event, state) = decide(WRITTEN.with_host_nmi(true), vmcall(MARKER));
+    let (event, state) = decide(GuestKind::BuiltInTest, WRITTEN.with_host_nmi(true), vmcall(MARKER));
     assert_eq!(event, ExitEvent::MainVmcall);
     assert!(state.nmi_pending);
     let plan = match event.action() {
@@ -969,11 +1044,120 @@ fn an_nmi_in_root_operation_at_vmcall_1_reaches_the_guest() {
     let mut state = state;
     let mut event = ExitEvent::Unexpected;
     for exit in [exit(EXIT_REASON_NMI_WINDOW), vmcall(NMI_MARKER), vmcall(MARKER + 1)] {
-        (event, state) = decide(state, exit);
+        (event, state) = decide(GuestKind::BuiltInTest, state, exit);
         if exit.reason.basic == EXIT_REASON_NMI_WINDOW {
             assert_eq!(event, ExitEvent::NmiWindowInjected);
         }
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!((state.nmis_handled, state.nmi_pending), (1, false));
+}
+
+/// What `decide` makes of `exit` for the firmware, from `state`.
+fn firmware(state: ExitState, exit: ExitInfo) -> ExitAction {
+    decide(GuestKind::Firmware, state, exit).0.action()
+}
+
+#[test]
+fn the_firmware_resumes_from_every_exit_aleph0_handles() {
+    // Hyper-V's first synthetic MSR, outside the MSR bitmap: #GP, and on.
+    let synthetic_msr = ExitInfo {
+        guest_rcx: 0x4000_0000,
+        ..exit(EXIT_REASON_RDMSR)
+    };
+    let pending = ExitState {
+        nmi_pending: true,
+        ..START
+    };
+    let handled = emulated_exits().into_iter().map(|exit| (START, exit)).chain([
+        (START, synthetic_msr),
+        (START, exit(EXIT_REASON_MWAIT)),
+        (START, exit(EXIT_REASON_MONITOR)),
+        (START, nmi(0)),
+        (START, nmi(BLOCKING_BY_STI)),
+        (pending, exit(EXIT_REASON_NMI_WINDOW)),
+    ]);
+    for (state, exit) in handled {
+        assert!(
+            matches!(firmware(state, exit), ExitAction::Resume(_)),
+            "reason {} from {state:?}",
+            exit.reason.basic
+        );
+    }
+}
+
+#[test]
+fn the_firmware_stops_at_its_vmcalls_and_ept_violations() {
+    // The test guest's markers mean nothing in the firmware: its VMCALLs are
+    // Hyper-V hypercalls (#27). No page is the firmware's to write, so every
+    // EPT violation means the map is wrong.
+    for exit in [
+        vmcall(0),
+        vmcall(MARKER),
+        vmcall(NMI_MARKER),
+        protected_write(),
+        ept_violation(0xFEE0_0030, EPT_ACCESS_READ),
+    ] {
+        assert_eq!(
+            firmware(START, exit),
+            ExitAction::Unexpected,
+            "reason {}",
+            exit.reason.basic
+        );
+    }
+    assert_eq!(
+        decide(GuestKind::Firmware, START, protected_write()),
+        (ExitEvent::EptViolation, START)
+    );
+}
+
+#[test]
+fn the_firmware_stops_at_an_unhandled_exit() {
+    let page_fault = ExitInfo {
+        interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
+        ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
+    };
+    let entry_failure = ExitInfo {
+        reason: ExitReason {
+            basic: 33,
+            entry_failure: true,
+        },
+        ..exit(33)
+    };
+    // A triple fault (2), a CR access (28), an EPT misconfiguration (49).
+    for exit in [
+        page_fault,
+        entry_failure,
+        exit(2),
+        exit(28),
+        exit(EXIT_REASON_EPT_MISCONFIG),
+    ] {
+        assert_eq!(
+            firmware(START, exit),
+            ExitAction::Unexpected,
+            "reason {}",
+            exit.reason.basic
+        );
+    }
+}
+
+#[test]
+fn the_firmware_never_finishes() {
+    // Every basic reason and the test guest's markers, from every state its
+    // run passes through, the last main VMCALL's included.
+    for state in [START, WRITTEN, WAITING] {
+        for basic in 0..=u16::from(u8::MAX) {
+            for rax in [0, MARKER, MARKER + 1, NMI_MARKER] {
+                let exit = ExitInfo {
+                    guest_rax: rax,
+                    ..exit(basic)
+                };
+                assert_ne!(
+                    firmware(state, exit),
+                    ExitAction::Finished,
+                    "reason {basic} rax={rax:#x}"
+                );
+            }
+        }
+    }
 }

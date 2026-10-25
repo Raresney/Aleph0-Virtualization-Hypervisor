@@ -17,14 +17,20 @@
 //!   reach a copy of them instead, and HLT, which it skips. Each handler
 //!   reads the exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR,
 //!   which get #UD, need no handler of their own.
-//! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
-//!   NMI reinjection), which depend on what came before:
-//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`. Any other EPT
-//!   violation stops the guest as [`ExitEvent::EptViolation`].
+//! - `scenario.rs`: exits that depend on what came before:
+//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`. NMI reinjection,
+//!   for every guest, and the test guest's own exits: its EPT write and its
+//!   VMCALLs. Any other EPT violation stops the guest as
+//!   [`ExitEvent::EptViolation`].
 //! - An EPT misconfiguration stops the guest as
 //!   [`ExitEvent::EptMisconfig`]. Aleph0 makes no misconfigured entry on
 //!   purpose (KVM does, for MMIO, and emulates the access in
 //!   `handle_ept_misconfig`), so one means the map is broken.
+//!
+//! The guest's kind (`GuestKind`) only decides the test guest's own exits.
+//! The firmware has no scripted end: its VMCALLs (Hyper-V hypercalls, #27)
+//! and every EPT violation stop it, so it never finishes and runs until an
+//! exit Aleph0 does not handle.
 //!
 //! An exit reason without a handler stops the guest. Nothing here counts
 //! exits: `vmexit::stats` does, for every guest, from what the handler
@@ -34,6 +40,7 @@ mod emulation;
 mod scenario;
 
 use crate::vmx::mtrr::MtrrCapabilities;
+use crate::vmx::vmcs::GuestKind;
 
 pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in, wrmsr_value};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
@@ -615,18 +622,19 @@ impl ExitEvent {
     }
 }
 
-/// Decides what `exit` is, given what happened before (`state`), and
-/// returns the event with the state for the next exit.
+/// Decides what `exit` of a `guest` is, given what happened before
+/// (`state`), and returns the event with the state for the next exit.
 ///
 /// A VM-entry failure is never handled, whatever the reason. Every other
 /// exit goes to the handler for its reason. An exit that interrupted an
 /// event's delivery (`exit.idt_vectoring` valid) is still judged by its
 /// reason; the handler re-delivers the event with the plan's `redeliver`
 /// (built by [`ExitInfo::redelivery`] and [`ResumePlan::redelivering`]).
-pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
+pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
     }
+    let test_guest = guest == GuestKind::BuiltInTest;
     match exit.reason.basic {
         EXIT_REASON_CPUID => (emulation::cpuid(&exit), state),
         EXIT_REASON_RDMSR => (emulation::rdmsr(&exit), state),
@@ -636,9 +644,10 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         EXIT_REASON_MWAIT | EXIT_REASON_MONITOR => (ExitEvent::GuestInvalidOpcode, state),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
-        EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),
+        EXIT_REASON_EPT_VIOLATION if test_guest => scenario::ept_violation(state, &exit),
+        EXIT_REASON_EPT_VIOLATION => (ExitEvent::EptViolation, state),
         EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),
-        EXIT_REASON_VMCALL => scenario::vmcall(state, &exit),
+        EXIT_REASON_VMCALL if test_guest => scenario::vmcall(state, &exit),
         _ => (ExitEvent::Unexpected, state),
     }
 }

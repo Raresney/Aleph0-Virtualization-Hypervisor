@@ -12,6 +12,35 @@ const FLAT_DATA_NOT_ACCESSED: u64 = 0x00CF_9200_0000_FFFF;
 /// Busy 64-bit TSS descriptor, low 8 bytes: limit 0x67, type 0xB, P = 1.
 const BUSY_TSS: u64 = 0x0000_8B00_0000_0067;
 
+/// The Hyper-V firmware's IDT.
+const FIRMWARE_IDT: DescriptorTable = DescriptorTable {
+    base: 0x7f0a_4018,
+    limit: 0xfff,
+};
+
+#[test]
+fn the_test_guest_starts_at_its_code_with_interrupts_off_and_its_own_idt() {
+    let idt = DescriptorTable {
+        base: 0x7eae_e000,
+        limit: 0x2f,
+    };
+    let entry = GuestEntry::At {
+        rip: 0x7eae_c000,
+        rsp: 0x7eae_f000,
+        idtr: idt,
+    };
+    assert_eq!(entry.registers(), (0x7eae_c000, 0x7eae_f000, 0x2));
+    assert_eq!(entry.idtr(), idt);
+}
+
+#[test]
+fn in_place_keeps_the_firmware_idt_and_leaves_rip_rsp_and_rflags_to_vmlaunch() {
+    let entry = GuestEntry::InPlace { idtr: FIRMWARE_IDT };
+    // Placeholders: `launch_in_place` writes the real ones at VMLAUNCH.
+    assert_eq!(entry.registers(), (0, 0, 0x2));
+    assert_eq!(entry.idtr(), FIRMWARE_IDT);
+}
+
 #[test]
 fn data_segment_gets_accessed_bit() {
     let segment = GuestSegment::from_descriptor(0x30, SegmentDescriptor(FLAT_DATA_NOT_ACCESSED), 0);

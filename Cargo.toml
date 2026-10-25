@@ -7,20 +7,23 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 uefi = "0.40"
 
-# Test-only switches for the Hyper-V runner (`-Features`); both are off by
-# default and change nothing in a normal build.
+# Switches for the Hyper-V runner (`-Features`, `-TestGuest`); all are off by
+# default. A default build virtualizes the running firmware in place.
 [features]
+# Run the built-in test guest instead: the regression mode, with its scripted
+# VMCALLs, teardown and the return to firmware outside VMX operation.
+test-guest = []
 # The exit handler reads a non-canonical address at the first exit, so the
 # host IDT's #GP handler prints the fault and halts.
 host-fault-test = []
 # The exit handler waits in root operation after main VMCALL #1, so the
 # `-InjectNmi` NMI reaches the host NMI handler instead of the guest.
-host-nmi-test = []
+host-nmi-test = ["test-guest"]
 # Print every VM exit in full, with no rate limit (vmexit/policy.rs).
 trace-exits = []
 # Expect the wrong RAX at main VMCALL #1, so the guest stops there as an
 # unexpected exit: the stop report and teardown of a stop nobody planned.
-unexpected-exit-test = []
+unexpected-exit-test = ["test-guest"]
 # Make the Local APIC's PDPT entry W without R, so the guest's read of it is
 # an EPT misconfiguration: the stop, and the walk that names the entry.
-ept-misconfig-test = []
+ept-misconfig-test = ["test-guest"]

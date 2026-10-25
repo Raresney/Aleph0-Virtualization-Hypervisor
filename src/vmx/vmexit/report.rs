@@ -16,11 +16,13 @@ use crate::vmx::exit_decision::{
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::mtrr::{self, FIXED_END, MtrrMsr, Mtrrs};
 use crate::vmx::page::PAGE_SIZE;
-use crate::vmx::vmcs::VmcsError;
 use crate::vmx::vmcs::fields::{EPT_POINTER, GUEST_LINEAR_ADDRESS};
+use crate::vmx::vmcs::{GuestKind, VmcsError};
 
 /// One exit, as its report needs it.
 pub(super) struct ExitReport<'a> {
+    /// The guest it came from.
+    pub(super) guest: GuestKind,
     /// The exit's number, from 1.
     pub(super) number: u64,
     /// How many exits of its reason there have been, this one included.
@@ -45,6 +47,7 @@ pub(super) struct ExitReport<'a> {
 /// detail.
 pub(super) fn report_exit(report: &ExitReport<'_>) {
     let ExitReport {
+        guest,
         number,
         count,
         detail,
@@ -82,14 +85,23 @@ pub(super) fn report_exit(report: &ExitReport<'_>) {
         report_host_nmi(number);
     }
     match outcome {
-        Outcome::Resumed { resumed, .. } => report_event(number, event, read.exit, next, Some(resumed)),
+        Outcome::Resumed { resumed, .. } => report_event(guest, number, event, read.exit, next, Some(resumed)),
         Outcome::ResumeFailed(failure) => {
             crate::serial_println!("{tag} VM exit #{number}: {failure}; not resuming.")
         }
-        Outcome::Stopped(_) => report_event(number, event, read.exit, next, None),
+        Outcome::Stopped(_) => report_event(guest, number, event, read.exit, next, None),
     }
     if outcome.stops() {
-        crate::serial_println!("{tag} VM exit #{number}: stopping the guest; returning to bring-up.");
+        crate::serial_println!("{tag} VM exit #{number}: stopping the guest; {}.", after_stop(guest));
+    }
+}
+
+/// Where a stop of `guest` goes, for its report line.
+pub(super) fn after_stop(guest: GuestKind) -> &'static str {
+    if guest.stop_returns_to_bring_up() {
+        "returning to bring-up"
+    } else {
+        "halting: the firmware has nothing to return to"
     }
 }
 
@@ -251,10 +263,17 @@ pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &
     history::report(format_args!("VM exit #{number}"));
 }
 
-/// Prints what exit `number` turned out to be and what Aleph0 does about
-/// it. `state` is the state after the exit; `resumed` is how the guest goes
-/// on, for events that resume it.
-fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: ExitState, resumed: Option<Resumed>) {
+/// Prints what exit `number` of `guest` turned out to be and what Aleph0
+/// does about it. `state` is the state after the exit; `resumed` is how the
+/// guest goes on, for events that resume it.
+fn report_event(
+    guest: GuestKind,
+    number: u64,
+    event: ExitEvent,
+    exit: Option<ExitInfo>,
+    state: ExitState,
+    resumed: Option<Resumed>,
+) {
     let tag = crate::TAG;
     let rax = exit.map_or(0, |exit| exit.guest_rax);
     let rip = resumed.map_or(0, |resumed| resumed.rip);
@@ -323,10 +342,15 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::GuestInvalidOpcode => crate::serial_println!(
             "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
         ),
-        ExitEvent::Unexpected => crate::serial_println!(
+        ExitEvent::Unexpected if guest == GuestKind::BuiltInTest => crate::serial_println!(
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),
         ),
+        // The firmware has no script: the lines above name the exit, and a
+        // VMCALL is a Hyper-V hypercall (#27).
+        ExitEvent::Unexpected => {
+            crate::serial_println!("{tag} VM exit #{number}: NOT an exit Aleph0 handles for the firmware.")
+        }
     }
     if event == ExitEvent::LastMainVmcall {
         crate::serial_println!(

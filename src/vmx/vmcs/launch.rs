@@ -22,9 +22,19 @@
 //! RFLAGS bits 63:22 are reserved and read as 0. No stop value is 0, because
 //! RFLAGS bit 1 always reads as 1, so the exit handler can return 0 to mean
 //! "resume the guest".
+//!
+//! [`launch_in_place`] is the other way in, for the firmware: there is no
+//! guest code to jump to and no stop to come back from. It writes the RIP,
+//! RSP and RFLAGS it runs with into the guest state just before VMLAUNCH,
+//! so the guest starts at the instruction after VMLAUNCH, on the same stack.
+//! The code that called it then goes on as the guest, in VMX non-root
+//! operation, and returns to its own caller. Nothing jumps back into its
+//! frame, so it saves none.
 
+use core::arch::asm;
 use core::sync::atomic::AtomicU64;
 
+use super::fields::{GUEST_RFLAGS, GUEST_RIP, GUEST_RSP};
 use super::{VmcsError, instruction_error_for, launch_failure, resume_failure};
 use crate::vmx::exit_decision::ExitReason;
 
@@ -200,6 +210,86 @@ pub unsafe fn launch() -> GuestStop {
         },
         stop => stop,
     }
+}
+
+/// Decodes what the in-place launch's asm leaves: 0 when it runs on as the
+/// guest, or the RFLAGS of the VMWRITE or VMLAUNCH that failed, which are
+/// never 0 (bit 1 always reads as 1).
+fn decode_in_place(value: u64) -> Result<(), VmcsError> {
+    match value {
+        0 => Ok(()),
+        rflags => Err(launch_failure(rflags)),
+    }
+}
+
+/// Enters the guest described by the current VMCS in place: the guest is
+/// this code, from the instruction after VMLAUNCH on, with the RSP and
+/// RFLAGS it had there, IF included. So this returns `Ok` in VMX non-root
+/// operation, to its caller, as if VMLAUNCH had been an instruction that did
+/// nothing. The registers VM entry does not load (the general-purpose ones)
+/// keep their values across it.
+///
+/// Returns [`GuestStop::LaunchFailed`] in root operation if VMLAUNCH, or a
+/// VMWRITE of GUEST_RIP, GUEST_RSP or GUEST_RFLAGS just before it, failed:
+/// the guest never ran. A failed VMWRITE reads as VmFailValid with error 12
+/// (unsupported VMCS component).
+///
+/// An interrupt that arrives after RFLAGS is copied runs the firmware's
+/// handler in root operation, on the stack below the copied RSP, and is
+/// gone by VMLAUNCH; the guest starts with that same RSP.
+///
+/// # Safety
+///
+/// As for [`launch`], except for RIP, RSP and RFLAGS, which this writes:
+/// VMX root operation, with a current VMCS whose controls, host state and
+/// other guest state are fully written, and HOST_RSP and HOST_RIP at a live
+/// exit stack and handler. The guest state must describe the running
+/// context (`guest_state::GuestEntry::InPlace`), so that the code after
+/// VMLAUNCH runs the same as before it. No VM exit may jump back here: the
+/// exit handler must halt on a stop (`GuestKind::Firmware`).
+pub unsafe fn launch_in_place() -> Result<(), GuestStop> {
+    let value: u64;
+    // SAFETY: the caller guarantees VMX root operation with a fully written
+    // current VMCS and a guest state that is this context's. VMWRITE changes
+    // only the VMCS. Each `jbe` leaves at the first VMfail (CF = 1 or
+    // ZF = 1). PUSHFQ and POP balance, so RSP at VMLAUNCH, and at `2:` where
+    // the guest starts, is the one written to GUEST_RSP. VM entry keeps the
+    // general-purpose registers, so every operand still holds its value
+    // there; flags are clobbered either way (no `preserves_flags`).
+    unsafe {
+        asm!(
+            "lea {value}, [rip + 2f]",
+            "vmwrite {rip_field}, {value}",
+            "jbe 3f",
+            "vmwrite {rsp_field}, rsp",
+            "jbe 3f",
+            "pushfq",
+            "pop {value}",
+            "vmwrite {rflags_field}, {value}",
+            "jbe 3f",
+            "vmlaunch",
+            // VMLAUNCH or a VMWRITE failed: its RFLAGS say how.
+            "3:",
+            "pushfq",
+            "pop {value}",
+            "jmp 4f",
+            // The guest starts here, in VMX non-root operation.
+            "2:",
+            "xor {value:e}, {value:e}",
+            "4:",
+            // `out`, not `lateout`: written before the inputs are last read.
+            value = out(reg) value,
+            rip_field = in(reg) u64::from(GUEST_RIP),
+            rsp_field = in(reg) u64::from(GUEST_RSP),
+            rflags_field = in(reg) u64::from(GUEST_RFLAGS),
+        );
+    }
+    decode_in_place(value).map_err(|error| GuestStop::LaunchFailed {
+        error,
+        // SAFETY: the launch failed, so this is still root operation with the
+        // VMCS current; teardown has not run yet.
+        instruction_error: unsafe { instruction_error_for(error) },
+    })
 }
 
 #[cfg(test)]
