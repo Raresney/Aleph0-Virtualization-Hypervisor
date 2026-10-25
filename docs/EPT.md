@@ -3,15 +3,20 @@
 How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 - why the guest needs a translation stage it cannot touch;
 - the EPT entries and the EPT pointer;
-- how Aleph0 checks support and builds an identity map, with the memory
-  types of the MTRRs;
+- how Aleph0 checks support and builds an identity map of the whole
+  guest-physical address space, with the memory types of the MTRRs for RAM
+  and UC 1 GiB pages above it;
+- the Local APIC, the device page the test guest reads through it;
 - the guest's read-only data page and the EPT violation it causes on purpose;
-- how Aleph0 handles that violation (grant write, INVEPT, retry);
+- how Aleph0 handles that violation (grant write, INVEPT, retry), and how
+  it stops on any other EPT exit with a walk of the GPA through the tables;
 - what the Hyper-V runs printed;
 - what the identity map does *not* hide, and what is not covered yet.
 
 Code:
-- `src/vmx/ept/mod.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
+- `src/vmx/ept/mod.rs`: support check, entry encodings, the map's layout (`MapLayout`), identity map, `ProtectedPage::grant_write`, INVEPT;
+- `src/vmx/ept/walk.rs`: what the CPU refuses in an entry (`check_entry`), and the walk of a GPA (`walk`);
+- `src/vmx/apic.rs`: IA32_APIC_BASE, and the check that the test guest can read the Local APIC;
 - `src/vmx/mtrr/mod.rs`: the memory type of each address, from the MTRRs (see [MTRR.md](MTRR.md));
 - `src/vmx/guest.rs`: the data page and the guest code that writes it;
 - `src/vmx/exit_decision/`: which EPT violation is accepted (`scenario.rs`, reached from `decide` in `mod.rs`);
@@ -67,14 +72,15 @@ entry bits differ:
 | 0, 1, 2 | **R, W, X**: read, write, execute allowed. No separate "present" bit: R = W = X = 0 means not present. |
 | 5:3 | memory type, in leaf entries only: 0 = UC, 6 = write-back (WB), the type of ordinary RAM; Aleph0 copies it from the MTRRs ([MTRR.md](MTRR.md)) |
 | 6 | IPAT: ignore the guest's PAT. Aleph0 leaves it 0. |
-| 7 | in a PD entry: this entry maps a 2 MiB page directly (no PT below) |
+| 7 | in a PDPT or PD entry: this entry maps a 1 GiB or 2 MiB page directly (no table below) |
 | 51:12 | physical address of the next table, or of the page |
 
 Some combinations are not just "forbidden" but invalid, for example W = 1
 with R = 0. The CPU reports those as **exit reason 49, EPT
-misconfiguration**, which Aleph0 never handles.
+misconfiguration**. Aleph0 makes no such entry, so one stops the guest with
+a walk of the GPA that names the bad entry (section 6).
 
-The encodings Aleph0 uses (`ept.rs`, all host-tested). `EptEntry<L>` is
+The encodings Aleph0 uses (`ept/mod.rs`, all host-tested). `EptEntry<L>` is
 generic over its table level (`Pml4`, `Pdpt`, `Pd`, `Pt` in `ept::level`),
 so each constructor exists only where the entry is valid: calling
 `large_page` on a PT entry, or `table` on one, does not compile.
@@ -120,6 +126,14 @@ IA32_VMX_PROCBASED_CTLS (primary) allows bit 31
 | 20 | INVEPT | `ProtectedPage::grant_write` |
 | 25 or 26 | single- or all-context INVEPT | single-context is preferred |
 
+It also reads two bits it does not require, into `EntryRules` with
+MAXPHYADDR:
+
+| Bit | Meaning | What it changes |
+|---|---|---|
+| 0 | execute-only pages | whether X = 1 with R = W = 0 is a misconfiguration (section 6) |
+| 17 | 1 GiB pages | the map above RAM (section 4) |
+
 Hyper-V (nested) reported:
 
 ```text
@@ -130,7 +144,7 @@ EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT single-context.
 Decoded, `0x06f34041` (low half) has bits 0, 6, 14, 16, 17, 20, 21, 22, 23,
 25 and 26 set. Beyond what Aleph0 requires, that means:
 - execute-only pages (bit 0), which EPT split views need later;
-- 1 GiB pages (bit 17);
+- 1 GiB pages (bit 17), which the map above RAM uses;
 - accessed/dirty flags (bit 21);
 - advanced EPT-violation information (bit 22, see section 6).
 
@@ -142,21 +156,54 @@ Aleph0 builds an **identity map**: GPA = HPA everywhere. The guest then
 runs exactly as before, because every address it used still reaches the
 same memory. Only the permissions can now differ.
 
+The map covers the whole guest-physical address space:
+`[0, 2^min(MAXPHYADDR, 48))` (`address_space_end`). MAXPHYADDR is
+CPUID.80000008H:EAX[7:0] (`cpuid::physical_address_bits`), and a 4-level
+walk translates 48 bits whatever MAXPHYADDR says. Device memory can be
+anywhere in that space: the Local APIC at `0xFEE00000`, the IOAPIC, PCI
+BARs, the VMBus windows Hyper-V puts above RAM. A GPA without an entry
+would stop the guest at its first access to it (section 6).
+
+`MapLayout` lays the map out GiB by GiB:
+
+```text
+0 ── PDs (2 MiB and 4 KiB pages) ── pd_end ── 1 GiB pages, UC ── end
+     the GiBs the UEFI memory map        no RAM above the memory map
+     reaches: RAM, retyped when the
+     guest writes its MTRRs
+```
+
+- The GiBs the UEFI memory map reaches keep a PD each, even a GiB of one
+  type, so the guest's MTRR writes can retype its RAM 2 MiB or 4 KiB at a
+  time (section 7, [MTRR.md](MTRR.md) section 7) without splitting a 1 GiB
+  page.
+- Above them there is no RAM, so every GiB is UC whatever the MTRRs say
+  (`EptTypes`, [MTRR.md](MTRR.md) section 5), and is never retyped: one UC
+  1 GiB page each, in a PDPT entry.
+- One PDPT per 512 GiB, each in its own PML4 entry: 128 for a 46-bit space.
+- Without 1 GiB pages (capability bit 17 clear), a PD per GiB of a 46-bit
+  space would take 256 MiB of tables, so the PDs stop at
+  `max(memory map end, 4 GiB)` instead. The 32-bit device window, with the
+  Local APIC and the IOAPIC, is still mapped; an access above it stops the
+  guest with the walk of section 6.
+
 `Ept::build` (before VMXON, while boot services run):
 
 1. Reads the UEFI memory map and takes the highest address any region
-   reaches, rounded up to 1 GiB (`identity_map_end`). Every region counts,
-   whatever its type. One PDPT reaches 512 GiB, so that is the limit.
+   reaches, rounded up to 1 GiB (`memory_map_end`). Every region counts,
+   whatever its type. `MapLayout::new` refuses a memory map that reaches
+   past the address space.
 2. Gathers the memory map's RAM into sorted, merged ranges (`RamMap`):
    RAM takes the MTRRs' memory type, and everything else (MMIO, reserved
    memory, holes) is UC (`EptTypes`, [MTRR.md](MTRR.md) section 5).
    Counts the 2 MiB regions that need a PT (`split_regions`): those whose
    pages differ in memory type or are only partly RAM, and the one holding
    the guest's data page.
-3. Allocates one PML4, one PDPT, one PD per GiB, and those PTs, plus spare
-   PTs for regions the guest's MTRR writes split later (`spare_pts`), and a
-   stack of the free PTs' indices.
-4. Points PML4 entry 0 at the PDPT and PDPT entry *i* at PD *i*.
+3. Allocates one PML4, the PDPTs, one PD per GiB below `pd_end`, and those
+   PTs, plus spare PTs for regions the guest's MTRR writes split later
+   (`spare_pts`), and a stack of the free PTs' indices.
+4. Points PML4 entry *k* at PDPT *k*, and PDPT entry *g* at PD *g* below
+   `pd_end`; above it, PDPT entry *g* is a UC 1 GiB page.
 5. Fills every PD entry with a 2 MiB page, RWX, of the region's memory
    type, except for the regions counted in step 2. Their PD entry points to
    the next PT, which maps the region in 512 pages of 4 KiB, all RWX and
@@ -164,6 +211,10 @@ same memory. Only the permissions can now differ.
 
 2 MiB pages keep the tables small. Only the regions that need a 4 KiB
 exception pay for a PT.
+
+Aleph0's own page tables (HOST_CR3) map only up to the memory map's end
+(`Ept::memory_map_end`, [HOST_ENVIRONMENT.md](HOST_ENVIRONMENT.md)): root
+operation needs Aleph0's memory and the EPT tables, never device memory.
 
 `Ept::build` also returns the `TypeTables` the exit handler keeps: the PDs,
 the PTs with the spare ones, and the free stack. When the guest writes its
@@ -188,6 +239,45 @@ PDPT index = bits 38:30 = 1       (second GiB)
 PD index   = bits 29:21 = 0x1F5   (PD entry 1 * 512 + 0x1F5 = 0x3F5 across both PDs: the split)
 PT index   = bits 20:12 = 0x101   (the read-only entry)
 ```
+
+### The Local APIC
+
+The Local APIC is the device every OS, and the firmware once it is the
+guest (#21), touches first. In xAPIC mode its registers are a 4 KiB page of
+MMIO at IA32_APIC_BASE (MSR `0x1B`), `0xFEE00000` unless the firmware moved
+it: above RAM on the test VM, so in a UC 1 GiB page. `vmx/apic.rs` decodes
+the MSR: the page's address (bits MAXPHYADDR-1:12), the BSP flag, and the
+mode from bits 11:10, named as KVM's `enum lapic_mode` names them
+(disabled, xAPIC, x2APIC, invalid).
+
+Before VMXON, bring-up checks that the test guest can read the page
+(`check_local_apic`), and stops with `LocalApic` otherwise:
+- the Local APIC is in xAPIC mode (EN = 1, EXTD = 0): in x2APIC mode the
+  registers are MSRs and the page decodes nothing;
+- the page tables the guest shares with bring-up (the firmware's) map the
+  page to itself, since the guest reads it through that linear address;
+- the walk of the page through EPT (section 6) maps it to itself, UC and
+  readable.
+
+The test guest then reads it, after its MTRR writes and before its `hlt`:
+
+```text
+mov ecx, 0x1b                ; IA32_APIC_BASE, which the MSR bitmap passes through
+rdmsr
+mov ecx, eax
+and ecx, 0xc00               ; EN and EXTD
+cmp ecx, 0x800               ; xAPIC mode, or ud2 with the fail marker
+...
+and rax, r10                 ; bits below MAXPHYADDR (R10, from the MTRR part)
+and rax, -0x1000             ; the register page
+mov eax, [rax + 0x30]        ; the version register: no exit
+cmp al, 0x10 / cmp al, 0x15  ; an integrated APIC, or ud2 (0xFF: nothing answered)
+hlt                          ; the HLT exit shows the register in RAX
+```
+
+The read adds no exit: with the page mapped RWX, it never leaves the
+guest. A missing entry would be an EPT violation, and the walk would show
+which level lacks it.
 
 ## 5. The guest's data page
 
@@ -263,10 +353,10 @@ of these hold:
 - no write was granted yet (a second violation would mean the grant did not
   work).
 
-Anything else stops the guest as unexpected. And if main VMCALL #1 arrives
-**before** any violation, the guest's write went through unnoticed: EPT did
-not protect the page, and the guest stops with a message saying so
-(`EptWriteMissing`).
+Any other EPT violation stops the guest as `EptViolation`, with a walk of
+the GPA (below). And if main VMCALL #1 arrives **before** any violation, the
+guest's write went through unnoticed: EPT did not protect the page, and the
+guest stops with a message saying so (`EptWriteMissing`).
 
 ### Grant and retry
 
@@ -282,6 +372,66 @@ Not advancing RIP is the only option anyway: for an EPT violation the CPU
 does not report the instruction's length (`instruction length=0` in the
 log), because the instruction did not complete. Skipping a write would
 require decoding it.
+
+### Any other EPT exit: the walk
+
+The map allows every access to every GPA it covers, but one write. So any
+other EPT violation, and every EPT misconfiguration (exit reason 49: an
+entry the CPU refuses to use at all), means the map is wrong, not that an
+access needs emulating. Each stops the guest as its own event,
+`ExitEvent::EptViolation` or `ExitEvent::EptMisconfig`, and the report
+prints the GPA's walk through the tables, the way KVM prints the hierarchy
+of an EPT entry with reserved bits set (`get_mmio_spte`). Unlike KVM, which
+misconfigures entries on purpose for MMIO and emulates those accesses in
+`handle_ept_misconfig`, Aleph0 passes devices through, so it makes no
+misconfigured entry.
+
+`ept::walk` (`ept/walk.rs`) follows a GPA from the EPTP down, one entry
+per level, as the CPU does, until an entry maps a page, is not present, or
+is one the CPU refuses. It returns every entry it read, with what the CPU
+refuses in it, and how the walk ended: mapped (with the HPA, page size,
+access and memory type), not present, misconfigured, or a pointer outside
+the tables. It reads entries through a function its caller gives it.
+`TypeTables::walk`, which the exit handler uses, gives it one that reads
+only the table pages `Ept::build` allocated, so a corrupt pointer is
+reported, never followed into memory that is not EPT. The walk starts from
+the EPTP the VMCS holds.
+
+`check_entry` names what the CPU refuses in an entry (Intel SDM Vol. 3C,
+"EPT Misconfigurations"), as KVM's `is_rsvd_spte` does with the masks
+`__reset_rsvds_bits_mask_ep` builds:
+
+| Entry | Bits reserved (must be 0) |
+|---|---|
+| any | 51:MAXPHYADDR |
+| PML4 | 7:3: no memory type, IPAT or page size |
+| PDPT or PD pointing to a table | 6:3: no memory type or IPAT |
+| PDPT mapping a 1 GiB page | 29:12, below the page's alignment; and 7 itself on a CPU without 1 GiB pages |
+| PD mapping a 2 MiB page | 20:12 |
+| PT | nothing more |
+
+Besides reserved bits: bits 2:0 must not allow writes without reads (010b,
+110b), nor execution alone (100b) on a CPU without execute-only pages; and
+a page's memory type must not be 2, 3 or 7. An entry with bits 2:0 = 000b
+is not present: a walk reaching it is an EPT violation, never a
+misconfiguration.
+
+For example, a 2 MiB page at `0x400000` planted with W = 1 but R = 0 would
+print (addresses made up):
+
+```text
+VM exit #N: an EPT entry on this GPA's path is one the CPU refuses; Ept::build makes none, so the map is wrong.
+VM exit #N: EPT walk of GPA 0x0000000000400010 from EPTP 0x7eaa901e:
+VM exit #N:   PML4 entry 0x0 at 0x7eaa9000 = 0x000000007eaaa007: ok
+VM exit #N:   PDPT entry 0x0 at 0x7eaaa000 = 0x000000007eb2a007: ok
+VM exit #N:   PD entry 0x2 at 0x7eb2a010 = 0x00000000004000b6: write without read
+VM exit #N:   the CPU refuses the last entry: an EPT misconfiguration.
+```
+
+The host tests check each rule at each level, every entry `Ept::build`
+makes, walks through hand-built tables and through the full Hyper-V map,
+and the bounds-checked reader on real page-aligned tables, with a planted
+pointer it must not follow.
 
 ## 7. INVEPT
 
@@ -381,7 +531,13 @@ section 10).
 - **EPT split views** (ROADMAP section 6): one GPA mapped to one host page
   for execution (execute-only, cap bit 0, which Hyper-V has) and to another
   for reads.
-- **More than 512 GiB**: a second PDPT, or 1 GiB pages.
+- **1 GiB pages for RAM**: the GiBs the memory map reaches keep their PDs,
+  so MTRR writes retype them 2 MiB or 4 KiB at a time. A GiB of RAM of one
+  type mapped as one 1 GiB page would have to be split, with spare PDs, when
+  an MTRR write gives part of it another type.
+- **The guest's MAXPHYADDR**: CPUID passes it through. On a CPU that reports
+  more than 48 bits, the guest could use GPAs a 4-level walk does not
+  translate; KVM caps the guest's physical-address width for that (#25).
 - **VPID**: tags TLB entries per guest so VM entries and exits need not
   flush them. A performance feature, independent of EPT.
 - **INVEPT before VMXOFF**: the EPT pages are never freed, so cached
@@ -399,10 +555,12 @@ section 10).
 | `SECONDARY_VM_EXEC_CONTROL` | `0x401E` |
 | `EPT_POINTER` | `0x201A`; low bits `0x1E` = WB, 4 levels |
 | `IA32_VMX_PROCBASED_CTLS2` | `0x48B` |
-| `IA32_VMX_EPT_VPID_CAP` | `0x48C`; bits 6, 14, 16, 20, 25/26 required |
-| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs for RAM, UC for the rest; 0 = UC, 6 = WB), 6 IPAT, 7 2 MiB page |
-| Exit reason 48 | EPT violation: `GUEST_PHYSICAL_ADDRESS` `0x2400`, `GUEST_LINEAR_ADDRESS` `0x640A` |
-| Exit reason 49 | EPT misconfiguration: never handled |
+| `IA32_VMX_EPT_VPID_CAP` | `0x48C`; bits 6, 14, 16, 20, 25/26 required; 0 (execute-only) and 17 (1 GiB pages) read |
+| EPT entry bits | 0 R, 1 W, 2 X, 5:3 type (from the MTRRs for RAM, UC for the rest; 0 = UC, 6 = WB), 6 IPAT, 7 1 GiB or 2 MiB page |
+| The map | `[0, 2^min(MAXPHYADDR, 48))`: PDs up to the memory map's end, UC 1 GiB pages above |
+| Exit reason 48 | EPT violation: `GUEST_PHYSICAL_ADDRESS` `0x2400`, `GUEST_LINEAR_ADDRESS` `0x640A`; any but the accepted one stops with the walk |
+| Exit reason 49 | EPT misconfiguration: stops with the walk, which names the bad entry |
+| IA32_APIC_BASE | `0x1B`; xAPIC registers at its bits MAXPHYADDR-1:12, the version register at `+0x30` |
 | Qualification | 0 read, 1 write, 2 fetch, 3/4/5 R/W/X allowed, 7 linear valid, 8 translated access, 12 NMI-unblocking IRET |
 | Accepted violation | write to the protected page, `0x58a` on Hyper-V |
 | After it | W = 1, INVEPT, resume at the same RIP |
