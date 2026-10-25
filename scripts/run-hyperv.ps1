@@ -62,7 +62,20 @@
     Boots the -Kernel image directly: it becomes \EFI\BOOT\BOOTX64.EFI in
     Aleph0's place, and Aleph0 is not built. Nothing writes COM2 then, and
     the kernel's console is COM1, so COM1 streams to this console (and
-    run\guest-serial.log) instead.
+    run\guest-serial.log) instead. With -Harness instead of -Kernel: the
+    harness runs on the firmware alone (its without-aleph0 feature), to check
+    its steps after ExitBootServices without Aleph0.
+
+.PARAMETER Harness
+    Boots the ExitBootServices test harness (tools/ebs-harness) as
+    \EFI\BOOT\BOOTX64.EFI, with Aleph0 next to it as \EFI\BOOT\aleph0.efi.
+    The harness starts Aleph0, runs as its guest, exits boot services,
+    overwrites every page the OS may reclaim, then makes VM exits and idles
+    (docs/RESIDENT.md). Its own lines go to COM1, run\guest-serial.log.
+
+.PARAMETER SetVirtualAddressMap
+    With -Harness: the harness also calls SetVirtualAddressMap after
+    ExitBootServices (its set-virtual-address-map feature).
 #>
 param(
     [string]$VMName   = "Aleph0Test",
@@ -77,7 +90,9 @@ param(
     [ValidateRange(1, 1024)]
     [int]$ProcessorCount = $(if ($InjectNmi) { 1 } else { 2 }),
     [string]$Kernel = "",
-    [switch]$WithoutAleph0
+    [switch]$WithoutAleph0,
+    [switch]$Harness,
+    [switch]$SetVirtualAddressMap
 )
 
 # See run.ps1 for why $ErrorActionPreference is not set to "Stop" globally.
@@ -87,6 +102,7 @@ $espType = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'   # EFI System Partition GPT
 $root         = Split-Path -Parent $PSScriptRoot   # this script lives in scripts/
 $buildProfile = if ($Release) { "release" } else { "debug" }
 $efiSrc       = Join-Path $root "target\x86_64-unknown-uefi\$buildProfile\aleph0hypervisor.efi"
+$harnessSrc   = Join-Path $root "target\x86_64-unknown-uefi\$buildProfile\ebs-harness.efi"
 $runDir       = Join-Path $root "run"
 $vhdPath      = Join-Path $runDir "aleph0-esp.vhdx"
 
@@ -131,13 +147,23 @@ if ($Kernel -and -not (Test-Path -LiteralPath $Kernel -PathType Leaf)) {
     Write-Error "Kernel image $Kernel not found; scripts/linux/build.sh builds run\linux\linux.efi."
     exit 1
 }
-if ($WithoutAleph0 -and -not $Kernel) {
-    Write-Error "-WithoutAleph0 boots the -Kernel image; pass -Kernel."
+if ($WithoutAleph0 -and -not ($Kernel -or $Harness)) {
+    Write-Error "-WithoutAleph0 boots the -Kernel image or the harness; pass -Kernel or -Harness."
     exit 1
 }
 # The NMI job waits for a line only Aleph0 prints.
 if ($WithoutAleph0 -and $InjectNmi) {
     Write-Error "-InjectNmi needs Aleph0; do not combine it with -WithoutAleph0."
+    exit 1
+}
+# The harness runs as the guest of the firmware build of Aleph0, which the
+# test guest's build is not, and it takes BOOTX64.EFI itself.
+if ($Harness -and ($TestGuest -or $InjectNmi -or $Kernel)) {
+    Write-Error "-Harness needs the firmware build of Aleph0, or none with -WithoutAleph0; do not combine it with -TestGuest, -InjectNmi or -Kernel."
+    exit 1
+}
+if ($SetVirtualAddressMap -and -not $Harness) {
+    Write-Error "-SetVirtualAddressMap is a harness option; pass -Harness."
     exit 1
 }
 
@@ -161,6 +187,23 @@ if (-not $WithoutAleph0) {
     if (-not (Test-Path $efiSrc)) {
         Write-Error "Compiled binary not found at $efiSrc"
         exit 1
+    }
+}
+if ($Harness) {
+    $harnessArgs = @("build", "-p", "ebs-harness")
+    if ($Release) { $harnessArgs += "--release" }
+    $harnessFeatures = @()
+    if ($SetVirtualAddressMap) { $harnessFeatures += "set-virtual-address-map" }
+    if ($WithoutAleph0) { $harnessFeatures += "without-aleph0" }
+    if ($harnessFeatures) { $harnessArgs += @("--features", ($harnessFeatures -join ',')) }
+    Write-Host "==> cargo $($harnessArgs -join ' ')" -ForegroundColor Cyan
+    Push-Location $root
+    cargo @harnessArgs
+    $buildExit = $LASTEXITCODE
+    Pop-Location
+    if ($buildExit -ne 0) {
+        Write-Error "cargo build of the harness failed (exit code $buildExit)."
+        exit $buildExit
     }
 }
 
@@ -197,8 +240,12 @@ try {
 
         $bootDir = "$($part.DriveLetter):\EFI\BOOT"
         New-Item -ItemType Directory -Force -ErrorAction Stop -Path $bootDir | Out-Null
-        $bootImage = if ($WithoutAleph0) { $Kernel } else { $efiSrc }
+        $bootImage = if ($Harness) { $harnessSrc } elseif ($WithoutAleph0) { $Kernel } else { $efiSrc }
         Copy-Item -Force -ErrorAction Stop -LiteralPath $bootImage -Destination (Join-Path $bootDir "BOOTX64.EFI")
+        if ($Harness -and -not $WithoutAleph0) {
+            # Where the harness loads Aleph0 from.
+            Copy-Item -Force -ErrorAction Stop -LiteralPath $efiSrc -Destination (Join-Path $bootDir "aleph0.efi")
+        }
         if ($Kernel) {
             $kernelDir = "$($part.DriveLetter):\EFI\aleph0"
             New-Item -ItemType Directory -Force -ErrorAction Stop -Path $kernelDir | Out-Null

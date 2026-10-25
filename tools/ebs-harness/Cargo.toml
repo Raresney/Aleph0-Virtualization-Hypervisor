@@ -1,0 +1,25 @@
+[package]
+name = "ebs-harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# `alloc` only to read Aleph0's image from the ESP, before ExitBootServices.
+[dependencies]
+uefi = { version = "0.40", features = ["alloc"] }
+
+# The firmware's pool as the global allocator, for the .efi only: the host
+# unit tests allocate from the host's.
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.40", features = ["alloc", "global_allocator"] }
+
+[features]
+# Call SetVirtualAddressMap after ExitBootServices, with virtual addresses
+# that differ from the physical ones, as Linux does
+# (`run-hyperv.ps1 -Harness -SetVirtualAddressMap`).
+set-virtual-address-map = []
+# Do not start Aleph0, and skip the VMCALL: checks ExitBootServices, the
+# switch to the harness's own tables, SetVirtualAddressMap and the overwrite
+# on the firmware alone (`run-hyperv.ps1 -Harness -WithoutAleph0`).
+without-aleph0 = []
