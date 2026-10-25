@@ -19,7 +19,7 @@ Code:
   reading them (`read`), and the guest's copy (`MtrrState`);
 - `src/vmx/cpuid.rs`: `has_mtrr`, the CPUID check before any MTRR MSR is
   read, and `physical_address_bits` (MAXPHYADDR);
-- `src/vmx/ept.rs`: `large_page_type`, `split_regions` and
+- `src/vmx/ept/mod.rs`: `large_page_type`, `split_regions` and
   `fill_identity_map`, which put the types into the identity map;
   `spare_pts`, `retype` and `TypeTables`, which change them when the guest
   writes its MTRRs;
@@ -205,9 +205,9 @@ guest's PAT still combines with it, and UC from EPT with WC from the PAT is
 WC (SDM Vol. 3A, "Selecting Memory Types for Pentium III and More Recent
 Processor Families"). KVM does the same: `vmx_get_mt_mask` gives MMIO UC.
 
-This also settles the types of the ranges #20 adds above the map's end:
-none of them is RAM, so they are UC, not the WB Hyper-V's MTRRs give
-`0x80000000..0x100000000`.
+This also settles the types of the ranges #20 maps above the memory map's
+end: none of them is RAM, so they are UC 1 GiB pages ([EPT.md](EPT.md)
+section 4), not the WB Hyper-V's MTRRs give `0x80000000..0x100000000`.
 
 ## 6. What bring-up prints
 
@@ -286,9 +286,11 @@ same way for both VM shapes.
 above 4 GiB UC, the default type. That WB range includes the Local APIC at
 `0xFEE00000` and the IOAPIC at `0xFEC00000`. On real hardware the firmware
 usually marks the hole below 4 GiB UC with a variable range; Hyper-V's does
-not. Copying the MTRR types, as `Ept::build` does, would map those devices
-WB. Hyper-V emulates them, so their accesses are trapped whatever the type,
-but #20 should decide on purpose rather than inherit WB.
+not. Copying the MTRR types would map those devices WB. Hyper-V emulates them,
+so their accesses are trapped whatever the type, but EPT decides on purpose
+rather than inherit WB: the range is not RAM, so it is UC (section 5), and
+since #20 the map covers it, as UC 1 GiB pages ([EPT.md](EPT.md)
+section 4).
 
 ## 7. Guest writes to the MTRRs
 

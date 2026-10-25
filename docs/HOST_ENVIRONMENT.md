@@ -41,9 +41,12 @@ the OS keeps is the next step (#23).
 ## 2. The page tables
 
 An identity map (linear = physical) of every address the UEFI memory map
-reaches, rounded up to 1 GiB: the same range EPT maps (`Ept::end`). That
-range holds the image with the exit handler, every allocation, and the
-firmware stack that `vmx_return_to_launcher` returns to after a stop.
+reaches, rounded up to 1 GiB (`Ept::memory_map_end`). That range holds the
+image with the exit handler, every allocation (the EPT tables included),
+and the firmware stack that `vmx_return_to_launcher` returns to after a
+stop. EPT maps more for the guest, the whole guest-physical address space
+([EPT.md](EPT.md) section 4), but root operation never touches the device
+memory above the memory map.
 
 ```text
 with 1 GiB pages (CPUID.80000001H:EDX bit 26):

@@ -5,6 +5,7 @@
 //! private items.
 
 use super::level::{Pd, Pdpt, Pml4, Pt};
+use super::walk::WalkEnd;
 use super::*;
 use crate::vmx::guest::GUEST_MTRR_BASE;
 use crate::vmx::mtrr::MemoryType::{Uncacheable as UC, WriteBack as WB, WriteProtected as WP};
@@ -19,21 +20,54 @@ const EPT_ALLOWED: ControlCapability = ControlCapability((SECONDARY_ENABLE_EPT a
 const FULL_CAP: u64 =
     CAP_WALK_LENGTH_4 | CAP_WRITE_BACK | CAP_2M_PAGES | CAP_INVEPT | CAP_INVEPT_SINGLE_CONTEXT | CAP_INVEPT_ALL_CONTEXT;
 
+/// MAXPHYADDR on the Hyper-V test VM: CPUID 0x80000008 EAX 0x302e.
+const HYPER_V_BITS: u8 = 46;
+
+/// The INVEPT type [`check_support`] picks for `cap`.
+fn invept_for(cap: u64) -> Result<InveptType, EptError> {
+    check_support(EPT_ALLOWED, cap, HYPER_V_BITS).map(|support| support.invept)
+}
+
 #[test]
 fn full_support_picks_single_context() {
-    assert_eq!(check_support(EPT_ALLOWED, FULL_CAP), Ok(InveptType::SingleContext));
+    assert_eq!(invept_for(FULL_CAP), Ok(InveptType::SingleContext));
 }
 
 #[test]
 fn all_context_is_the_fallback() {
-    let cap = FULL_CAP & !CAP_INVEPT_SINGLE_CONTEXT;
-    assert_eq!(check_support(EPT_ALLOWED, cap), Ok(InveptType::AllContext));
+    assert_eq!(
+        invept_for(FULL_CAP & !CAP_INVEPT_SINGLE_CONTEXT),
+        Ok(InveptType::AllContext)
+    );
+}
+
+#[test]
+fn the_rules_carry_maxphyaddr_and_whether_pdpt_entries_may_map_1_gib() {
+    let rules = |cap| check_support(EPT_ALLOWED, cap, HYPER_V_BITS).map(|support| support.rules);
+    assert_eq!(
+        rules(FULL_CAP),
+        Ok(EntryRules {
+            physical_address_bits: HYPER_V_BITS,
+            huge_pages: false,
+            execute_only: false,
+        })
+    );
+    assert_eq!(rules(FULL_CAP | CAP_1G_PAGES).map(|rules| rules.huge_pages), Ok(true));
+    assert_eq!(
+        rules(FULL_CAP | CAP_EXECUTE_ONLY).map(|rules| rules.execute_only),
+        Ok(true)
+    );
+    // Hyper-V's IA32_VMX_EPT_VPID_CAP: bits 17 and 0 set.
+    assert_eq!(
+        rules(0x0000_0f01_06f3_4041).map(|rules| (rules.huge_pages, rules.execute_only)),
+        Ok((true, true))
+    );
 }
 
 #[test]
 fn each_missing_capability_has_its_error() {
     assert_eq!(
-        check_support(ControlCapability(0), FULL_CAP),
+        check_support(ControlCapability(0), FULL_CAP, HYPER_V_BITS),
         Err(EptError::EptUnsupported)
     );
     for (missing, error) in [
@@ -46,13 +80,26 @@ fn each_missing_capability_has_its_error() {
             EptError::InveptUnsupported,
         ),
     ] {
-        assert_eq!(check_support(EPT_ALLOWED, FULL_CAP & !missing), Err(error));
+        assert_eq!(invept_for(FULL_CAP & !missing), Err(error));
     }
 }
 
 #[test]
 fn table_entry_allows_everything() {
     assert_eq!(EptEntry::<Pdpt>::table(0x7e00_1000), EptEntry::from_raw(0x7e00_1007));
+}
+
+#[test]
+fn huge_page_entry_is_rwx_1g_of_its_memory_type() {
+    // 0x7 RWX | 0x80 page size; UC is type 0: no type bits.
+    assert_eq!(
+        EptEntry::<Pdpt>::huge_page(0xC000_0000, UC),
+        EptEntry::from_raw(0xC000_0087)
+    );
+    assert_eq!(
+        EptEntry::<Pdpt>::huge_page(1 << 45, WB),
+        EptEntry::from_raw((1 << 45) | 0xB7)
+    );
 }
 
 #[test]
@@ -136,26 +183,91 @@ fn debug_names_the_level() {
 fn map_end_is_the_highest_region_rounded_up_to_a_gib() {
     // 2 GiB of RAM in two regions, plus firmware MMIO just below 4 GiB.
     let regions = [(0, 0x1000), (0x0100_0000, 0x7_F000), (0xFFC0_0000, 0x400)];
-    assert_eq!(identity_map_end(regions.into_iter()), Ok(4 * SIZE_1G));
+    assert_eq!(memory_map_end(regions.into_iter()), Ok(4 * SIZE_1G));
 }
 
 #[test]
 fn map_end_on_a_gib_boundary_is_not_rounded_further() {
-    assert_eq!(identity_map_end([(0, 0x8_0000)].into_iter()), Ok(2 * SIZE_1G));
+    assert_eq!(memory_map_end([(0, 0x8_0000)].into_iter()), Ok(2 * SIZE_1G));
 }
 
 #[test]
-fn map_end_past_one_pdpt_is_refused() {
-    let past = MAX_IDENTITY_MAP + PAGE_SIZE as u64;
-    assert_eq!(
-        identity_map_end([(MAX_IDENTITY_MAP, 1)].into_iter()),
-        Err(EptError::RangeTooLarge { end: past }),
-    );
+fn a_region_past_the_top_of_the_address_space_ends_at_u64_max() {
+    assert_eq!(memory_map_end([(u64::MAX - 0xFFF, 2)].into_iter()), Ok(u64::MAX));
+    assert_eq!(memory_map_end([(0, u64::MAX)].into_iter()), Ok(u64::MAX));
 }
 
 #[test]
 fn empty_memory_map_is_refused() {
-    assert_eq!(identity_map_end(core::iter::empty()), Err(EptError::EmptyMemoryMap));
+    assert_eq!(memory_map_end(core::iter::empty()), Err(EptError::EmptyMemoryMap));
+    assert_eq!(memory_map_end([(0, 0)].into_iter()), Err(EptError::EmptyMemoryMap));
+}
+
+/// The rules of a CPU with `bits` of physical address, with 1 GiB EPT
+/// pages or without.
+fn rules(bits: u8, huge_pages: bool) -> EntryRules {
+    EntryRules {
+        physical_address_bits: bits,
+        huge_pages,
+        execute_only: false,
+    }
+}
+
+#[test]
+fn the_address_space_ends_at_maxphyaddr_or_where_a_4_level_walk_stops() {
+    assert_eq!(address_space_end(36), 1 << 36);
+    assert_eq!(address_space_end(HYPER_V_BITS), 1 << 46);
+    assert_eq!(address_space_end(48), 1 << 48);
+    assert_eq!(address_space_end(52), 1 << 48);
+}
+
+#[test]
+fn with_1_gib_pages_the_map_reaches_maxphyaddr_with_pds_for_the_memory_map() {
+    // The Hyper-V test VM: 2 GiB of memory map, 46 bits.
+    let layout = MapLayout::new(2 * SIZE_1G, rules(HYPER_V_BITS, true)).unwrap();
+    assert_eq!(layout.pd_gibs(), 2);
+    assert_eq!(layout.pd_end(), 2 * SIZE_1G);
+    assert_eq!(layout.end(), 1 << 46);
+    assert_eq!(layout.huge_gibs(), (1 << 16) - 2);
+    assert_eq!(layout.pdpts(), 128);
+    // 52 bits: the 4-level walk stops at 48, 512 PDPTs.
+    let layout = MapLayout::new(2 * SIZE_1G, rules(52, true)).unwrap();
+    assert_eq!((layout.end(), layout.pdpts()), (1 << 48, 512));
+    // 36 bits, the smallest: one PDPT, partly filled.
+    let layout = MapLayout::new(2 * SIZE_1G, rules(36, true)).unwrap();
+    assert_eq!((layout.end(), layout.pdpts(), layout.huge_gibs()), (1 << 36, 1, 62));
+}
+
+#[test]
+fn without_1_gib_pages_the_pds_reach_the_memory_map_or_4_gib_and_no_further() {
+    let layout = MapLayout::new(2 * SIZE_1G, rules(HYPER_V_BITS, false)).unwrap();
+    assert_eq!(
+        (layout.pd_gibs(), layout.end(), layout.huge_gibs()),
+        (4, 4 * SIZE_1G, 0)
+    );
+    let layout = MapLayout::new(8 * SIZE_1G, rules(HYPER_V_BITS, false)).unwrap();
+    assert_eq!((layout.pd_gibs(), layout.end()), (8, 8 * SIZE_1G));
+    assert_eq!(layout.pdpts(), 1);
+}
+
+#[test]
+fn a_memory_map_past_the_address_space_is_refused() {
+    for huge_pages in [false, true] {
+        assert_eq!(
+            MapLayout::new(1 << 37, rules(36, huge_pages)),
+            Err(EptError::RangeTooLarge {
+                end: 1 << 37,
+                limit: 1 << 36
+            })
+        );
+        assert_eq!(
+            MapLayout::new(u64::MAX, rules(HYPER_V_BITS, huge_pages)),
+            Err(EptError::RangeTooLarge {
+                end: u64::MAX,
+                limit: 1 << 46
+            })
+        );
+    }
 }
 
 /// MTRRs of a 2 GiB machine: WB up to 2 GiB, UC above (the default), a
@@ -174,7 +286,13 @@ fn test_mtrrs() -> Mtrrs {
     .unwrap()
 }
 
-/// The PML4, PDPT, PDs and PTs of an identity map.
+/// A map of `gibs` GiB, all of them through a PD: the layout of the 2 GiB
+/// tests, which look at the part of the map the memory map reaches.
+fn pds_only(gibs: usize) -> MapLayout {
+    MapLayout { pd_gibs: gibs, gibs }
+}
+
+/// The PML4, PDPTs, PDs and PTs of an identity map.
 type Tables4 = (
     Vec<EptEntry<Pml4>>,
     Vec<EptEntry<Pdpt>>,
@@ -207,28 +325,36 @@ fn filled_with(mtrrs: &Mtrrs, protected_page: u64) -> (Tables4, usize) {
 /// at 0x2000, PTs from 0x10_0000), and returns the tables and the protected
 /// page's index in the PTs.
 fn filled_with_ram(types: &EptTypes<'_>, protected_page: u64) -> (Tables4, usize) {
-    let split = split_regions(types, 2, protected_page);
-    let (mut pml4, mut pdpt, mut pds, mut pts) = (
+    filled_as(pds_only(2), types, protected_page)
+}
+
+/// Fills an identity map laid out as `layout` with `types` and made-up
+/// table addresses (PDPTs from 0x1000, the PDs right after them, PTs from
+/// 0x10_0000), and returns the tables and the protected page's index in
+/// the PTs.
+fn filled_as(layout: MapLayout, types: &EptTypes<'_>, protected_page: u64) -> (Tables4, usize) {
+    let split = split_regions(types, layout.pd_gibs(), protected_page);
+    let (mut pml4, mut pdpts, mut pds, mut pts) = (
         vec![EptEntry::EMPTY; ENTRIES],
-        vec![EptEntry::EMPTY; ENTRIES],
-        vec![EptEntry::EMPTY; 2 * ENTRIES],
+        vec![EptEntry::EMPTY; layout.pdpts() * ENTRIES],
+        vec![EptEntry::EMPTY; layout.pd_gibs() * ENTRIES],
         vec![EptEntry::EMPTY; split * ENTRIES],
     );
     let protected = fill_identity_map(
         Tables {
             pml4: &mut pml4,
-            pdpt: &mut pdpt,
+            pdpts: &mut pdpts,
             pds: &mut pds,
             pts: &mut pts,
-            pdpt_address: 0x1000,
-            pds_address: 0x2000,
+            pdpts_address: 0x1000,
+            pds_address: 0x1000 + (layout.pdpts() * PAGE_SIZE) as u64,
             pts_address: 0x10_0000,
         },
-        2,
+        layout,
         types,
         protected_page,
     );
-    ((pml4, pdpt, pds, pts), protected)
+    ((pml4, pdpts, pds, pts), protected)
 }
 
 #[test]
@@ -478,20 +604,20 @@ impl TypeMap {
         let types = EptTypes { mtrrs, ram };
         let split = split_regions(&types, 2, PROTECTED);
         let mut pml4 = vec![EptEntry::EMPTY; ENTRIES];
-        let mut pdpt = vec![EptEntry::EMPTY; ENTRIES];
+        let mut pdpts = vec![EptEntry::EMPTY; ENTRIES];
         let mut pds = vec![EptEntry::EMPTY; 2 * ENTRIES];
         let mut pts = vec![EptEntry::EMPTY; (split + spare) * ENTRIES];
         fill_identity_map(
             Tables {
                 pml4: &mut pml4,
-                pdpt: &mut pdpt,
+                pdpts: &mut pdpts,
                 pds: &mut pds,
                 pts: &mut pts[..split * ENTRIES],
-                pdpt_address: 0x1000,
+                pdpts_address: 0x1000,
                 pds_address: 0x2000,
                 pts_address: PTS_ADDRESS,
             },
-            2,
+            pds_only(2),
             &types,
             PROTECTED,
         );
@@ -888,4 +1014,472 @@ fn the_guests_mtrrs_never_make_memory_that_is_not_ram_cacheable() {
     // On again: the map bring-up built.
     map.retype(&all_write_back());
     assert_eq!((map.pds, map.pts, map.free_len), built);
+}
+
+// The whole guest-physical address space: the 1 GiB pages above the memory
+// map, and the PDPTs that hold them.
+
+#[test]
+fn pdpt_entries_read_back_as_1g_pages() {
+    assert_eq!(
+        EptEntry::<Pdpt>::huge_page(0xC000_0000, UC).mapping(),
+        RegionMapping::HugePage(UC)
+    );
+    // A PD pointer is read through its PD instead, so not as a 1 GiB page.
+    assert_eq!(EptEntry::<Pdpt>::table(0x2000).mapping(), RegionMapping::Invalid);
+    assert_eq!(EptEntry::<Pdpt>::EMPTY.mapping(), RegionMapping::Invalid);
+    // RWX, page size, type 2: reserved.
+    assert_eq!(EptEntry::<Pdpt>::from_raw(0x97).mapping(), RegionMapping::Invalid);
+    assert_eq!(RegionMapping::HugePage(UC).to_string(), "1 GiB pages, UC");
+}
+
+/// The Hyper-V test VM's MTRRs (#16): default UC, the fixed ranges WB below
+/// 0xA0000 and UC up to 1 MiB, and variable range 0 making the first 4 GiB
+/// WB, with its 46-bit mask.
+fn hyper_v_mtrrs() -> Mtrrs {
+    let all = |memory_type: MemoryType| u64::from_le_bytes([memory_type.raw() as u8; 8]);
+    let mut fixed = [all(UC); crate::vmx::mtrr::FIXED_MSRS];
+    fixed[0] = all(WB);
+    fixed[1] = all(WB);
+    let first_4_gib = (WB.raw(), 0x3FFF_0000_0000 | crate::vmx::mtrr::PHYSMASK_VALID);
+    Mtrrs::decode(enabled_with_fixed(UC), Some(fixed), &[first_4_gib]).unwrap()
+}
+
+/// The RAM Aleph0 found in the Hyper-V test VM's UEFI memory map (#16,
+/// #17): `EPT RAM 0x0..0xa0000` and `0x100000..0x80000000`.
+const HYPER_V_RAM: RamMap<'static> = RamMap {
+    ranges: &[(0, 0xA_0000), (0x10_0000, 0x8000_0000)],
+};
+
+/// A protected data page where bring-up put one on Hyper-V.
+const HYPER_V_DATA_PAGE: u64 = 0x7eab_0000;
+
+/// Every leaf of `tables`, laid out as `layout`, in address order: its
+/// base, size, memory type and access, read back from the entries. Panics
+/// at an entry that maps nothing or holds a reserved type.
+fn leaves(tables: &Tables4, layout: MapLayout) -> Vec<(u64, u64, MemoryType, u64)> {
+    let (_, pdpts, pds, pts) = tables;
+    let mut leaves = Vec::new();
+    for (gib, pdpt_entry) in pdpts.iter().enumerate().take(layout.gibs) {
+        let base = gib as u64 * SIZE_1G;
+        if gib >= layout.pd_gibs() {
+            let RegionMapping::HugePage(memory_type) = pdpt_entry.mapping() else {
+                panic!("GiB {gib} is not a 1 GiB page: {pdpt_entry:?}");
+            };
+            leaves.push((base, SIZE_1G, memory_type, pdpt_entry.raw & EPT_RWX));
+            continue;
+        }
+        for (i, pd_entry) in pds.iter().enumerate().skip(gib * ENTRIES).take(ENTRIES) {
+            let region = i as u64 * SIZE_2M;
+            match pd_entry.mapping() {
+                RegionMapping::LargePage(memory_type) => {
+                    leaves.push((region, SIZE_2M, memory_type, pd_entry.raw & EPT_RWX));
+                }
+                RegionMapping::Pt => {
+                    let pt = pt_index(*pd_entry, 0x10_0000, pts.len() / ENTRIES).expect("one of the PTs");
+                    for (j, page) in pts[pt * ENTRIES..][..ENTRIES].iter().enumerate() {
+                        let memory_type = leaf_memory_type(page.raw).expect("a defined type");
+                        leaves.push((
+                            region + (j * PAGE_SIZE) as u64,
+                            PAGE_SIZE as u64,
+                            memory_type,
+                            page.raw & EPT_RWX,
+                        ));
+                    }
+                }
+                other => panic!("region {i:#x} maps nothing: {other:?}"),
+            }
+        }
+    }
+    leaves
+}
+
+/// Checks that the map in `tables`, laid out as `layout`, covers
+/// `[0, layout.end())` without a gap and gives every page the memory type
+/// `types` gives it, RWX except `protected_page`, which is read-only.
+fn assert_every_page_has_its_type(tables: &Tables4, layout: MapLayout, types: &EptTypes<'_>, protected_page: u64) {
+    let mut next = 0;
+    for (base, size, memory_type, access) in leaves(tables, layout) {
+        assert_eq!(base, next, "a gap or an overlap before {base:#x}");
+        next = base + size;
+        let wanted = match size {
+            SIZE_1G => {
+                assert_eq!(
+                    types.ram.coverage(base, SIZE_1G),
+                    RamCoverage::None,
+                    "RAM in the 1 GiB page {base:#x}"
+                );
+                UC
+            }
+            SIZE_2M => types.region_type(base).expect("a region of one type"),
+            _ => types.page_type(base),
+        };
+        assert_eq!(memory_type, wanted, "the type of {base:#x} ({size:#x} bytes)");
+        let wanted_access = if base == protected_page { EPT_READ } else { EPT_RWX };
+        assert_eq!(access, wanted_access, "the access of {base:#x}");
+    }
+    assert_eq!(next, layout.end(), "the map ends early");
+}
+
+#[test]
+fn the_hyper_v_map_gives_every_page_up_to_maxphyaddr_the_type_ept_types_gives_it() {
+    let mtrrs = hyper_v_mtrrs();
+    let types = EptTypes {
+        mtrrs: &mtrrs,
+        ram: HYPER_V_RAM,
+    };
+    let layout = MapLayout::new(2 * SIZE_1G, rules(HYPER_V_BITS, true)).unwrap();
+    let (tables, _) = filled_as(layout, &types, HYPER_V_DATA_PAGE);
+    assert_every_page_has_its_type(&tables, layout, &types, HYPER_V_DATA_PAGE);
+    // As on Hyper-V: the first 2 MiB and the data page's region need a PT.
+    assert_eq!(split_regions(&types, layout.pd_gibs(), HYPER_V_DATA_PAGE), 2);
+}
+
+#[test]
+fn the_local_apic_and_the_ioapic_are_in_a_uc_1_gib_page_above_the_memory_map() {
+    let mtrrs = hyper_v_mtrrs();
+    let types = EptTypes {
+        mtrrs: &mtrrs,
+        ram: HYPER_V_RAM,
+    };
+    let layout = MapLayout::new(2 * SIZE_1G, rules(HYPER_V_BITS, true)).unwrap();
+    let ((_, pdpts, _, _), _) = filled_as(layout, &types, HYPER_V_DATA_PAGE);
+    // Hyper-V's MTRRs make the first 4 GiB WB, devices included: EPT makes
+    // the device window UC all the same, since it is not RAM.
+    assert_eq!(mtrrs.memory_type(0xFEE0_0000), WB);
+    assert_eq!(pdpts[Pdpt::index(0xFEE0_0000)], EptEntry::huge_page(3 * SIZE_1G, UC));
+    assert_eq!(Pdpt::index(0xFEC0_0000), 3);
+    assert_eq!(pdpts[2], EptEntry::huge_page(2 * SIZE_1G, UC));
+    // The last GiB of the 46-bit space.
+    assert_eq!(pdpts[(1 << 16) - 1], EptEntry::huge_page((1 << 46) - SIZE_1G, UC));
+}
+
+#[test]
+fn a_map_past_512_gib_takes_one_pdpt_per_pml4_entry() {
+    let mtrrs = test_mtrrs();
+    let types = all_ram_below(&mtrrs, 2 * SIZE_1G);
+    // 40 bits: 1 TiB, two PDPTs.
+    let layout = MapLayout::new(2 * SIZE_1G, rules(40, true)).unwrap();
+    let ((pml4, pdpts, _, _), _) = filled_as(layout, &types, 0x7eb1_d000);
+    assert_eq!(pml4[0], EptEntry::table(0x1000));
+    assert_eq!(pml4[1], EptEntry::table(0x2000));
+    assert_eq!(pml4[2], EptEntry::EMPTY);
+    // The PDs come right after the two PDPTs.
+    assert_eq!(pdpts[0], EptEntry::table(0x3000));
+    assert_eq!(pdpts[1], EptEntry::table(0x4000));
+    assert_eq!(pdpts[2], EptEntry::huge_page(2 * SIZE_1G, UC));
+    // GiB 512, entry 0 of the second PDPT, which PML4 entry 1 points to.
+    assert_eq!((Pml4::index(512 * SIZE_1G), Pdpt::index(512 * SIZE_1G)), (1, 0));
+    assert_eq!(pdpts[512], EptEntry::huge_page(512 * SIZE_1G, UC));
+    assert_eq!(pdpts[1023], EptEntry::huge_page(1023 * SIZE_1G, UC));
+}
+
+/// The EPT types of `mtrrs` with RAM from 0 to `end`.
+fn all_ram_below(mtrrs: &Mtrrs, end: u64) -> EptTypes<'_> {
+    let ranges: &'static [(u64, u64)] = Box::leak(Box::new([(0, end)]));
+    EptTypes {
+        mtrrs,
+        ram: RamMap { ranges },
+    }
+}
+
+#[test]
+fn a_map_with_uc_holes_and_gaps_in_its_ram_gives_every_page_its_type() {
+    let mtrrs = test_mtrrs();
+    // RAM with a gap of 3 MiB at 1 GiB (one region all hole, one half), and
+    // ending 1 MiB short of 2 GiB.
+    let ram = RamMap {
+        ranges: &[(0, SIZE_1G), (SIZE_1G + 0x30_0000, 2 * SIZE_1G - 0x10_0000)],
+    };
+    let types = EptTypes { mtrrs: &mtrrs, ram };
+    for layout in [
+        MapLayout::new(2 * SIZE_1G, rules(40, true)).unwrap(),
+        MapLayout::new(2 * SIZE_1G, rules(40, false)).unwrap(),
+    ] {
+        let (tables, _) = filled_as(layout, &types, 0x7eb1_d000);
+        assert_every_page_has_its_type(&tables, layout, &types, 0x7eb1_d000);
+    }
+}
+
+#[test]
+fn without_1_gib_pages_the_device_window_below_4_gib_is_uc_2_mib_pages() {
+    let mtrrs = hyper_v_mtrrs();
+    let types = EptTypes {
+        mtrrs: &mtrrs,
+        ram: HYPER_V_RAM,
+    };
+    let layout = MapLayout::new(2 * SIZE_1G, rules(HYPER_V_BITS, false)).unwrap();
+    let (tables, _) = filled_as(layout, &types, HYPER_V_DATA_PAGE);
+    assert_every_page_has_its_type(&tables, layout, &types, HYPER_V_DATA_PAGE);
+    let (_, pdpts, pds, _) = &tables;
+    assert_eq!(pdpts.len(), ENTRIES);
+    assert_eq!(pdpts[4], EptEntry::EMPTY, "nothing past 4 GiB");
+    let lapic_region = (0xFEE0_0000 / SIZE_2M) as usize;
+    assert_eq!(
+        pds[lapic_region],
+        EptEntry::large_page(0xFEE0_0000 & !(SIZE_2M - 1), UC)
+    );
+}
+
+#[test]
+fn region_runs_read_the_pds_then_the_1_gib_pages_above_them() {
+    let mtrrs = hyper_v_mtrrs();
+    let types = EptTypes {
+        mtrrs: &mtrrs,
+        ram: HYPER_V_RAM,
+    };
+    let layout = MapLayout::new(2 * SIZE_1G, rules(HYPER_V_BITS, true)).unwrap();
+    let ((_, mut pdpts, mut pds, mut pts), _) = filled_as(layout, &types, HYPER_V_DATA_PAGE);
+    let ram = HYPER_V_RAM.ranges();
+    let tables = TypeTables {
+        pml4: 0,
+        pdpts: pdpts.as_mut_ptr(),
+        layout,
+        pds: pds.as_mut_ptr(),
+        regions: pds.len(),
+        pts: pts.as_mut_ptr(),
+        pt_count: pts.len() / ENTRIES,
+        pts_address: 0x10_0000,
+        free: core::ptr::null_mut(),
+        free_len: 0,
+        protected_region: (HYPER_V_DATA_PAGE / SIZE_2M) as usize,
+        ram: ram.as_ptr(),
+        ram_len: ram.len(),
+        eptp: Eptp::new(0),
+        invept: InveptType::SingleContext,
+        rules: rules(HYPER_V_BITS, true),
+    };
+    let runs = |start, end| -> Vec<_> {
+        tables
+            .region_runs(start, end)
+            .map(|run| (run.start, run.end, run.mapping))
+            .collect()
+    };
+    // As bring-up prints them on Hyper-V.
+    assert_eq!(
+        runs(0, layout.end()),
+        [
+            (0, SIZE_2M, RegionMapping::Pt),
+            (SIZE_2M, 0x7EA0_0000, RegionMapping::LargePage(WB)),
+            (0x7EA0_0000, 0x7EC0_0000, RegionMapping::Pt),
+            (0x7EC0_0000, 2 * SIZE_1G, RegionMapping::LargePage(WB)),
+            (2 * SIZE_1G, 1 << 46, RegionMapping::HugePage(UC)),
+        ]
+    );
+    // A span inside the PDs reads none of the 1 GiB pages, and one above
+    // them none of the PDs.
+    assert_eq!(
+        runs(SIZE_2M, 2 * SIZE_2M),
+        [(SIZE_2M, 2 * SIZE_2M, RegionMapping::LargePage(WB))]
+    );
+    assert_eq!(
+        runs(4 * SIZE_1G, 5 * SIZE_1G),
+        [(4 * SIZE_1G, 5 * SIZE_1G, RegionMapping::HugePage(UC))]
+    );
+    assert!(runs(1 << 46, u64::MAX).is_empty());
+}
+
+// Walking the map `Ept::build` fills, as the exit handler does after an EPT
+// violation or misconfiguration.
+
+/// The Hyper-V test VM's rules, execute-only pages included.
+const HYPER_V_RULES: EntryRules = EntryRules {
+    physical_address_bits: HYPER_V_BITS,
+    huge_pages: true,
+    execute_only: true,
+};
+
+/// The entry at `address` in `tables`, which [`filled_as`] filled for
+/// `layout`, at the addresses it gave them, with the PML4 at 0; `None`
+/// outside them.
+fn read_filled(tables: &Tables4, layout: MapLayout, address: u64) -> Option<u64> {
+    let (pml4, pdpts, pds, pts) = tables;
+    let index = |base: u64, len: usize| {
+        (base..base + (len * size_of::<u64>()) as u64)
+            .contains(&address)
+            .then(|| ((address - base) / size_of::<u64>() as u64) as usize)
+    };
+    let pds_address = 0x1000 + (layout.pdpts() * PAGE_SIZE) as u64;
+    index(0, pml4.len())
+        .map(|i| pml4[i].raw)
+        .or_else(|| index(0x1000, pdpts.len()).map(|i| pdpts[i].raw))
+        .or_else(|| index(pds_address, pds.len()).map(|i| pds[i].raw))
+        .or_else(|| index(0x10_0000, pts.len()).map(|i| pts[i].raw))
+}
+
+#[test]
+fn the_walk_of_the_hyper_v_map_reaches_ram_devices_and_the_protected_page() {
+    let mtrrs = hyper_v_mtrrs();
+    let types = EptTypes {
+        mtrrs: &mtrrs,
+        ram: HYPER_V_RAM,
+    };
+    let layout = MapLayout::new(2 * SIZE_1G, HYPER_V_RULES).unwrap();
+    let (tables, _) = filled_as(layout, &types, HYPER_V_DATA_PAGE);
+    let walk_to = |gpa| {
+        walk(Eptp::new(0), gpa, HYPER_V_RULES, |address| {
+            read_filled(&tables, layout, address)
+        })
+    };
+    let mapped = |hpa, size, access, memory_type| WalkEnd::Mapped {
+        hpa,
+        size,
+        access,
+        memory_type,
+    };
+    // RAM, a 2 MiB WB page.
+    assert_eq!(walk_to(0x40_0123).end, mapped(0x40_0123, SIZE_2M, EPT_RWX, WB));
+    // The Local APIC's version register: a UC 1 GiB page above the PDs.
+    let lapic = walk_to(0xFEE0_0030);
+    assert_eq!(lapic.end, mapped(0xFEE0_0030, SIZE_1G, EPT_RWX, UC));
+    assert_eq!(lapic.entries().count(), 2);
+    // The protected data page: read-only, through its region's PT.
+    assert_eq!(
+        walk_to(HYPER_V_DATA_PAGE + 4).end,
+        mapped(HYPER_V_DATA_PAGE + 4, PAGE_SIZE as u64, EPT_READ, WB)
+    );
+    // The VGA window below 1 MiB is not RAM: UC.
+    assert_eq!(walk_to(0xA_0000).end, mapped(0xA_0000, PAGE_SIZE as u64, EPT_RWX, UC));
+    // The last byte of the 46-bit space, then the first past it.
+    let last = (1 << 46) - 1;
+    assert_eq!(walk_to(last).end, mapped(last, SIZE_1G, EPT_RWX, UC));
+    assert_eq!(walk_to(1 << 46).end, WalkEnd::NotPresent);
+    for gpa in [0x40_0123, 0xFEE0_0030, HYPER_V_DATA_PAGE, 0xA_0000, last] {
+        assert!(walk_to(gpa).entries().all(|entry| entry.faults.is_empty()), "{gpa:#x}");
+    }
+}
+
+/// Zeroed, page-aligned memory for real tables, freed on drop: what
+/// `allocate_zeroed_pages` gives `Ept::build`, on the host.
+struct Pages {
+    start: core::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl Pages {
+    fn new(count: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(count.max(1) * PAGE_SIZE, PAGE_SIZE).unwrap();
+        // SAFETY: `layout` has a nonzero size.
+        let start = unsafe { std::alloc::alloc_zeroed(layout) };
+        Self {
+            start: core::ptr::NonNull::new(start).expect("host memory"),
+            layout,
+        }
+    }
+
+    fn address(&self) -> u64 {
+        self.start.as_ptr() as u64
+    }
+
+    fn entries<L: Level>(&mut self) -> &mut [EptEntry<L>] {
+        // SAFETY: the allocation is zeroed, page-aligned and this long, and
+        // the slice borrows `self`; an all-zero entry is a valid one.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.start.as_ptr().cast(),
+                self.layout.size() / size_of::<EptEntry<L>>(),
+            )
+        }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout, freed only here.
+        unsafe { std::alloc::dealloc(self.start.as_ptr(), self.layout) }
+    }
+}
+
+#[test]
+fn the_type_tables_walk_reads_only_the_tables_build_allocated() {
+    let mtrrs = test_mtrrs();
+    let types = all_ram_below(&mtrrs, 2 * SIZE_1G);
+    // 40 bits: two PDPTs, so the walk crosses PML4 entries too.
+    let layout = MapLayout::new(2 * SIZE_1G, rules(40, true)).unwrap();
+    let split = split_regions(&types, layout.pd_gibs(), PROTECTED);
+    let (mut pml4, mut pdpts, mut pds, mut pts) = (
+        Pages::new(1),
+        Pages::new(layout.pdpts()),
+        Pages::new(layout.pd_gibs()),
+        Pages::new(split),
+    );
+    let (pml4_address, pdpts_address, pds_address, pts_address) =
+        (pml4.address(), pdpts.address(), pds.address(), pts.address());
+    fill_identity_map(
+        Tables {
+            pml4: pml4.entries(),
+            pdpts: pdpts.entries(),
+            pds: pds.entries(),
+            pts: pts.entries(),
+            pdpts_address,
+            pds_address,
+            pts_address,
+        },
+        layout,
+        &types,
+        PROTECTED,
+    );
+    let ram = types.ram.ranges();
+    let tables = TypeTables {
+        pml4: pml4_address,
+        pdpts: pdpts.entries().as_mut_ptr(),
+        layout,
+        pds: pds.entries().as_mut_ptr(),
+        regions: layout.pd_gibs() * ENTRIES,
+        pts: pts.entries().as_mut_ptr(),
+        pt_count: split,
+        pts_address,
+        free: core::ptr::null_mut(),
+        free_len: 0,
+        protected_region: (PROTECTED / SIZE_2M) as usize,
+        ram: ram.as_ptr(),
+        ram_len: ram.len(),
+        eptp: Eptp::new(pml4_address),
+        invept: InveptType::SingleContext,
+        // The host's heap addresses take up to 47 bits: with fewer, the
+        // walk would rightly call the table pointers' high bits reserved.
+        rules: rules(48, true),
+    };
+    let eptp = Eptp::new(pml4_address);
+    let end_of = |gpa| tables.walk(eptp, gpa).end;
+    // The UC 2 MiB region of `test_mtrrs`, the protected page, and a 1 GiB
+    // page reached through PML4 entry 1.
+    assert!(matches!(
+        end_of(0x4000_0123),
+        WalkEnd::Mapped {
+            hpa: 0x4000_0123,
+            memory_type: UC,
+            ..
+        }
+    ));
+    assert!(matches!(
+        end_of(PROTECTED),
+        WalkEnd::Mapped {
+            access: EPT_READ,
+            memory_type: WB,
+            ..
+        }
+    ));
+    let far = 600 * SIZE_1G + 0x123;
+    assert_eq!(
+        end_of(far),
+        WalkEnd::Mapped {
+            hpa: far,
+            size: SIZE_1G,
+            access: EPT_RWX,
+            memory_type: UC,
+        }
+    );
+    // An EPTP naming no table of ours: nothing is read.
+    let foreign = tables.walk(Eptp::new(0x1234_5000), 0);
+    assert_eq!(foreign.end, WalkEnd::OutsideTables { table: 0x1234_5000 });
+    assert_eq!(foreign.entries().count(), 0);
+    assert!(tables.contains_entry(pml4_address));
+    assert!(tables.contains_entry(pts_address + (split * PAGE_SIZE) as u64 - 8));
+    assert!(!tables.contains_entry(pml4_address + 4), "misaligned");
+    assert!(!tables.contains_entry(0));
+    // A PD entry pointing elsewhere is reported, not followed: reading
+    // 0x1234_5000 on the host would fault.
+    pds.entries::<Pd>()[0] = EptEntry::table(0x1234_5000);
+    assert_eq!(end_of(0x1000), WalkEnd::OutsideTables { table: 0x1234_5000 });
 }

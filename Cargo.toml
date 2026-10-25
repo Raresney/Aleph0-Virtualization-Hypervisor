@@ -21,3 +21,6 @@ trace-exits = []
 # Expect the wrong RAX at main VMCALL #1, so the guest stops there as an
 # unexpected exit: the stop report and teardown of a stop nobody planned.
 unexpected-exit-test = []
+# Make the Local APIC's PDPT entry W without R, so the guest's read of it is
+# an EPT misconfiguration: the stop, and the walk that names the entry.
+ept-misconfig-test = []

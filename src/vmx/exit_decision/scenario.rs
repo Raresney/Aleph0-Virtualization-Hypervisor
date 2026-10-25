@@ -109,7 +109,7 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
 
 /// EPT violation (exit reason 48). Exactly one is handled: the guest's
 /// write to its protected data page, which must come before the first main
-/// VMCALL.
+/// VMCALL. Any other is [`ExitEvent::EptViolation`].
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     let protected_write = exit.protected_page != 0
         && exit.guest_physical & !0xFFF == exit.protected_page
@@ -123,7 +123,7 @@ pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, Ex
             },
         )
     } else {
-        (ExitEvent::Unexpected, state)
+        (ExitEvent::EptViolation, state)
     }
 }
 

@@ -21,8 +21,12 @@
 //! hardware, so it saves each one first and restores it afterwards. Then it
 //! moves its last variable MTRR to [`GUEST_MTRR_BASE`] and back, which
 //! reaches only Aleph0's copy of its MTRRs and the EPT memory types. Then it
-//! runs one `hlt` with IF = 0: only Aleph0 moving RIP past it lets the guest
-//! go on.
+//! reads the Local APIC's version register, device memory above RAM that
+//! EPT maps UC (`vmx::apic`), which must not exit and must hold a version an
+//! integrated APIC has; outside xAPIC mode there is no register page, and it
+//! skips the read. Then it runs one `hlt` with IF = 0, with that register
+//! (or IA32_APIC_BASE's low half) in EAX for the exit's report: only Aleph0
+//! moving RIP past it lets the guest go on.
 //!
 //! Guest RIP is [`GuestMemory::code_base`], guest RSP
 //! [`GuestMemory::stack_top`], and guest IDTR [`GuestMemory::idt`];
@@ -41,6 +45,7 @@ use core::ptr::NonNull;
 
 use uefi::boot::MemoryType;
 
+use super::apic::{APIC_BASE_MODE, APIC_BASE_XAPIC, IA32_APIC_BASE, INTEGRATED_APIC_VERSIONS, LAPIC_VERSION};
 use super::cpuid::ADDRESS_SIZES;
 use super::cr::{self, read_cr4};
 use super::ept::SIZE_2M;
@@ -107,8 +112,8 @@ pub const GUEST_IO_VALUE: u8 = 0xA5;
 pub const GUEST_MTRR_BASE: u64 = SIZE_2M;
 
 /// Value the guest loads into EAX before `ud2` when an emulated instruction
-/// returned the wrong value. The #UD exit (vector 6) stops the guest, and
-/// this marker in RAX on serial says why.
+/// returned the wrong value, or the Local APIC reads as no integrated APIC. The #UD exit (vector 6) stops the guest,
+/// and this marker in RAX on serial says why; its RIP says which check.
 pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 
 /// The exit statistics a finished run of the guest must end with, given the
@@ -250,8 +255,31 @@ guest_code_start:
     mov eax, r11d
     mov edx, r12d
     wrmsr
-    // HLT exits (HLT exiting is on). IF = 0, so no interrupt could ever end
-    // the halt: the guest goes on only because Aleph0 resumes past it.
+    // The Local APIC: in xAPIC mode, which IA32_APIC_BASE (passed through by
+    // the MSR bitmap) says, its registers are a page of MMIO at the base
+    // address (bits MAXPHYADDR-1:12, R10 still masking the first). EPT maps
+    // that page UC, outside RAM, so the read of the version register must
+    // not exit, and must give an integrated APIC's version. In any other
+    // mode there is no page to read: EAX keeps the MSR's low half.
+    mov ecx, {apic_base_msr}
+    rdmsr
+    mov ecx, eax
+    and ecx, {apic_mode_bits}
+    cmp ecx, {xapic_mode}
+    jne guest_local_apic_done
+    shl rdx, 32
+    or rax, rdx
+    and rax, r10
+    and rax, -{page_size}
+    mov eax, dword ptr [rax + {lapic_version}]
+    cmp al, {apic_version_min}
+    jb guest_emulation_failed
+    cmp al, {apic_version_max}
+    ja guest_emulation_failed
+guest_local_apic_done:
+    // HLT exits (HLT exiting is on), with the version register in EAX. IF =
+    // 0, so no interrupt could ever end the halt: the guest goes on only
+    // because Aleph0 resumes past it.
     hlt
     // No NMI handled yet. General-purpose registers are not VMCS fields, so
     // without this EBX would hold whatever the host had at VMLAUNCH.
@@ -301,8 +329,8 @@ guest_nmi_handler:
     // blocking.
     iretq
 guest_emulation_failed:
-    // An emulated instruction returned the wrong value: stop with a marker
-    // in RAX, which the #UD exit prints.
+    // An emulated instruction or the Local APIC gave the wrong value: stop
+    // with a marker in RAX, which the #UD exit prints.
     mov eax, {fail_marker}
     ud2
 guest_code_end:
@@ -324,6 +352,12 @@ guest_code_end:
     two_mib = const SIZE_2M,
     page_size = const PAGE_SIZE,
     physmask_valid = const PHYSMASK_VALID,
+    apic_base_msr = const IA32_APIC_BASE,
+    apic_mode_bits = const APIC_BASE_MODE,
+    xapic_mode = const APIC_BASE_XAPIC,
+    lapic_version = const LAPIC_VERSION,
+    apic_version_min = const *INTEGRATED_APIC_VERSIONS.start(),
+    apic_version_max = const *INTEGRATED_APIC_VERSIONS.end(),
 );
 
 unsafe extern "C" {

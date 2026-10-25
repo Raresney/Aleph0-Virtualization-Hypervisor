@@ -19,7 +19,12 @@
 //!   which get #UD, need no handler of their own.
 //! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
 //!   NMI reinjection), which depend on what came before:
-//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`.
+//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`. Any other EPT
+//!   violation stops the guest as [`ExitEvent::EptViolation`].
+//! - An EPT misconfiguration stops the guest as
+//!   [`ExitEvent::EptMisconfig`]. Aleph0 makes no misconfigured entry on
+//!   purpose (KVM does, for MMIO, and emulates the access in
+//!   `handle_ept_misconfig`), so one means the map is broken.
 //!
 //! An exit reason without a handler stops the guest. Nothing here counts
 //! exits: `vmexit::stats` does, for every guest, from what the handler
@@ -112,7 +117,8 @@ pub const EXIT_REASON_MONITOR: u16 = 39;
 /// allow.
 pub const EXIT_REASON_EPT_VIOLATION: u16 = 48;
 /// Basic exit reason of an EPT misconfiguration: an EPT entry the CPU
-/// cannot use at all (for example W = 1 with R = 0). Never handled.
+/// cannot use at all (for example W = 1 with R = 0). It stops the guest
+/// ([`ExitEvent::EptMisconfig`]).
 pub const EXIT_REASON_EPT_MISCONFIG: u16 = 49;
 
 // Exit qualification bits of an EPT violation (Intel SDM Vol. 3C, "Exit
@@ -405,6 +411,14 @@ pub enum ExitEvent {
     /// the guest should have read from its data page: the seed before its
     /// write, its own value after it.
     DataPageMismatch,
+    /// An EPT violation other than the guest's first write to its
+    /// protected data page. The map allows every other access to every GPA
+    /// up to MAXPHYADDR, so the map itself is wrong: stop, and show the walk
+    /// of the GPA.
+    EptViolation,
+    /// An EPT misconfiguration: an entry on the GPA's path is one the CPU
+    /// refuses. `Ept::build` makes none, so stop, and show the walk.
+    EptMisconfig,
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
     /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
@@ -592,7 +606,11 @@ impl ExitEvent {
             Self::Halted => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
             Self::GuestInvalidOpcode => ExitAction::Resume(ResumePlan::INJECT_UD),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => ExitAction::Unexpected,
+            Self::EptWriteMissing
+            | Self::DataPageMismatch
+            | Self::EptViolation
+            | Self::EptMisconfig
+            | Self::Unexpected => ExitAction::Unexpected,
         }
     }
 }
@@ -619,6 +637,7 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
         EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),
+        EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),
         EXIT_REASON_VMCALL => scenario::vmcall(state, &exit),
         _ => (ExitEvent::Unexpected, state),
     }

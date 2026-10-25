@@ -153,79 +153,97 @@ fn write_to_the_protected_page_is_granted() {
 }
 
 #[test]
-fn write_to_another_page_is_unexpected() {
+fn write_to_another_page_stops_with_the_violation() {
     let elsewhere = ept_violation(PROTECTED_PAGE + 0x1000, PROTECTED_WRITE);
-    assert_eq!(decide(START, elsewhere), (ExitEvent::Unexpected, START));
+    assert_eq!(decide(START, elsewhere), (ExitEvent::EptViolation, START));
 }
 
 #[test]
-fn violation_with_nothing_protected_is_unexpected() {
+fn a_violation_on_a_device_page_stops_with_the_violation() {
+    // The Local APIC's version register: EPT maps it, so a violation there
+    // means the map is wrong.
+    let read = EPT_ACCESS_READ | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
+    assert_eq!(
+        decide(START, ept_violation(0xFEE0_0030, read)),
+        (ExitEvent::EptViolation, START)
+    );
+}
+
+#[test]
+fn violation_with_nothing_protected_stops_with_the_violation() {
     // Before Ept::build the protected page is 0, and GPA 0 must not match.
     let unprotected = ExitInfo {
         protected_page: 0,
         ..ept_violation(0, PROTECTED_WRITE)
     };
-    assert_eq!(decide(START, unprotected), (ExitEvent::Unexpected, START));
+    assert_eq!(decide(START, unprotected), (ExitEvent::EptViolation, START));
 }
 
 #[test]
-fn read_or_fetch_violation_is_unexpected() {
+fn read_or_fetch_violation_stops_with_the_violation() {
     let read = EPT_ACCESS_READ | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
     let fetch = EPT_ACCESS_FETCH | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
     assert_eq!(
         decide(START, ept_violation(PROTECTED_PAGE, read)).0,
-        ExitEvent::Unexpected
+        ExitEvent::EptViolation
     );
     assert_eq!(
         decide(START, ept_violation(PROTECTED_PAGE, fetch)).0,
-        ExitEvent::Unexpected
+        ExitEvent::EptViolation
     );
 }
 
 #[test]
-fn write_to_a_page_already_writable_is_unexpected() {
+fn write_to_a_page_already_writable_stops_with_the_violation() {
     let writable = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_PAGE_WRITABLE);
-    assert_eq!(decide(START, writable).0, ExitEvent::Unexpected);
+    assert_eq!(decide(START, writable).0, ExitEvent::EptViolation);
 }
 
 #[test]
-fn write_to_an_unreadable_page_is_unexpected() {
+fn write_to_an_unreadable_page_stops_with_the_violation() {
     let unreadable = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE & !EPT_PAGE_READABLE);
-    assert_eq!(decide(START, unreadable).0, ExitEvent::Unexpected);
+    assert_eq!(decide(START, unreadable).0, ExitEvent::EptViolation);
 }
 
 #[test]
-fn second_violation_on_the_page_is_unexpected() {
+fn second_violation_on_the_page_stops_with_the_violation() {
     // Write was granted once; another violation means the grant did not
     // take effect.
-    assert_eq!(decide(WRITTEN, protected_write()), (ExitEvent::Unexpected, WRITTEN));
+    assert_eq!(decide(WRITTEN, protected_write()), (ExitEvent::EptViolation, WRITTEN));
 }
 
 #[test]
-fn violation_during_nmi_unblocking_iret_is_unexpected() {
+fn violation_during_nmi_unblocking_iret_stops_with_the_violation() {
     let iret = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET);
-    assert_eq!(decide(START, iret).0, ExitEvent::Unexpected);
+    assert_eq!(decide(START, iret).0, ExitEvent::EptViolation);
 }
 
 #[test]
-fn violation_on_a_guest_page_table_access_is_unexpected() {
+fn violation_on_a_guest_page_table_access_stops_with_the_violation() {
     // Bit 7 without bit 8: the CPU was reading a guest page table.
     let walk = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE & !EPT_TRANSLATED_ACCESS);
-    assert_eq!(decide(START, walk).0, ExitEvent::Unexpected);
+    assert_eq!(decide(START, walk).0, ExitEvent::EptViolation);
     let no_linear = ept_violation(
         PROTECTED_PAGE,
         PROTECTED_WRITE & !(EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS),
     );
-    assert_eq!(decide(START, no_linear).0, ExitEvent::Unexpected);
+    assert_eq!(decide(START, no_linear).0, ExitEvent::EptViolation);
 }
 
 #[test]
-fn ept_misconfiguration_is_unexpected() {
+fn ept_misconfiguration_stops_with_its_own_event() {
     let misconfig = ExitInfo {
         guest_physical: PROTECTED_PAGE,
         ..exit(EXIT_REASON_EPT_MISCONFIG)
     };
-    assert_eq!(decide(START, misconfig), (ExitEvent::Unexpected, START));
+    assert_eq!(decide(START, misconfig), (ExitEvent::EptMisconfig, START));
+}
+
+#[test]
+fn the_ept_stops_stop_the_guest() {
+    for event in [ExitEvent::EptViolation, ExitEvent::EptMisconfig] {
+        assert_eq!(event.action(), ExitAction::Unexpected, "{event:?}");
+    }
 }
 
 #[test]

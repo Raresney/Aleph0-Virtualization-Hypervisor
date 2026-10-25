@@ -21,9 +21,11 @@ Verified on Hyper-V with nested virtualization:
 - [x] Enters VMX root operation and fills in a complete VMCS
 - [x] Runs root operation on its own page tables, GDT, TSS and IDT
 - [x] Launches a minimal guest and resumes it with VMRESUME after each exit
-- [x] EPT identity map with the memory types the MTRRs give to RAM, and UC for
-      MMIO and everything else; a read-only guest page whose write exits to
-      Aleph0, which grants the write and retries it
+- [x] EPT identity map of the whole guest-physical address space, with the
+      memory types the MTRRs give to RAM and UC for MMIO and everything
+      else (1 GiB pages above RAM); a read-only guest page whose write exits
+      to Aleph0, which grants the write and retries it; any other EPT exit
+      stops with a walk of the GPA through the tables
 - [x] Keeps the guest's MTRR writes in a copy, never the CPU's, with the #GP
       of a value the CPU would refuse, and gives EPT the types the copy gives
       (the #GP host-tested only)
@@ -124,7 +126,8 @@ guest an NMI after its first VMCALL, and `-Features` builds with the
 test-only switches in `Cargo.toml`: `host-fault-test` and `host-nmi-test` (see
 [docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8),
 `unexpected-exit-test` and `trace-exits` (see
-[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)). `-ProcessorCount` sets the
+[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)), and `ept-misconfig-test`
+(see [docs/EPT.md](docs/EPT.md) section 6). `-ProcessorCount` sets the
 vCPUs (2 by default, 1 with `-InjectNmi`).
 
 **The Linux target:** `scripts/linux/build.sh` (Linux or WSL) builds the
@@ -153,7 +156,8 @@ diagnostics that run before VMXON.
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | Guest code, data, stack and IDT pages; the page-table walk that checks them |
-| `src/vmx/ept.rs` | EPT: support check, identity map with the guest's data page read-only, write grant and INVEPT, and the memory types that follow the guest's MTRRs, with spare PTs |
+| `src/vmx/ept/` | EPT: support check, the identity map of the whole guest-physical address space (`MapLayout`: PDs for the memory map, UC 1 GiB pages above) with the guest's data page read-only, write grant and INVEPT, and the memory types that follow the guest's MTRRs, with spare PTs (`mod.rs`); the walk of a GPA through the tables and what the CPU refuses in an entry, for the stop on any other EPT exit (`walk.rs`) |
+| `src/vmx/apic.rs` | IA32_APIC_BASE (the Local APIC's register page and mode), and the check that the test guest can read the page through EPT |
 | `src/vmx/mtrr/` | The MTRRs: decoding them and the memory type of each address, which the EPT entries copy (`mod.rs`); the MTRR MSRs a CPU has, the values WRMSR refuses, reading them, and the guest's copy (`registers.rs`) |
 | `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU |

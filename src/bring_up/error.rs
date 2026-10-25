@@ -1,6 +1,7 @@
 //! Why bring-up stopped, and how that gets printed.
 
 use crate::vmx;
+use crate::vmx::apic::LocalApicError;
 use crate::vmx::context_tables::{GdtError, TssError};
 use crate::vmx::ept::EptError;
 use crate::vmx::exit_bitmaps::ExitBitmapsError;
@@ -32,6 +33,10 @@ pub enum BringUpError {
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
     /// failed. Both happen before VMXON.
     Ept(EptError),
+    /// The test guest could not read the Local APIC's registers in xAPIC
+    /// mode: its page tables or EPT do not map their page to itself, EPT
+    /// with UC. Before VMXON.
+    LocalApic(LocalApicError),
     /// Building the page tables, GDT, TSS or IDT that VMX root operation
     /// runs on failed. Before VMXON.
     Host(HostError),
@@ -82,6 +87,12 @@ pub enum BringUpError {
     /// before teardown; otherwise that earlier error is returned and this
     /// one was printed when it happened.
     Teardown(TeardownError),
+}
+
+impl From<LocalApicError> for BringUpError {
+    fn from(error: LocalApicError) -> Self {
+        Self::LocalApic(error)
+    }
 }
 
 impl From<TssError> for BringUpError {
@@ -195,11 +206,16 @@ pub fn report_error(error: BringUpError) {
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
         BringUpError::Mtrr(error) => log!("MTRR setup failed: {error}."),
-        BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(
-            "EPT setup failed: the memory map reaches {end:#x}, past the {:#x} one PDPT maps.",
-            vmx::ept::MAX_IDENTITY_MAP,
+        BringUpError::Ept(EptError::RangeTooLarge { end, limit }) => log!(
+            "EPT setup failed: the memory map reaches {end:#x}, past {limit:#x}, the end of the guest-physical address space (MAXPHYADDR, at most the 48 bits a 4-level EPT walk translates)."
         ),
         BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
+        BringUpError::LocalApic(LocalApicError::GuestMapping { address, translation }) => log!(
+            "The page tables the guest shares do not map the Local APIC's registers at {address:#x} to themselves: {translation:?}."
+        ),
+        BringUpError::LocalApic(LocalApicError::EptMapping { address, end }) => {
+            log!("EPT does not map the Local APIC's registers at {address:#x} to themselves, UC: {end}.")
+        }
         BringUpError::Host(error) => log!("Host environment setup failed: {error:?}"),
         BringUpError::VmxOn(error) => log!("VMXON failed: {error:?}"),
         BringUpError::Vmcs {

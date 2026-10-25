@@ -101,7 +101,7 @@ working after `ExitBootServices`. In code reachable from it:
 ## Tests
 
 Unit tests live in `tests/unit/`, which mirrors `src/`: the tests for
-`src/vmx/ept.rs` are in `tests/unit/vmx/ept.rs`. Each source file includes its
+`src/vmx/paging.rs` are in `tests/unit/vmx/paging.rs`. Each source file includes its
 tests with
 
 ```rust

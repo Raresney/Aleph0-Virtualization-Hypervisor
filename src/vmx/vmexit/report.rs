@@ -8,7 +8,7 @@ use super::guest_mtrrs::{self, MtrrWrite};
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
 use super::policy::{COUNTERS, Detail, Histogram};
 use super::{RegisterFrame, dump, history, read_field, stats};
-use crate::vmx::ept::{InveptType, Retyped};
+use crate::vmx::ept::{Eptp, InveptType, Retyped};
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_WRMSR, EptQualification, ExitEvent, ExitInfo,
     ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax, wrmsr_value,
@@ -17,7 +17,7 @@ use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::mtrr::{self, FIXED_END, MtrrMsr, Mtrrs};
 use crate::vmx::page::PAGE_SIZE;
 use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmcs::fields::GUEST_LINEAR_ADDRESS;
+use crate::vmx::vmcs::fields::{EPT_POINTER, GUEST_LINEAR_ADDRESS};
 
 /// One exit, as its report needs it.
 pub(super) struct ExitReport<'a> {
@@ -187,6 +187,40 @@ fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification, gue
     }
 }
 
+/// Prints the walk of `gpa` through the EPT tables EPT_POINTER names: each
+/// entry on its path, what the CPU refuses in it, and how the walk ended
+/// (`ept::walk`), as KVM prints the hierarchy of an EPT entry with reserved
+/// bits set. The walk reads only Aleph0's own table pages.
+fn report_ept_walk(number: u64, gpa: u64) {
+    let tag = crate::TAG;
+    let eptp = match read_field(EPT_POINTER) {
+        Ok(raw) => Eptp::from_raw(raw),
+        Err(error) => {
+            crate::serial_println!("{tag} VM exit #{number}: EPT_POINTER unreadable ({error:?}); no EPT walk.");
+            return;
+        }
+    };
+    let Some(walk) = guest_mtrrs::inspect(|_, tables| tables.walk(eptp, gpa)) else {
+        crate::serial_println!("{tag} VM exit #{number}: the EPT tables are not available; no EPT walk.");
+        return;
+    };
+    crate::serial_println!(
+        "{tag} VM exit #{number}: EPT walk of GPA {gpa:#018x} from EPTP {:#x}:",
+        eptp.raw()
+    );
+    for entry in walk.entries() {
+        crate::serial_println!(
+            "{tag} VM exit #{number}:   {} entry {:#x} at {:#x} = {:#018x}: {}",
+            entry.level.name(),
+            entry.index,
+            entry.address,
+            entry.raw,
+            entry.faults,
+        );
+    }
+    crate::serial_println!("{tag} VM exit #{number}:   {}.", walk.end);
+}
+
 /// Prints that an NMI arrived while Aleph0 ran in root operation, and is
 /// now pending for the guest. Not "resuming the guest": that text arms
 /// `run-hyperv.ps1 -InjectNmi`.
@@ -240,6 +274,15 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::EptWriteMissing => crate::serial_println!(
             "{tag} VM exit #{number}: main VMCALL (rax={rax:#x}) before any EPT violation: the guest's write to its data page was not caught, so EPT did not protect it."
         ),
+        ExitEvent::EptViolation => {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: an EPT violation Aleph0 does not handle: only the guest's first write to its protected data page is one; the map is wrong for this GPA."
+            );
+            report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical));
+        }
+        // The read's line already says an entry is invalid; the walk says
+        // which.
+        ExitEvent::EptMisconfig => report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical)),
         ExitEvent::MainVmcall => crate::serial_println!(
             "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); resuming the guest at rip={rip:#018x}."
         ),

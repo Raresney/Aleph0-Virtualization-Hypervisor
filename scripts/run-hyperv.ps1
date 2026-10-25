@@ -36,8 +36,9 @@
     switches in Cargo.toml: host-fault-test (the exit handler faults on
     purpose), host-nmi-test (with -InjectNmi, the NMI arrives while Aleph0
     runs in VMX root operation), unexpected-exit-test (the guest stops at
-    main VMCALL #1 as an unexpected exit), or trace-exits (every VM exit
-    printed in full).
+    main VMCALL #1 as an unexpected exit), ept-misconfig-test (the guest's
+    Local APIC read is an EPT misconfiguration, which stops it with a walk
+    of the tables), or trace-exits (every VM exit printed in full).
 
 .PARAMETER ProcessorCount
     vCPUs to give the VM: 2 by default, 1 with -InjectNmi, which refuses any
