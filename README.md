@@ -124,7 +124,14 @@ guest an NMI after its first VMCALL, and `-Features` builds with the
 test-only switches in `Cargo.toml`: `host-fault-test` and `host-nmi-test` (see
 [docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8),
 `unexpected-exit-test` and `trace-exits` (see
-[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)).
+[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)). `-ProcessorCount` sets the
+vCPUs (2 by default, 1 with `-InjectNmi`).
+
+**The Linux target:** `scripts/linux/build.sh` (Linux or WSL) builds the
+kernel that is to boot as Aleph0's guest, as one EFI file in `run\linux\`.
+`-Kernel run\linux\linux.efi` puts it on the ESP next to Aleph0, and
+`-WithoutAleph0` boots it in Aleph0's place, streaming its console (COM1). See
+[docs/LINUX_GUEST.md](docs/LINUX_GUEST.md).
 
 **QEMU + OVMF (no VMX):** put `OVMF_CODE.fd` and `OVMF_VARS.fd` from
 [rust-osdev/ovmf-prebuilt](https://github.com/rust-osdev/ovmf-prebuilt) in
@@ -156,6 +163,7 @@ diagnostics that run before VMXON.
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
+| `scripts/linux/` | The Linux target's build (`build.sh`, bash for Linux or WSL), its kernel configuration fragment (`aleph0.config`) and its initramfs's `/init` (see [docs/LINUX_GUEST.md](docs/LINUX_GUEST.md)) |
 | `docs/` | Background explanations (see [Documentation](#documentation)) |
 
 ## Documentation
@@ -172,6 +180,7 @@ references it relies on:
 - [EMULATED_EXITS.md](docs/EMULATED_EXITS.md): CPUID, MSR and port-I/O exits, the bitmaps, passthrough emulation
 - [NMI.md](docs/NMI.md): catching NMIs in the guest and reinjecting them
 - [CLEAN_STOP.md](docs/CLEAN_STOP.md): stopping the guest, leaving VMX and returning to firmware
+- [LINUX_GUEST.md](docs/LINUX_GUEST.md): the Linux target, how it is built and staged, and its boot without Aleph0
 
 ## Contributing
 

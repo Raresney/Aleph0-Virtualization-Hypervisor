@@ -1,0 +1,3 @@
+# Run by bash or the Linux kernel, which a CRLF line ending breaks
+# (`#!/bin/busybox sh\r`), on any checkout, core.autocrlf included.
+/scripts/linux/** text eol=lf
