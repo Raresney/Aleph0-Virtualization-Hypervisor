@@ -1209,6 +1209,26 @@ impl TypeTables {
         })
     }
 
+    /// Test only (`ept-misconfig-test`): clears R in the PDPT entry of the
+    /// GiB holding `gpa`, leaving W without R, an entry the CPU refuses, so
+    /// any access to that GiB is an EPT misconfiguration.
+    ///
+    /// # Safety
+    ///
+    /// Before VMLAUNCH: no INVEPT follows, so the CPU must never have walked
+    /// the tables.
+    #[cfg(feature = "ept-misconfig-test")]
+    pub unsafe fn misconfigure(&self, gpa: u64) {
+        let gib = (gpa / SIZE_1G) as usize;
+        assert!(gib < self.layout.gibs, "GPA {gpa:#x} is outside the map");
+        // SAFETY: entry `gib` of the PDPTs `build` filled, `layout.gibs` of
+        // them, never freed; the caller guarantees the CPU is not using them.
+        unsafe {
+            let entry = self.pdpts.add(gib);
+            entry.write_volatile(EptEntry::from_raw(entry.read_volatile().raw & !EPT_READ));
+        }
+    }
+
     /// Whether `address` is an 8-byte aligned entry inside one of the
     /// table pages `build` allocated: the PML4, the PDPTs, the PDs or the
     /// PTs, spare ones included.

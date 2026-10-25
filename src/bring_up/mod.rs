@@ -255,7 +255,19 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         )
     }?;
     report::ept(&ept, &types, guest.data_page());
-    check_local_apic(&ept, &types, ept_support)?;
+    let _local_apic = check_local_apic(&ept, &types, ept_support)?;
+    // Test only: the guest's read of the Local APIC then meets a PDPT entry
+    // the CPU refuses, so the run shows the EPT misconfiguration stop and
+    // its walk on real VMX.
+    #[cfg(feature = "ept-misconfig-test")]
+    if let Some(registers) = _local_apic {
+        // SAFETY: before VMLAUNCH: the CPU has never walked the tables.
+        unsafe { types.misconfigure(registers) };
+        log!(
+            "ept-misconfig-test: the PDPT entry of GiB {:#x} is now W without R.",
+            registers >> 30
+        );
+    }
 
     let bitmaps = ExitBitmaps::allocate()?;
     report::exit_bitmaps(&bitmaps, capabilities);
@@ -334,18 +346,18 @@ fn activate_context_tables() -> Result<ContextTables, BringUpError> {
     })
 }
 
-/// Checks that the test guest can read the Local APIC's version register.
-/// In xAPIC mode both the page tables the guest shares and EPT must map the
-/// register page, device memory above the UEFI memory map, to itself, EPT
-/// with UC. In any other mode there is no register page, and the guest skips
-/// its read.
-fn check_local_apic(ept: &Ept, types: &TypeTables, support: EptSupport) -> Result<(), BringUpError> {
+/// Checks that the test guest can read the Local APIC's version register,
+/// and returns where it reads it. In xAPIC mode both the page tables the
+/// guest shares and EPT must map the register page, device memory above the
+/// UEFI memory map, to itself, EPT with UC. In any other mode there is no
+/// register page: the guest skips its read, and this returns `None`.
+fn check_local_apic(ept: &Ept, types: &TypeTables, support: EptSupport) -> Result<Option<u64>, BringUpError> {
     // SAFETY: IA32_APIC_BASE exists on every CPU with a Local APIC, which
     // every x86-64 CPU has, and reading it has no side effects.
     let apic_base = ApicBase(unsafe { vmx::msr::rdmsr(IA32_APIC_BASE) });
     if apic_base.mode() != LapicMode::Xapic {
         report::local_apic_skipped(apic_base);
-        return Ok(());
+        return Ok(None);
     }
     let registers = apic_base.address(support.rules.physical_address_bits);
     // SAFETY: boot services are still active, so the firmware's tables are
@@ -354,7 +366,7 @@ fn check_local_apic(ept: &Ept, types: &TypeTables, support: EptSupport) -> Resul
     let walk = types.walk(ept.eptp(), registers);
     report::local_apic(apic_base, registers, walk.end);
     apic::check_registers(registers, translation, walk.end)?;
-    Ok(())
+    Ok(Some(registers))
 }
 
 /// Detects VMX, reads the capability MSRs the VMCS controls are chosen from,
