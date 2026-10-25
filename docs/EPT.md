@@ -11,7 +11,7 @@ How Aleph0 turns on Extended Page Tables (EPT), and what that changes:
 - what the identity map does *not* hide, and what is not covered yet.
 
 Code:
-- `src/vmx/ept.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
+- `src/vmx/ept/mod.rs`: support check, entry encodings, identity map, `ProtectedPage::grant_write`, INVEPT;
 - `src/vmx/mtrr/mod.rs`: the memory type of each address, from the MTRRs (see [MTRR.md](MTRR.md));
 - `src/vmx/guest.rs`: the data page and the guest code that writes it;
 - `src/vmx/exit_decision/`: which EPT violation is accepted (`scenario.rs`, reached from `decide` in `mod.rs`);

@@ -19,7 +19,7 @@ Code:
   reading them (`read`), and the guest's copy (`MtrrState`);
 - `src/vmx/cpuid.rs`: `has_mtrr`, the CPUID check before any MTRR MSR is
   read, and `physical_address_bits` (MAXPHYADDR);
-- `src/vmx/ept.rs`: `large_page_type`, `split_regions` and
+- `src/vmx/ept/mod.rs`: `large_page_type`, `split_regions` and
   `fill_identity_map`, which put the types into the identity map;
   `spare_pts`, `retype` and `TypeTables`, which change them when the guest
   writes its MTRRs;

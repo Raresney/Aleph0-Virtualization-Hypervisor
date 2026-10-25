@@ -1526,5 +1526,5 @@ unsafe fn invalidate(kind: InveptType, eptp: Eptp) -> Result<(), VmxFail> {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/ept.rs"]
+#[path = "../../../tests/unit/vmx/ept.rs"]
 mod tests;
