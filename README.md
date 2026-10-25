@@ -21,9 +21,11 @@ Verified on Hyper-V with nested virtualization:
 - [x] Enters VMX root operation and fills in a complete VMCS
 - [x] Runs root operation on its own page tables, GDT, TSS and IDT
 - [x] Launches a minimal guest and resumes it with VMRESUME after each exit
-- [x] EPT identity map with the memory types the MTRRs give to RAM, and UC for
-      MMIO and everything else; a read-only guest page whose write exits to
-      Aleph0, which grants the write and retries it
+- [x] EPT identity map of the whole guest-physical address space, with the
+      memory types the MTRRs give to RAM and UC for MMIO and everything
+      else (1 GiB pages above RAM); a read-only guest page whose write exits
+      to Aleph0, which grants the write and retries it; any other EPT exit
+      stops with a walk of the GPA (that stop host-tested only)
 - [x] Keeps the guest's MTRR writes in a copy, never the CPU's, with the #GP
       of a value the CPU would refuse, and gives EPT the types the copy gives
       (the #GP host-tested only)

@@ -501,6 +501,35 @@ than before because of the new instructions). The CPU delivered it through
 the guest IDT at `0x7eafe000` and ran the handler on the guest stack
 `0x7eaff000`, both reached through EPT.
 
+### The whole address space (#20)
+
+```text
+EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT single-context; 1 GiB pages=true; MAXPHYADDR 46 bits.
+EPT built: identity 0x0..0x400000000000 (65536 GiB), 142 table pages: 128 PDPT(s); 2 PD(s), for 0x0..0x80000000, with 2 PTs for 2 MiB regions mapped in 4 KiB pages and 9 spare PTs for the guest's MTRR writes; 65534 GiB above as 1 GiB pages; data page 0x000000007eaa7000 read-only (R=1 W=0 X=0).
+EPT 0x000000000000..0x000000200000: 4 KiB pages (a PT each)
+EPT 0x000000200000..0x00007ea00000: 2 MiB pages, WB
+EPT 0x00007ea00000..0x00007ec00000: 4 KiB pages (a PT each)
+EPT 0x00007ec00000..0x000080000000: 2 MiB pages, WB
+EPT 0x000080000000..0x400000000000: 1 GiB pages, UC
+Local APIC: IA32_APIC_BASE=0xfee00900 (xAPIC, BSP); its registers at 0xfee00000 are mapped to HPA 0xfee00000 by a 1 GiB page, UC, R=1 W=1 X=1; the test guest reads the version register at 0xfee00030.
+Host page tables: identity 0x0..0x80000000 (2 GiB), 1 GiB pages, 2 table pages; HOST_CR3=0x7ea10000 (firmware CR3=0x4401000).
+...
+VM exit #21: reason=12 (HLT)
+VM exit #21: guest rax=0x0000000000050014 rbx=0x0000000000000000 rcx=0x0000000000000800 rdx=0x0000000000000000
+```
+
+- The 142 table pages are the PML4, 128 PDPTs, 2 PDs and 11 PTs: the
+  first 2 MiB's, the data page region's and the 9 spare ones.
+- Host CR3 still maps only the memory map's 2 GiB.
+- RAX at the HLT is the version register: version `0x14` (bits 7:0), and
+  bits 23:16 = 5, so 6 LVT entries. RCX is `0x800`, the xAPIC mode bits
+  the guest checked. Nested Hyper-V let the guest read the VM's own Local
+  APIC through Aleph0's EPT, and the read added no exit: the run ended
+  after 24 exits with `SUCCESS`, and the `-InjectNmi` run after 26, the
+  same as before #20.
+- No `EptViolation` or `EptMisconfig` stop came; their walk is
+  host-tested only.
+
 ## 9. What the identity map does not hide
 
 Identity means the guest sees **all** physical memory up to the map's end,
