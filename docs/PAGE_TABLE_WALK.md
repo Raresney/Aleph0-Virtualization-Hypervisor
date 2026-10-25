@@ -509,8 +509,9 @@ page, then `check_permissions` requires that:
 | stack | not a user page while CR4.SMAP = 1 | `StackBlockedBySmap` |
 
 The guest runs at ring 0 with the host's CR4 and RFLAGS.AC = 0, so SMEP and
-SMAP apply to it. The guest code page is allocated as `LOADER_CODE` because
-firmware with memory protection often maps `LOADER_DATA` no-execute.
+SMAP apply to it. The guest code page is allocated as a code type
+(`LOADER_CODE` then, `RUNTIME_SERVICES_CODE` since #23) because firmware with
+memory protection often maps the data types no-execute.
 
 On Hyper-V both pages came back **identity-mapped, 4 KiB, writable, XD
 clear**, with host **EFER.NXE = 1**. That last value matters for guest

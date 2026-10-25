@@ -40,7 +40,7 @@ hangs off that one value:
 | guest state (`GuestEntry`) | `At`: its code page, stack top, RFLAGS `0x2`, its IDT | `InPlace`: written at VMLAUNCH, the firmware's IDT |
 | launch | `vmcs::launch`, returns at the stop | `vmcs::launch_in_place`, returns as the guest |
 | exception bitmap | all ones | 0 |
-| VMCALL | the script (`scenario::vmcall`) | stops: a Hyper-V hypercall (#27) |
+| VMCALL | the script (`scenario::vmcall`) | Aleph0's own (`vmx::vmcall`, [RESIDENT.md](RESIDENT.md)) resume; any other stops: a Hyper-V hypercall (#27) |
 | EPT violation | the protected-page write, once | stops, with the walk of the GPA |
 | a stop | returns to bring-up, teardown, `SUCCESS` or `ABORTED` | halts after the report |
 
@@ -181,8 +181,11 @@ and `SUCCESS`, and 26 with `-InjectNmi`.
   CR4.VMXE today (#24); re-delivering interrupted events and the interrupt
   policy for an OS (#26).
 - The firmware guest still gets the test guest's pages, because `Ept::build`
-  protects their data page. Nothing in the firmware touches it.
-- Staying resident after `ExitBootServices` (#23).
+  protects their data page. Nothing in the firmware touches it, and since
+  #23 they are resident, so no OS reuses them either.
+- Staying resident after `ExitBootServices` (#23) is implemented
+  ([RESIDENT.md](RESIDENT.md)); its harness run stops where the firmware
+  does, at `0x40000020`.
 
 ## Cheat sheet
 

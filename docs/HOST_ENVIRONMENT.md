@@ -35,8 +35,8 @@ Only VM exits load them. Bring-up and the test guest keep running on the
 firmware's page tables and IDT and on the GDT copy (`context_tables.rs`), and
 teardown switches back to the firmware's (section 7).
 
-The pages still come from `page.rs` (`LOADER_DATA`). Moving them to memory
-the OS keeps is the next step (#23).
+The pages come from `page.rs` as `RUNTIME_SERVICES_DATA`, which the OS keeps
+after `ExitBootServices` (#23, [RESIDENT.md](RESIDENT.md)).
 
 ## 2. The page tables
 
