@@ -3,6 +3,8 @@
 //!
 //! Nothing here changes CPU state or can fail.
 
+use uefi::boot::MemoryType;
+
 use super::PassthroughState;
 use crate::vmx;
 use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
@@ -13,6 +15,7 @@ use crate::vmx::guest_state::{GuestEntry, GuestState};
 use crate::vmx::host::{HostEnvironment, InterruptStack};
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
+use crate::vmx::page::Allocation;
 
 /// Prints the segmentation state of the context tables, which the guest
 /// state copies and the host GDT keeps the selectors of.
@@ -186,6 +189,16 @@ pub(super) fn host_environment(host: &HostEnvironment, firmware_cr3: u64) {
     for stack in InterruptStack::ALL {
         let (name, ist, top) = (stack.name(), stack.ist(), host.interrupt_stack_top(stack));
         log!("Host interrupt stack: {name} IST{ist} top={top:#018x}.");
+    }
+}
+
+/// Prints one resident allocation with the type the memory map gives it
+/// (`None`: no region holds it).
+pub(super) fn resident_allocation(allocation: Allocation, memory_type: Option<MemoryType>) {
+    let Allocation { address, pages } = allocation;
+    match memory_type {
+        Some(memory_type) => log!("Resident allocation at {address:#018x}: {pages} page(s), {memory_type:?}."),
+        None => log!("Resident allocation at {address:#018x}: {pages} page(s), in no memory-map region."),
     }
 }
 

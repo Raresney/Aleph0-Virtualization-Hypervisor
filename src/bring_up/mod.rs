@@ -19,9 +19,12 @@
 //!    ([`HostEnvironment`]): page tables mapping the same range, a GDT, a
 //!    TSS with interrupt stacks, an IDT.
 //! 4. Enter VMX root operation and create the VMCS.
-//! 5. Fill in the VMCS: controls, EPT pointer, exit bitmaps, host state,
-//!    guest state ([`prepare_vmcs`]). Then check that none of this disturbed
-//!    the host's descriptor tables, and stop if it did.
+//! 5. Check in the UEFI memory map that every resident allocation, the
+//!    image copy included, lies in memory the OS keeps after
+//!    `ExitBootServices` ([`check_resident_memory`]). Fill in the VMCS:
+//!    controls, EPT pointer, exit bitmaps, host state, guest state
+//!    ([`prepare_vmcs`]). Then check that none of this disturbed the host's
+//!    descriptor tables, and stop if it did.
 //! 6. Launch the guest with VMLAUNCH: the one `GuestKind::SELECTED` names.
 //!    - The test guest ([`run_test_guest`]): `vmx::vmcs::launch` returns
 //!      once the guest has stopped: after its last planned exit, or at an
@@ -29,11 +32,12 @@
 //!      The host state the guest reaches through passthrough emulation
 //!      ([`PassthroughState`]) is read before and after, and printed, and
 //!      so are the CPU's MTRRs, which the guest must never reach.
-//!    - The firmware ([`virtualize_firmware`]): `vmx::vmcs::launch_in_place`
-//!      returns in VMX non-root operation, as the guest. `run` then returns
-//!      to `main`, and `main` to the firmware, which keeps running
-//!      virtualized. Step 7 does not run; a stop of the firmware halts in
-//!      the exit handler.
+//!    - The firmware ([`virtualize_firmware`]): the `ExitBootServices`
+//!      event is created first (`resident::watch_exit_boot_services`), then
+//!      `vmx::vmcs::launch_in_place` returns in VMX non-root operation, as
+//!      the guest. `run` then returns to `main`, and `main` to the firmware,
+//!      which keeps running virtualized. Step 7 does not run; a stop of the
+//!      firmware halts in the exit handler.
 //! 7. Leave VMX operation and restore the firmware's state
 //!    ([`teardown::teardown`]). Runs whatever happened after VMXON
 //!    succeeded (creating the VMCS, steps 5 and 6), except a firmware that
@@ -55,6 +59,10 @@ mod teardown;
 
 pub use error::{BringUpError, report_error};
 
+use uefi::boot::{self, MemoryType};
+use uefi::mem::memory_map::MemoryMap;
+
+use crate::resident::{self, memory};
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
 use crate::vmx::apic::{self, ApicBase, IA32_APIC_BASE, LapicMode};
@@ -66,6 +74,7 @@ use crate::vmx::guest_state::{GuestEntry, GuestState};
 use crate::vmx::host::{FirmwareSelectors, HostEnvironment};
 use crate::vmx::msr::{IA32_KERNEL_GS_BASE, VmcsControlMsrs};
 use crate::vmx::mtrr::{MtrrError, MtrrRegisters, MtrrState};
+use crate::vmx::page;
 use crate::vmx::segment::DescriptorTable;
 use crate::vmx::vmcs::{DesiredControls, GuestKind, GuestStop, VmcsRegion};
 use crate::vmx::vmexit::{VM_EXIT_STACK_SIZE, VmExitStack};
@@ -159,7 +168,9 @@ const _: () = assert!(
 /// Every region allocated here (TSS, GDT, VM-exit stack, guest pages, EPT
 /// tables, host environment, exit bitmaps, VMXON region, VMCS) stays allocated, even after this
 /// returns. None of these types implement `Drop`, so their pages are never
-/// returned to UEFI. TR keeps pointing at the TSS (see `teardown`).
+/// returned to UEFI. TR keeps pointing at the TSS (see `teardown`). All of
+/// them are resident (`vmx::page`), so after a return to the firmware the
+/// OS loses them too.
 pub fn run() -> Result<GuestRun, BringUpError> {
     let context_tables = activate_context_tables()?;
 
@@ -241,8 +252,9 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     );
 
     // shortcut: the firmware guest gets the test guest's pages too, since
-    // `Ept::build` protects their data page; drop them once EPT protects a
-    // list of pages (hiding Aleph0's pages, ROADMAP section 5).
+    // `Ept::build` protects their data page, and they are resident so that no
+    // OS writes it; drop them once EPT protects a list of pages (hiding
+    // Aleph0's pages, ROADMAP section 5).
     let guest = GuestMemory::allocate()?;
     log!(
         "Guest memory allocated: code={:#018x} ({} bytes copied) stack top={:#018x}.",
@@ -416,10 +428,10 @@ fn check_vmx_support() -> Result<(VmcsControlMsrs, EptSupport), BringUpError> {
     Ok((controls, support))
 }
 
-/// Prepares the current VMCS for the guest `GuestKind::SELECTED` names,
-/// checks the host tables, and launches the guest. Returns once the test
-/// guest has stopped, or in VMX non-root operation once the firmware runs as
-/// the guest.
+/// Checks the resident memory, prepares the current VMCS for the guest
+/// `GuestKind::SELECTED` names, checks the host tables, and launches the
+/// guest. Returns once the test guest has stopped, or in VMX non-root
+/// operation once the firmware runs as the guest.
 fn launch_guest(
     controls: &VmcsControlMsrs,
     vmexit_stack: &VmExitStack,
@@ -440,6 +452,7 @@ fn launch_guest(
             idtr: context_tables.idtr,
         },
     };
+    check_resident_memory()?;
     prepare_vmcs(controls, vmexit_stack, ept, host, bitmaps, kind, entry)?;
     check_context_tables_preserved(context_tables)?;
 
@@ -449,10 +462,51 @@ fn launch_guest(
     }
 }
 
-/// Launches the firmware in place: from VMLAUNCH on, this code is the
-/// guest. Returns [`GuestRun::Virtualized`] in VMX non-root operation, or the
-/// launch's failure in root operation.
+/// Checks, in the UEFI memory map, that every resident allocation
+/// (`vmx::page`) lies in memory the OS keeps after `ExitBootServices`, and
+/// prints each one's type. A `LOADER_*` or `BOOT_SERVICES_*` page here would
+/// be reused by the OS while Aleph0 still needs it.
+fn check_resident_memory() -> Result<(), BringUpError> {
+    let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| BringUpError::ResidentMemoryMapUnavailable)?;
+    let mut pages = 0;
+    for allocation in page::resident_allocations() {
+        let regions = map
+            .entries()
+            .map(|region| (region.phys_start, region.page_count, region.ty));
+        let memory_type = resident::memory_type_at(regions, allocation.address);
+        report::resident_allocation(allocation, memory_type);
+        if memory_type.is_none_or(memory::is_reclaimable) {
+            return Err(BringUpError::NotResident {
+                address: allocation.address,
+                memory_type,
+            });
+        }
+        pages += allocation.pages;
+    }
+    // The image copy is always listed: an empty list means listing broke,
+    // and the loop above checked nothing.
+    if pages == 0 {
+        return Err(BringUpError::NoResidentAllocations);
+    }
+    match page::unlisted_resident_allocations() {
+        0 => {
+            log!("Resident memory checked: {pages} pages, all kept by the OS after ExitBootServices.");
+            Ok(())
+        }
+        unlisted => Err(BringUpError::ResidentAllocationsUnlisted(unlisted)),
+    }
+}
+
+/// Creates the `ExitBootServices` event, then launches the firmware in
+/// place: from VMLAUNCH on, this code is the guest. Returns
+/// [`GuestRun::Virtualized`] in VMX non-root operation, or the launch's
+/// failure in root operation, with the event closed again.
 fn virtualize_firmware() -> Result<GuestRun, BringUpError> {
+    // Before VMLAUNCH: once the firmware is the guest, every firmware call
+    // can exit, and one Aleph0 does not handle stops it.
+    let event =
+        resident::watch_exit_boot_services().map_err(|error| BringUpError::ExitBootServicesEvent(error.status()))?;
+    log!("ExitBootServices event created: its VMCALL will tell Aleph0 when boot services end.");
     log!("Launching the firmware in place with VMLAUNCH; its VM exits are reported on serial only.");
     // SAFETY: `prepare_vmcs` wrote the controls, the host state
     // (HOST_RSP/HOST_RIP at the live exit stack and handler) and the guest
@@ -461,7 +515,14 @@ fn virtualize_firmware() -> Result<GuestRun, BringUpError> {
     // handler halts at a stop of the firmware (`GuestKind::Firmware`).
     match unsafe { vmx::vmcs::launch_in_place() } {
         Ok(()) => Ok(GuestRun::Virtualized),
-        Err(stop) => guest_result(stop),
+        Err(stop) => {
+            // Outside VMX operation its VMCALL would raise #UD inside
+            // ExitBootServices.
+            if let Err(error) = boot::close_event(event) {
+                log!("ExitBootServices event not closed: {:?}.", error.status());
+            }
+            guest_result(stop)
+        }
     }
 }
 

@@ -99,3 +99,24 @@ fn guest_mtrr_failures_say_what_went_wrong() {
         "EPT took the guest's MTRR types, but INVEPT failed (Invalid)"
     );
 }
+
+#[test]
+fn the_guest_resumes_in_the_phase_the_exit_found() {
+    for found in [Phase::BootServices, Phase::Runtime] {
+        assert_eq!(resume_phase(ExitEvent::Halted, found), found);
+        assert_eq!(resume_phase(ExitEvent::TestVmcall, found), found);
+    }
+}
+
+#[test]
+fn the_exit_boot_services_vmcall_starts_the_runtime_phase_for_good() {
+    assert_eq!(
+        resume_phase(ExitEvent::BootServicesEnded, Phase::BootServices),
+        Phase::Runtime
+    );
+    // A second one, faked by the guest, changes nothing.
+    assert_eq!(
+        resume_phase(ExitEvent::BootServicesEnded, Phase::Runtime),
+        Phase::Runtime
+    );
+}

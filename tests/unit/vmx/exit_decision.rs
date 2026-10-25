@@ -1112,6 +1112,45 @@ fn the_firmware_stops_at_its_vmcalls_and_ept_violations() {
 }
 
 #[test]
+fn the_firmware_resumes_past_aleph0s_own_vmcalls() {
+    for (rax, event) in [
+        (vmcall::BOOT_SERVICES_ENDED, ExitEvent::BootServicesEnded),
+        (vmcall::TEST, ExitEvent::TestVmcall),
+    ] {
+        assert_eq!(decide(GuestKind::Firmware, START, vmcall(rax)), (event, START));
+        assert_eq!(event.action(), ExitAction::Resume(ResumePlan::PAST_INSTRUCTION));
+    }
+}
+
+#[test]
+fn aleph0s_vmcalls_are_told_apart_by_all_of_rax() {
+    // One bit off, or only the low half: a Hyper-V hypercall, whose RAX is
+    // whatever the caller left there.
+    for rax in [
+        vmcall::BOOT_SERVICES_ENDED ^ 1,
+        vmcall::BOOT_SERVICES_ENDED & 0xFFFF_FFFF,
+        vmcall::TEST ^ (1 << 63),
+    ] {
+        assert_eq!(firmware(START, vmcall(rax)), ExitAction::Unexpected, "rax={rax:#x}");
+    }
+    assert_ne!(vmcall::BOOT_SERVICES_ENDED, vmcall::TEST);
+    assert_eq!(vmcall::BOOT_SERVICES_ENDED, 0x416c_6570_6830_4542);
+}
+
+#[test]
+fn the_test_guest_has_no_aleph0_vmcalls() {
+    // Its VMCALLs are its script's: the ExitBootServices marker is not the
+    // next main VMCALL's, so it stops the run.
+    for rax in [vmcall::BOOT_SERVICES_ENDED, vmcall::TEST] {
+        assert_eq!(
+            decide(GuestKind::BuiltInTest, WRITTEN, vmcall(rax)).0,
+            ExitEvent::Unexpected,
+            "rax={rax:#x}"
+        );
+    }
+}
+
+#[test]
 fn the_firmware_stops_at_an_unhandled_exit() {
     let page_fault = ExitInfo {
         interruption_info: InterruptionInfo(PAGE_FAULT_INFO),

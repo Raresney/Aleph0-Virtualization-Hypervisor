@@ -10,9 +10,9 @@
 //! alignment or revision identifier), ZF = 1 is VmFailValid (already in VMX
 //! operation, error number 15).
 //!
-//! Memory type: `LOADER_DATA` is fine while Boot Services are alive. If the
-//! hypervisor is meant to survive `ExitBootServices`, this must become
-//! `RUNTIME_SERVICES_DATA` (or a reserved type) so the OS never reclaims it.
+//! The region is resident (`page::RESIDENT_DATA`): the CPU uses it for as
+//! long as VMX operation lasts, after `ExitBootServices` too, so the OS must
+//! never reclaim it.
 
 use super::cr;
 use super::instruction::{VmxFail, vmx_asm};

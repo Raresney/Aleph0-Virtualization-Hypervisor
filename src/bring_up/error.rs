@@ -1,5 +1,8 @@
 //! Why bring-up stopped, and how that gets printed.
 
+use uefi::Status;
+use uefi::boot::MemoryType;
+
 use crate::vmx;
 use crate::vmx::apic::LocalApicError;
 use crate::vmx::context_tables::{GdtError, TssError};
@@ -60,6 +63,24 @@ pub enum BringUpError {
     /// activation and the launch. The VMCS guest fields were copied from the
     /// activated tables, so the guest would start on stale ones.
     ContextTablesChanged,
+    /// The UEFI memory map, which the resident allocations are checked
+    /// against, could not be read. Before the launch.
+    ResidentMemoryMapUnavailable,
+    /// The resident allocation at `address` lies in memory the OS may reuse
+    /// after `ExitBootServices`: its memory-map region has type
+    /// `memory_type`, or no region holds it (`None`). Before the launch.
+    NotResident {
+        address: u64,
+        memory_type: Option<MemoryType>,
+    },
+    /// `count` resident allocations came after `vmx::page`'s list was full,
+    /// so they could not be checked. Before the launch.
+    ResidentAllocationsUnlisted(usize),
+    /// `vmx::page` listed no resident allocation, not even the image copy,
+    /// so the check would have checked nothing. Before the launch.
+    NoResidentAllocations,
+    /// The `ExitBootServices` event could not be created. Before the launch.
+    ExitBootServicesEvent(Status),
     /// The guest stopped at exit `number`, which the exit handler did not
     /// resume: it does not handle that exit, or it is an expected VMCALL the
     /// handler could not step past. Its lines on serial say which.
@@ -241,6 +262,30 @@ pub fn report_error(error: BringUpError) {
         BringUpError::GuestState { error, .. } => log!("Guest state invalid: {error:x?}"),
         BringUpError::ContextTablesChanged => {
             log!("Context descriptor tables changed after VMX/UEFI calls; the guest was not launched.")
+        }
+        BringUpError::ResidentMemoryMapUnavailable => {
+            log!(
+                "The UEFI memory map is unavailable, so the resident allocations went unchecked; the guest was not launched."
+            )
+        }
+        BringUpError::NotResident {
+            address,
+            memory_type: Some(memory_type),
+        } => log!(
+            "The resident allocation at {address:#018x} is {memory_type:?}, which the OS may reuse after ExitBootServices; the guest was not launched."
+        ),
+        BringUpError::NotResident {
+            address,
+            memory_type: None,
+        } => log!("The resident allocation at {address:#018x} is in no memory-map region; the guest was not launched."),
+        BringUpError::ResidentAllocationsUnlisted(count) => log!(
+            "{count} resident allocation(s) came after the list was full and went unchecked; the guest was not launched."
+        ),
+        BringUpError::NoResidentAllocations => {
+            log!("No resident allocation was listed, not even the image copy; the guest was not launched.")
+        }
+        BringUpError::ExitBootServicesEvent(status) => {
+            log!("The ExitBootServices event could not be created: {status:?}; the firmware was not launched.")
         }
         BringUpError::UnexpectedExit { number, reason } => log!(
             "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",

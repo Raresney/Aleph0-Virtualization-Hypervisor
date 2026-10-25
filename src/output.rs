@@ -104,7 +104,8 @@ pub enum Phase {
     /// which the firmware console may be used.
     BootServices = 0,
     /// After `ExitBootServices`: the firmware console is gone and the OS
-    /// owns the machine. Nothing sets it yet (ROADMAP section 0b).
+    /// owns the machine. The exit handler sets it for good at the VMCALL of
+    /// Aleph0's `ExitBootServices` event (`resident`).
     Runtime = 1,
     /// The VM-exit handler, which puts the phase it found back when it
     /// resumes the guest (in place, the guest is Aleph0's own code too, which
