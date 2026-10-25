@@ -26,7 +26,7 @@
 
 use crate::vmx::cr::CR4_LA57;
 use crate::vmx::ept::level::{Level, Pd, Pdpt, Pml4, TableLevel};
-use crate::vmx::ept::{MAX_IDENTITY_MAP, SIZE_1G};
+use crate::vmx::ept::{PDPT_SPAN, SIZE_1G};
 use crate::vmx::page::{PAGE_SIZE, allocate_zeroed_pages};
 use core::marker::PhantomData;
 
@@ -94,10 +94,11 @@ pub fn check_paging_mode(cr4: u64) -> Result<(), HostPagingError> {
 }
 
 /// How many GiB a map ending at `end` covers. `end` comes from
-/// `ept::identity_map_end`, so it is a whole number of GiB; anything else is
-/// refused rather than rounded.
+/// `ept::memory_map_end`, so it is a whole number of GiB, and the map has
+/// one PDPT, so it reaches 512 GiB at most; anything else is refused rather
+/// than rounded.
 fn gibs(end: u64) -> Result<usize, HostPagingError> {
-    if end == 0 || !end.is_multiple_of(SIZE_1G) || end > MAX_IDENTITY_MAP {
+    if end == 0 || !end.is_multiple_of(SIZE_1G) || end > PDPT_SPAN {
         return Err(HostPagingError::InvalidEnd { end });
     }
     Ok((end / SIZE_1G) as usize)

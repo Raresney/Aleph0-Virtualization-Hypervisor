@@ -32,14 +32,20 @@
 //! - IPAT (bit 6): ignore the guest's PAT. Left clear, so the guest's PAT
 //!   still combines with the EPT type, as it would with the MTRRs' type
 //!   without EPT.
-//! - PS (bit 7, in a PD entry): this entry maps a 2 MiB page directly.
+//! - PS (bit 7, in a PDPT or PD entry): this entry maps a 1 GiB or 2 MiB
+//!   page directly.
 //!
-//! Aleph0 builds an identity map (GPA = HPA) of all memory, each page of
-//! RAM with the memory type the MTRRs give it, so the guest runs as without
-//! EPT, and everything else (MMIO, reserved memory, holes in the UEFI
-//! memory map) UC whatever the MTRRs say ([`EptTypes`]). One 4 KiB page, the guest's data page, is mapped read-only: a guest
-//! write to it is the intentional EPT violation, and
-//! [`ProtectedPage::grant_write`] makes it writable when that exit arrives.
+//! Aleph0 builds an identity map (GPA = HPA) of the whole guest-physical
+//! address space, as far as MAXPHYADDR and the 4-level walk reach
+//! ([`MapLayout`]), so the guest runs as without EPT: each page of RAM with
+//! the memory type the MTRRs give it, and everything else (MMIO, reserved
+//! memory, holes in the UEFI memory map) UC whatever the MTRRs say
+//! ([`EptTypes`]). The GiBs the UEFI memory map reaches are mapped through
+//! PDs, in 2 MiB and 4 KiB pages; above them, where there is no RAM, each
+//! GiB is one UC 1 GiB page. One 4 KiB page, the guest's data page, is
+//! mapped read-only: a guest write to it is the intentional EPT violation,
+//! and [`ProtectedPage::grant_write`] makes it writable when that exit
+//! arrives.
 //!
 //! The guest's writes to its MTRRs change the types its memory should have.
 //! [`TypeTables::apply`] rewrites the entries whose type changed and runs
@@ -87,11 +93,17 @@ const EPTP_WALK_LENGTH_4: u64 = 3 << 3;
 const ENTRIES: usize = 512;
 /// What a PD entry maps: a 2 MiB page, or a PT of 512 4 KiB pages.
 pub const SIZE_2M: u64 = 1 << 21;
-/// What a PDPT entry maps: a PD of 512 2 MiB regions.
+/// What a PDPT entry maps: a PD of 512 2 MiB regions, or a 1 GiB page.
 pub const SIZE_1G: u64 = 1 << 30;
-/// How far one PDPT reaches (512 entries of 1 GiB). Aleph0 builds one PDPT,
-/// so the identity map ends here at most.
-pub const MAX_IDENTITY_MAP: u64 = ENTRIES as u64 * SIZE_1G;
+/// What one PDPT maps: 512 entries of 1 GiB.
+pub const PDPT_SPAN: u64 = ENTRIES as u64 * SIZE_1G;
+/// Address bits a 4-level EPT walk translates: 9 per level and 12 of page
+/// offset. A GPA needs no more, whatever MAXPHYADDR says.
+const WALK_ADDRESS_BITS: u8 = 48;
+/// End of the 32-bit address space, below which the Local APIC, the IOAPIC
+/// and 32-bit PCI BARs live. Without 1 GiB pages the map reaches at least
+/// this far ([`MapLayout::new`]).
+const LOW_DEVICE_END: u64 = 4 * SIZE_1G;
 
 // IA32_VMX_EPT_VPID_CAP bits this module needs.
 /// Bit 6: 4-level EPT page walks.
@@ -100,6 +112,8 @@ const CAP_WALK_LENGTH_4: u64 = 1 << 6;
 const CAP_WRITE_BACK: u64 = 1 << 14;
 /// Bit 16: PD entries may map 2 MiB pages.
 const CAP_2M_PAGES: u64 = 1 << 16;
+/// Bit 17: PDPT entries may map 1 GiB pages.
+const CAP_1G_PAGES: u64 = 1 << 17;
 /// Bit 20: the INVEPT instruction.
 const CAP_INVEPT: u64 = 1 << 20;
 /// Bit 25: single-context INVEPT (only this EPTP's translations).
@@ -143,8 +157,9 @@ pub enum EptError {
     MemoryMapUnavailable,
     /// The memory map has no memory in it.
     EmptyMemoryMap,
-    /// The memory map reaches `end`, past what one PDPT maps.
-    RangeTooLarge { end: u64 },
+    /// The memory map reaches `end`, past `limit`, the end of the
+    /// guest-physical address space ([`address_space_end`]).
+    RangeTooLarge { end: u64, limit: u64 },
     /// The page to protect lies outside the identity map.
     ProtectedPageOutsideMap,
     /// UEFI could not provide the table pages.
@@ -154,12 +169,37 @@ pub enum EptError {
     AlreadyBuilt,
 }
 
-/// Checks that this CPU supports the EPT Aleph0 builds, and picks the INVEPT
-/// type: single-context when available, otherwise all-context.
+/// What the CPU allows in an EPT entry beyond what every EPT allows: what
+/// the map may use ([`MapLayout`]), and what the CPU refuses in an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryRules {
+    /// MAXPHYADDR: an entry's address bits from here up to 51 are reserved.
+    pub physical_address_bits: u8,
+    /// Whether a PDPT entry may map a 1 GiB page (IA32_VMX_EPT_VPID_CAP
+    /// bit 17).
+    pub huge_pages: bool,
+}
+
+/// What this CPU's EPT offers Aleph0: see [`check_support`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EptSupport {
+    /// The INVEPT type to use: single-context when available.
+    pub invept: InveptType,
+    pub rules: EntryRules,
+}
+
+/// Checks that this CPU supports the EPT Aleph0 builds, picks the INVEPT
+/// type (single-context when available, otherwise all-context), and reads
+/// what else its entries may use.
 ///
 /// `secondary` is IA32_VMX_PROCBASED_CTLS2 and `ept_vpid_cap`
-/// IA32_VMX_EPT_VPID_CAP, both 0 when the CPU lacks them.
-pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<InveptType, EptError> {
+/// IA32_VMX_EPT_VPID_CAP, both 0 when the CPU lacks them;
+/// `physical_address_bits` is MAXPHYADDR (`cpuid::physical_address_bits`).
+pub fn check_support(
+    secondary: ControlCapability,
+    ept_vpid_cap: u64,
+    physical_address_bits: u8,
+) -> Result<EptSupport, EptError> {
     if !secondary.allows(SECONDARY_ENABLE_EPT) {
         return Err(EptError::EptUnsupported);
     }
@@ -175,13 +215,20 @@ pub fn check_support(secondary: ControlCapability, ept_vpid_cap: u64) -> Result<
     if ept_vpid_cap & CAP_INVEPT == 0 {
         return Err(EptError::InveptUnsupported);
     }
-    if ept_vpid_cap & CAP_INVEPT_SINGLE_CONTEXT != 0 {
-        Ok(InveptType::SingleContext)
+    let invept = if ept_vpid_cap & CAP_INVEPT_SINGLE_CONTEXT != 0 {
+        InveptType::SingleContext
     } else if ept_vpid_cap & CAP_INVEPT_ALL_CONTEXT != 0 {
-        Ok(InveptType::AllContext)
+        InveptType::AllContext
     } else {
-        Err(EptError::InveptUnsupported)
-    }
+        return Err(EptError::InveptUnsupported);
+    };
+    Ok(EptSupport {
+        invept,
+        rules: EntryRules {
+            physical_address_bits,
+            huge_pages: ept_vpid_cap & CAP_1G_PAGES != 0,
+        },
+    })
 }
 
 /// The four table levels, as types: EPT's, and those of Aleph0's host page
@@ -267,7 +314,8 @@ pub mod level {
 ///
 /// | Level | Constructors |
 /// |---|---|
-/// | [`Pml4`], [`Pdpt`] | [`table`](Self::table) |
+/// | [`Pml4`] | [`table`](Self::table) |
+/// | [`Pdpt`] | [`table`](Self::table), [`huge_page`](Self::huge_page) |
 /// | [`Pd`] | [`table`](Self::table), [`large_page`](Self::large_page) |
 /// | [`Pt`] | [`page`](Self::page), [`with_access`](Self::with_access) |
 #[repr(transparent)]
@@ -297,10 +345,41 @@ impl<L: TableLevel> EptEntry<L> {
     }
 }
 
+/// The bits of an RWX entry mapping the page at `address` itself, of
+/// `memory_type`: a 1 GiB page in a PDPT entry, a 2 MiB one in a PD entry.
+fn page_entry_bits(address: u64, memory_type: MemoryType) -> u64 {
+    (address & ADDRESS_MASK) | EPT_RWX | (memory_type.raw() << MEMORY_TYPE_SHIFT) | LARGE_PAGE
+}
+
+/// The memory type a leaf entry `raw` holds in bits 5:3, or `None` for a
+/// reserved value (2, 3 or 7).
+fn leaf_memory_type(raw: u64) -> Option<MemoryType> {
+    MemoryType::from_raw(((raw >> MEMORY_TYPE_SHIFT) & MEMORY_TYPE_BITS) as u8)
+}
+
+impl EptEntry<Pdpt> {
+    /// An entry mapping the 1 GiB page at `address`: RWX, of `memory_type`.
+    /// Only on a CPU with 1 GiB EPT pages ([`EntryRules::huge_pages`]).
+    pub fn huge_page(address: u64, memory_type: MemoryType) -> Self {
+        Self::from_raw(page_entry_bits(address, memory_type))
+    }
+
+    /// How the entry maps its GiB as one 1 GiB page, read back from its
+    /// bits: [`RegionMapping::HugePage`], or [`RegionMapping::Invalid`] for
+    /// anything else. An entry pointing to a PD is `Invalid` here too: the
+    /// report reads that GiB's PD entries instead ([`TypeTables::region_runs`]).
+    pub fn mapping(self) -> RegionMapping {
+        if self.raw & EPT_RWX == 0 || self.raw & LARGE_PAGE == 0 {
+            return RegionMapping::Invalid;
+        }
+        leaf_memory_type(self.raw).map_or(RegionMapping::Invalid, RegionMapping::HugePage)
+    }
+}
+
 impl EptEntry<Pd> {
     /// An entry mapping the 2 MiB page at `address`: RWX, of `memory_type`.
     pub fn large_page(address: u64, memory_type: MemoryType) -> Self {
-        Self::from_raw((address & ADDRESS_MASK) | EPT_RWX | (memory_type.raw() << MEMORY_TYPE_SHIFT) | LARGE_PAGE)
+        Self::from_raw(page_entry_bits(address, memory_type))
     }
 
     /// How the entry maps its 2 MiB region, read back from its bits.
@@ -311,20 +390,23 @@ impl EptEntry<Pd> {
         if self.raw & LARGE_PAGE == 0 {
             return RegionMapping::Pt;
         }
-        let memory_type = (self.raw >> MEMORY_TYPE_SHIFT) & MEMORY_TYPE_BITS;
-        MemoryType::from_raw(memory_type as u8).map_or(RegionMapping::Invalid, RegionMapping::LargePage)
+        leaf_memory_type(self.raw).map_or(RegionMapping::Invalid, RegionMapping::LargePage)
     }
 }
 
-/// How a PD entry maps its 2 MiB region: see [`EptEntry::mapping`].
+/// How a PD entry maps its 2 MiB region, or a PDPT entry its GiB: see the
+/// two `mapping` methods of [`EptEntry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionMapping {
-    /// One 2 MiB page of this memory type.
+    /// One 2 MiB page of this memory type: a PD entry.
     LargePage(MemoryType),
-    /// A PT of 4 KiB pages, each with its own type and access.
+    /// One 1 GiB page of this memory type: a PDPT entry.
+    HugePage(MemoryType),
+    /// A PT of 4 KiB pages, each with its own type and access: a PD entry.
     Pt,
-    /// Neither: not present, or a 2 MiB page whose type bits hold a
-    /// reserved value. `Ept::build` makes no such entry.
+    /// Neither: not present, a page whose type bits hold a reserved value,
+    /// or, read as a 1 GiB page, a PDPT entry pointing to a PD. `Ept::build`
+    /// makes no such entry where it is read this way.
     Invalid,
 }
 
@@ -332,13 +414,14 @@ impl fmt::Display for RegionMapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LargePage(memory_type) => write!(f, "2 MiB pages, {}", memory_type.name()),
+            Self::HugePage(memory_type) => write!(f, "1 GiB pages, {}", memory_type.name()),
             Self::Pt => f.write_str("4 KiB pages (a PT each)"),
             Self::Invalid => f.write_str("invalid (not present or reserved type)"),
         }
     }
 }
 
-/// Consecutive 2 MiB regions the PDs map the same way: see
+/// Consecutive parts of the map mapped the same way: see
 /// [`TypeTables::region_runs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionRun {
@@ -347,28 +430,38 @@ pub struct RegionRun {
     pub mapping: RegionMapping,
 }
 
-/// The regions `pds` map, consecutive ones with the same
-/// [`mapping`](EptEntry::mapping) merged into one run. `pds` are back to
-/// back, as [`fill_identity_map`] fills them, from the one of region
-/// number `first` (GPA `first` * 2 MiB).
-fn region_runs(pds: &[EptEntry<Pd>], first: usize) -> impl Iterator<Item = RegionRun> + '_ {
-    let mut regions = pds
-        .iter()
+/// The `mappings` of consecutive blocks of `size` bytes, from block number
+/// `first`, with neighbours mapped alike merged into one run.
+fn runs(mappings: impl Iterator<Item = RegionMapping>, first: usize, size: u64) -> impl Iterator<Item = RegionRun> {
+    let mut blocks = mappings
         .enumerate()
-        .map(move |(i, entry)| (first + i, entry.mapping()))
+        .map(move |(i, mapping)| (first + i, mapping))
         .peekable();
     core::iter::from_fn(move || {
-        let (first, mapping) = regions.next()?;
+        let (first, mapping) = blocks.next()?;
         let mut last = first;
-        while let Some((next, _)) = regions.next_if(|&(_, next_mapping)| next_mapping == mapping) {
+        while let Some((next, _)) = blocks.next_if(|&(_, next_mapping)| next_mapping == mapping) {
             last = next;
         }
         Some(RegionRun {
-            start: first as u64 * SIZE_2M,
-            end: (last as u64 + 1) * SIZE_2M,
+            start: first as u64 * size,
+            end: (last as u64 + 1) * size,
             mapping,
         })
     })
+}
+
+/// The regions `pds` map, as [`runs`]. `pds` are back to back, as
+/// [`fill_identity_map`] fills them, from the one of region number `first`
+/// (GPA `first` * 2 MiB).
+fn region_runs(pds: &[EptEntry<Pd>], first: usize) -> impl Iterator<Item = RegionRun> + '_ {
+    runs(pds.iter().map(|entry| entry.mapping()), first, SIZE_2M)
+}
+
+/// The GiBs `pdpts` map as 1 GiB pages, as [`runs`], from the entry of GiB
+/// number `first`.
+fn gib_runs(pdpts: &[EptEntry<Pdpt>], first: usize) -> impl Iterator<Item = RegionRun> + '_ {
+    runs(pdpts.iter().map(|entry| entry.mapping()), first, SIZE_1G)
 }
 
 impl EptEntry<Pt> {
@@ -439,32 +532,103 @@ impl Eptp {
     }
 }
 
-/// End of the identity map for memory-map regions `(start, pages)`: the
-/// highest address any region reaches, rounded up to 1 GiB, so every PD is
-/// full.
+/// End of memory-map regions `(start, pages)`: the highest address any
+/// region reaches, rounded up to 1 GiB, so every PD of [`MapLayout`] is
+/// full. Every region counts, whatever its type, so memory-mapped I/O the
+/// firmware reports is in it too, UC ([`EptTypes`]).
 ///
-/// Every region counts, whatever its type, so memory-mapped I/O the
-/// firmware reports is mapped too, UC ([`EptTypes`]).
-pub fn identity_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64, EptError> {
-    let mut highest = 0u64;
-    for (start, pages) in regions {
-        let end = pages
-            .checked_mul(PAGE_SIZE as u64)
-            .and_then(|size| start.checked_add(size))
-            .ok_or(EptError::RangeTooLarge { end: u64::MAX })?;
-        highest = highest.max(end);
+/// A region reaching past the top of the 64-bit address space gives
+/// `u64::MAX`, past any address space, which [`MapLayout::new`] refuses.
+pub fn memory_map_end(regions: impl Iterator<Item = (u64, u64)>) -> Result<u64, EptError> {
+    let highest = regions
+        .map(|(start, pages)| start.saturating_add(pages.saturating_mul(PAGE_SIZE as u64)))
+        .max()
+        .filter(|&end| end > 0)
+        .ok_or(EptError::EmptyMemoryMap)?;
+    Ok(highest.checked_next_multiple_of(SIZE_1G).unwrap_or(u64::MAX))
+}
+
+/// End of the guest-physical address space EPT maps, for a CPU whose
+/// physical addresses have `physical_address_bits` bits (MAXPHYADDR): every
+/// address the guest can reach, as far as a 4-level walk translates.
+pub fn address_space_end(physical_address_bits: u8) -> u64 {
+    1 << physical_address_bits.min(WALK_ADDRESS_BITS)
+}
+
+/// How [`Ept::build`] lays out the identity map, GiB by GiB, from GPA 0:
+///
+/// ```text
+/// 0 ── PDs (2 MiB and 4 KiB pages) ── pd_end ── 1 GiB pages, UC ── end
+///      the GiBs the UEFI memory map        no RAM above the memory map
+///      reaches: RAM, retyped when the
+///      guest writes its MTRRs
+/// ```
+///
+/// Every GiB the memory map reaches keeps a PD, even one of a single type,
+/// so the guest's MTRR writes can retype its RAM 2 MiB or 4 KiB at a time
+/// ([`retype`]) without splitting a 1 GiB page. Above the memory map there
+/// is no RAM, so whatever the MTRRs say a GiB there is UC ([`EptTypes`]),
+/// and never retyped: one 1 GiB page each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapLayout {
+    /// GiBs `[0, pd_gibs)` are mapped through one PD each.
+    pd_gibs: usize,
+    /// GiBs `[pd_gibs, gibs)` are 1 GiB pages; the map ends at GiB `gibs`.
+    gibs: usize,
+}
+
+impl MapLayout {
+    /// The layout for a memory map ending at `memory_map_end`
+    /// ([`memory_map_end`]) on a CPU with `rules`: up to the end of the
+    /// address space ([`address_space_end`]). Without 1 GiB pages, a PD per
+    /// GiB of a 46-bit address space would take 256 MiB of tables, so the
+    /// PDs then stop at `max(memory_map_end, 4 GiB)`: the 32-bit device
+    /// window, with the Local APIC and the IOAPIC, is mapped, and an access
+    /// above it is an EPT violation.
+    pub fn new(memory_map_end: u64, rules: EntryRules) -> Result<Self, EptError> {
+        let limit = address_space_end(rules.physical_address_bits);
+        if memory_map_end > limit {
+            return Err(EptError::RangeTooLarge {
+                end: memory_map_end,
+                limit,
+            });
+        }
+        let gibs_to = |end: u64| (end / SIZE_1G) as usize;
+        Ok(if rules.huge_pages {
+            Self {
+                pd_gibs: gibs_to(memory_map_end),
+                gibs: gibs_to(limit),
+            }
+        } else {
+            let pd_gibs = gibs_to(memory_map_end.max(LOW_DEVICE_END).min(limit));
+            Self { pd_gibs, gibs: pd_gibs }
+        })
     }
-    if highest == 0 {
-        return Err(EptError::EmptyMemoryMap);
+
+    /// End of the map: GPAs `[0, end)` are mapped.
+    pub fn end(self) -> u64 {
+        self.gibs as u64 * SIZE_1G
     }
-    let rounded = highest
-        .checked_add(SIZE_1G - 1)
-        .map(|end| end & !(SIZE_1G - 1))
-        .ok_or(EptError::RangeTooLarge { end: highest })?;
-    if rounded > MAX_IDENTITY_MAP {
-        return Err(EptError::RangeTooLarge { end: highest });
+
+    /// End of the part mapped through PDs.
+    pub fn pd_end(self) -> u64 {
+        self.pd_gibs as u64 * SIZE_1G
     }
-    Ok(rounded)
+
+    /// How many GiBs are mapped through a PD each.
+    pub fn pd_gibs(self) -> usize {
+        self.pd_gibs
+    }
+
+    /// How many GiBs are 1 GiB pages.
+    pub fn huge_gibs(self) -> usize {
+        self.gibs - self.pd_gibs
+    }
+
+    /// How many PDPTs the map takes: one per 512 GiB, each in a PML4 entry.
+    pub fn pdpts(self) -> usize {
+        self.gibs.div_ceil(ENTRIES)
+    }
 }
 
 /// Whether memory of UEFI type `memory_type` is RAM: memory the firmware or
@@ -620,12 +784,14 @@ impl EptTypes<'_> {
 /// virtual one; on the host tests these are made-up numbers.
 struct Tables<'a> {
     pml4: &'a mut [EptEntry<Pml4>],
-    pdpt: &'a mut [EptEntry<Pdpt>],
-    /// One PD per GiB of the map, back to back.
+    /// One PDPT per 512 GiB of the map, back to back, so entry `g` maps
+    /// GiB `g`.
+    pdpts: &'a mut [EptEntry<Pdpt>],
+    /// One PD per GiB mapped through a PD ([`MapLayout`]), back to back.
     pds: &'a mut [EptEntry<Pd>],
     /// One PT per split region ([`split_regions`]), back to back.
     pts: &'a mut [EptEntry<Pt>],
-    pdpt_address: u64,
+    pdpts_address: u64,
     pds_address: u64,
     pts_address: u64,
 }
@@ -663,35 +829,45 @@ pub fn spare_pts(mtrr: MtrrCapabilities) -> usize {
     mtrr.variable_count() + usize::from(mtrr.fixed())
 }
 
-/// How many 2 MiB regions of the first `gibs` GiB need a PT
+/// How many 2 MiB regions of the first `pd_gibs` GiB need a PT
 /// ([`large_page_type`] is `None`): how many PTs [`fill_identity_map`]
 /// takes. At least 1, for the region holding `protected_page`.
-fn split_regions(types: &EptTypes<'_>, gibs: usize, protected_page: u64) -> usize {
-    (0..gibs * ENTRIES)
+fn split_regions(types: &EptTypes<'_>, pd_gibs: usize, protected_page: u64) -> usize {
+    (0..pd_gibs * ENTRIES)
         .filter(|&i| large_page_type(types, i as u64 * SIZE_2M, protected_page).is_none())
         .count()
 }
 
-/// Fills `tables` with an identity map of the first `gibs` GiB, each page
+/// Fills `tables` with an identity map laid out as `layout` says, each page
 /// with the memory type `types` gives it, and RWX except `protected_page`,
-/// which is read-only. A 2 MiB region is one 2 MiB page when it can be
-/// ([`large_page_type`]); otherwise it takes the next PT in `tables.pts`
-/// and is mapped in 4 KiB pages. Returns the index of `protected_page`'s
-/// entry in `tables.pts`.
+/// which is read-only. In the GiBs with a PD, a 2 MiB region is one 2 MiB
+/// page when it can be ([`large_page_type`]); otherwise it takes the next
+/// PT in `tables.pts` and is mapped in 4 KiB pages. Returns the index of
+/// `protected_page`'s entry in `tables.pts`.
 ///
-/// `pds` holds `gibs` tables and `pts` [`split_regions`] tables, and
-/// `protected_page` is 4 KiB-aligned and inside the map; [`Ept::build`]
-/// checks all three.
-fn fill_identity_map(tables: Tables<'_>, gibs: usize, types: &EptTypes<'_>, protected_page: u64) -> usize {
-    debug_assert!(tables.pds.len() == gibs * ENTRIES);
-    tables.pml4[0] = EptEntry::table(tables.pdpt_address);
-    for gib in 0..gibs {
-        tables.pdpt[gib] = EptEntry::table(tables.pds_address + gib as u64 * PAGE_SIZE as u64);
+/// `pdpts` holds [`MapLayout::pdpts`] tables, `pds` [`MapLayout::pd_gibs`]
+/// and `pts` [`split_regions`], and `protected_page` is 4 KiB-aligned and
+/// in a GiB with a PD; [`Ept::build`] checks all four.
+fn fill_identity_map(tables: Tables<'_>, layout: MapLayout, types: &EptTypes<'_>, protected_page: u64) -> usize {
+    debug_assert!(tables.pdpts.len() == layout.pdpts() * ENTRIES);
+    debug_assert!(tables.pds.len() == layout.pd_gibs * ENTRIES);
+    // The PDPTs are back to back, one per PML4 entry, so PDPT entry number
+    // `gib` across all of them maps GiB `gib`; likewise for the PDs and
+    // their 2 MiB regions.
+    for (number, entry) in tables.pml4.iter_mut().take(layout.pdpts()).enumerate() {
+        *entry = EptEntry::table(tables.pdpts_address + (number * PAGE_SIZE) as u64);
+    }
+    for (gib, entry) in tables.pdpts.iter_mut().take(layout.gibs).enumerate() {
+        let base = gib as u64 * SIZE_1G;
+        *entry = if gib < layout.pd_gibs {
+            EptEntry::table(tables.pds_address + (gib * PAGE_SIZE) as u64)
+        } else {
+            // Above the memory map, so no RAM: UC whatever the MTRRs say.
+            debug_assert!(types.ram.coverage(base, SIZE_1G) == RamCoverage::None);
+            EptEntry::huge_page(base, MemoryType::Uncacheable)
+        };
     }
 
-    // The PDs are back to back, one per PDPT entry, so PD entry number `i`
-    // across all of them maps GPA i * 2 MiB. No PML4 index: the map ends at
-    // 512 GiB at most, so every address in it uses PML4 entry 0.
     let (pts, rest) = tables.pts.as_chunks_mut::<ENTRIES>();
     debug_assert!(rest.is_empty(), "the PTs are whole tables");
     let mut pts = pts.iter_mut().enumerate();
@@ -728,21 +904,22 @@ fn fill_pt(pt: &mut [EptEntry<Pt>; ENTRIES], region: u64, types: &EptTypes<'_>) 
 /// on every guest access for as long as the VMCS points at them.
 pub struct Ept {
     eptp: Eptp,
-    end: u64,
+    layout: MapLayout,
+    memory_map_end: u64,
     split_regions: usize,
     spare_pts: usize,
     table_pages: usize,
 }
 
 impl Ept {
-    /// Builds the identity map from the UEFI memory map, with the memory
-    /// types of `mtrrs` for its RAM and UC for everything else
-    /// ([`EptTypes`]), `protected_page` read-only, and `spare_pts` more PTs
-    /// set aside ([`spare_pts`]). Publishes the [`ProtectedPage`] the
-    /// exit handler needs later, and returns, with the map, the
-    /// [`TypeTables`] it needs to change memory types. Refuses a second
-    /// build with [`EptError::AlreadyBuilt`]: the handler knows one map
-    /// only.
+    /// Builds the identity map from the UEFI memory map, laid out for the
+    /// CPU's `support` ([`MapLayout`]), with the memory types of `mtrrs` for
+    /// its RAM and UC for everything else ([`EptTypes`]), `protected_page`
+    /// read-only, and `spare_pts` more PTs set aside ([`spare_pts`]).
+    /// Publishes the [`ProtectedPage`] the exit handler needs later, and
+    /// returns, with the map, the [`TypeTables`] it needs to change memory
+    /// types. Refuses a second build with [`EptError::AlreadyBuilt`]: the
+    /// handler knows one map only.
     ///
     /// # Safety
     ///
@@ -751,13 +928,14 @@ impl Ept {
     /// their physical addresses.
     pub unsafe fn build(
         protected_page: u64,
-        invept: InveptType,
+        support: EptSupport,
         mtrrs: &Mtrrs,
         spare_pts: usize,
     ) -> Result<(Self, TypeTables), EptError> {
         let map = boot::memory_map(boot::MemoryType::LOADER_DATA).map_err(|_| EptError::MemoryMapUnavailable)?;
-        let end = identity_map_end(map.entries().map(|region| (region.phys_start, region.page_count)))?;
-        if protected_page >= end || !protected_page.is_multiple_of(PAGE_SIZE as u64) {
+        let memory_map_end = memory_map_end(map.entries().map(|region| (region.phys_start, region.page_count)))?;
+        let layout = MapLayout::new(memory_map_end, support.rules)?;
+        if protected_page >= layout.pd_end() || !protected_page.is_multiple_of(PAGE_SIZE as u64) {
             return Err(EptError::ProtectedPageOutsideMap);
         }
 
@@ -776,12 +954,11 @@ impl Ept {
         );
         let types = EptTypes { mtrrs, ram };
 
-        let gibs = (end / SIZE_1G) as usize;
-        let split_regions = split_regions(&types, gibs, protected_page);
+        let split_regions = split_regions(&types, layout.pd_gibs, protected_page);
         let pt_count = split_regions + spare_pts;
         let pml4 = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
-        let pdpt = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
-        let pds = allocate_zeroed_pages(gibs, EptError::AllocationFailed)?.as_ptr() as u64;
+        let pdpts = allocate_zeroed_pages(layout.pdpts(), EptError::AllocationFailed)?.as_ptr() as u64;
+        let pds = allocate_zeroed_pages(layout.pd_gibs, EptError::AllocationFailed)?.as_ptr() as u64;
         let pts = allocate_zeroed_pages(pt_count, EptError::AllocationFailed)?.as_ptr() as u64;
         let free_pages = (pt_count * size_of::<u32>()).div_ceil(PAGE_SIZE);
         let free = allocate_zeroed_pages(free_pages, EptError::AllocationFailed)?.as_ptr() as *mut u32;
@@ -804,15 +981,15 @@ impl Ept {
         let tables = unsafe {
             Tables {
                 pml4: table(pml4, 1),
-                pdpt: table(pdpt, 1),
-                pds: table(pds, gibs),
+                pdpts: table(pdpts, layout.pdpts()),
+                pds: table(pds, layout.pd_gibs),
                 pts: table(pts, split_regions),
-                pdpt_address: pdpt,
+                pdpts_address: pdpts,
                 pds_address: pds,
                 pts_address: pts,
             }
         };
-        let protected = fill_identity_map(tables, gibs, &types, protected_page);
+        let protected = fill_identity_map(tables, layout, &types, protected_page);
         // SAFETY: `free` is a zeroed allocation of at least `pt_count` u32s,
         // which nothing else refers to yet.
         let free_len = fill_free_stack(
@@ -822,14 +999,17 @@ impl Ept {
 
         let ept = Self {
             eptp: Eptp::new(pml4),
-            end,
+            layout,
+            memory_map_end,
             split_regions,
             spare_pts,
-            table_pages: 2 + gibs + pt_count,
+            table_pages: 1 + layout.pdpts() + layout.pd_gibs + pt_count,
         };
         let tables = TypeTables {
+            pdpts: pdpts as *mut EptEntry<Pdpt>,
+            layout,
             pds: pds as *mut EptEntry<Pd>,
-            regions: gibs * ENTRIES,
+            regions: layout.pd_gibs * ENTRIES,
             pts: pts as *mut EptEntry<Pt>,
             pt_count,
             pts_address: pts,
@@ -839,13 +1019,13 @@ impl Ept {
             ram: ram.ranges().as_ptr(),
             ram_len: ram.ranges().len(),
             eptp: ept.eptp,
-            invept,
+            invept: support.invept,
         };
         publish(ProtectedPage {
             gpa: protected_page,
             entry: (pts as *mut EptEntry<Pt>).wrapping_add(protected),
             eptp: ept.eptp,
-            invept,
+            invept: support.invept,
         })?;
         Ok((ept, tables))
     }
@@ -855,9 +1035,21 @@ impl Ept {
         self.eptp
     }
 
+    /// How the map is laid out: where it ends, and which GiBs have a PD.
+    pub fn layout(&self) -> MapLayout {
+        self.layout
+    }
+
     /// End of the identity map: GPAs `[0, end)` are mapped.
     pub fn end(&self) -> u64 {
-        self.end
+        self.layout.end()
+    }
+
+    /// End of the UEFI memory map, rounded up to 1 GiB ([`memory_map_end`]):
+    /// every page of RAM lies below it, and all the memory Aleph0 itself
+    /// uses, the EPT tables included.
+    pub fn memory_map_end(&self) -> u64 {
+        self.memory_map_end
     }
 
     /// How many 2 MiB regions are mapped in 4 KiB pages, through a PT each:
@@ -873,18 +1065,22 @@ impl Ept {
         self.spare_pts
     }
 
-    /// Pages holding the tables: PML4, PDPT, the PDs and the PTs, spare ones
-    /// included.
+    /// Pages holding the tables: the PML4, the PDPTs, the PDs and the PTs,
+    /// spare ones included.
     pub fn table_pages(&self) -> usize {
         self.table_pages
     }
 }
 
-/// What changing memory types needs once the guest runs: the PDs and PTs
-/// [`Ept::build`] filled, the spare PTs it set aside ([`spare_pts`]), and
-/// how to run INVEPT. Made once, by `build`; the exit handler keeps it
+/// The tables [`Ept::build`] filled, as the exit handler needs them once
+/// the guest runs: to change memory types (the PDs and PTs, the spare PTs
+/// it set aside ([`spare_pts`]), and how to run INVEPT), and to read the
+/// map back. Made once, by `build`; the exit handler keeps it
 /// (`vmexit::guest_mtrrs`), and applies the guest's MTRRs with it.
 pub struct TypeTables {
+    /// The PDPTs, back to back: entry g maps GiB g, `layout.gibs` of them.
+    pdpts: *mut EptEntry<Pdpt>,
+    layout: MapLayout,
     /// The PDs, back to back: entry i maps the 2 MiB region at i * 2 MiB.
     pds: *mut EptEntry<Pd>,
     regions: usize,
@@ -964,18 +1160,27 @@ impl TypeTables {
         self.free_len
     }
 
-    /// The map from `start` to `end` as its PD entries hold it: runs of
-    /// 2 MiB regions mapped the same way, read back from the entries the
-    /// CPU walks. The whole map from 0 to [`Ept::end`] at bring-up, the
-    /// regions an MTRR write changed in the exit handler's report.
+    /// The map from `start` to `end` as its entries hold it, read back from
+    /// the entries the CPU walks: runs of 2 MiB regions mapped the same way
+    /// by the PDs, then runs of 1 GiB pages above them ([`MapLayout`]). The
+    /// whole map from 0 to [`Ept::end`] at bring-up, the regions an MTRR
+    /// write changed in the exit handler's report.
     pub fn region_runs(&self, start: u64, end: u64) -> impl Iterator<Item = RegionRun> + '_ {
         let first = ((start / SIZE_2M) as usize).min(self.regions);
         let last = (end.div_ceil(SIZE_2M) as usize).clamp(first, self.regions);
-        // SAFETY: the PDs `build` filled, `regions` entries, never freed.
-        // Only `apply` writes them, through `&mut self`, so never while this
-        // iterator borrows `self`.
-        let pds = unsafe { core::slice::from_raw_parts(self.pds, self.regions) };
-        region_runs(&pds[first..last], first)
+        let first_gib = ((start / SIZE_1G) as usize).clamp(self.layout.pd_gibs, self.layout.gibs);
+        let last_gib = (end.div_ceil(SIZE_1G) as usize).clamp(first_gib, self.layout.gibs);
+        // SAFETY: the PDs and PDPTs `build` filled, `regions` and
+        // `layout.gibs` entries, never freed. Only `apply` writes them (the
+        // PDs), through `&mut self`, so never while this iterator borrows
+        // `self`.
+        let (pds, pdpts) = unsafe {
+            (
+                core::slice::from_raw_parts(self.pds, self.regions),
+                core::slice::from_raw_parts(self.pdpts, self.layout.gibs),
+            )
+        };
+        region_runs(&pds[first..last], first).chain(gib_runs(&pdpts[first_gib..last_gib], first_gib))
     }
 }
 
@@ -1141,8 +1346,8 @@ fn retype(tables: &mut Retype<'_>, types: &EptTypes<'_>) -> Retyped {
                 needing_pts = Some(needing_pts.map_or((i, i), |(first, _)| (first, i)));
                 false
             }
-            // Never made by `build`: left as it is.
-            (RegionMapping::Invalid, _) => false,
+            // Never made by `build` in a PD entry: left as it is.
+            (RegionMapping::Invalid | RegionMapping::HugePage(_), _) => false,
         };
         if changed {
             retyped.count(i);

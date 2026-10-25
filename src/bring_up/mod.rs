@@ -51,7 +51,7 @@ pub use error::{BringUpError, report_error};
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
 use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
-use crate::vmx::ept::{self, Ept, InveptType, TypeTables};
+use crate::vmx::ept::{self, Ept, EptSupport, TypeTables};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
 use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::vmx::guest_state::GuestState;
@@ -237,7 +237,7 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let mappings = unsafe { guest.check_mappings() }?;
     report::guest_mappings(&guest, &mappings);
 
-    let (controls, invept) = check_vmx_support()?;
+    let (controls, ept_support) = check_vmx_support()?;
 
     // The guest's MTRRs start as the CPU's.
     let mtrrs = MtrrState::new(vmx::mtrr::read()?)?;
@@ -245,17 +245,25 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     report::mtrrs(mtrrs.mtrrs());
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the data page's address its GPA.
-    let (ept, types) = unsafe { Ept::build(guest.data_page(), invept, mtrrs.mtrrs(), ept::spare_pts(capabilities)) }?;
+    let (ept, types) = unsafe {
+        Ept::build(
+            guest.data_page(),
+            ept_support,
+            mtrrs.mtrrs(),
+            ept::spare_pts(capabilities),
+        )
+    }?;
     report::ept(&ept, &types, guest.data_page());
 
     let bitmaps = ExitBitmaps::allocate()?;
     report::exit_bitmaps(&bitmaps, capabilities);
     vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
 
-    // The same range as EPT: every address the UEFI memory map reaches,
-    // which holds the image, every allocation and the firmware stack.
+    // Every address the UEFI memory map reaches, which holds the image,
+    // every allocation (the EPT tables included) and the firmware stack:
+    // not the device space above it, which EPT maps for the guest only.
     // SAFETY: boot services are still active, and UEFI identity-maps memory.
-    let host = unsafe { HostEnvironment::build(ept.end(), FirmwareSelectors::read()) }?;
+    let host = unsafe { HostEnvironment::build(ept.memory_map_end(), FirmwareSelectors::read()) }?;
     report::host_environment(&host, vmx::cr::read_cr3());
 
     // Recorded before VMXON: once the guest runs, its VM exits clear IF, and
@@ -326,8 +334,8 @@ fn activate_context_tables() -> Result<ContextTables, BringUpError> {
 
 /// Detects VMX, reads the capability MSRs the VMCS controls are chosen from,
 /// and checks that the CPU supports the EPT Aleph0 builds. Returns the MSRs
-/// and the INVEPT type to use.
-fn check_vmx_support() -> Result<(VmcsControlMsrs, InveptType), BringUpError> {
+/// and what the CPU's EPT offers.
+fn check_vmx_support() -> Result<(VmcsControlMsrs, EptSupport), BringUpError> {
     match vmx::detect() {
         VmxCapabilities::Supported => {
             log!("VMX supported and enabled by firmware.");
@@ -340,12 +348,13 @@ fn check_vmx_support() -> Result<(VmcsControlMsrs, InveptType), BringUpError> {
     let controls = unsafe { vmx::msr::read_vmcs_control_msrs() };
     report::vmx_capabilities(&controls);
 
-    let invept = ept::check_support(controls.secondary, controls.ept_vpid_cap)?;
-    log!(
-        "EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT {}.",
-        invept.name()
-    );
-    Ok((controls, invept))
+    let support = ept::check_support(
+        controls.secondary,
+        controls.ept_vpid_cap,
+        vmx::cpuid::physical_address_bits(),
+    )?;
+    report::ept_support(support);
+    Ok((controls, support))
 }
 
 /// Prepares the current VMCS, checks the host tables, and launches the

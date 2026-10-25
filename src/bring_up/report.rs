@@ -5,7 +5,7 @@
 
 use super::PassthroughState;
 use crate::vmx;
-use crate::vmx::ept::{Ept, TypeTables};
+use crate::vmx::ept::{Ept, EptSupport, TypeTables};
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
@@ -101,17 +101,33 @@ pub(super) fn mtrrs(mtrrs: &Mtrrs) {
     }
 }
 
-/// Prints the EPT identity map [`Ept::build`] made, and how its PD entries
-/// (`types`) map each run of 2 MiB regions: read back from the entries, so
-/// the lines show what the CPU walks.
-pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
+/// Prints what the CPU's EPT offers: what Aleph0 requires of it, and what
+/// the map may use.
+pub(super) fn ept_support(support: EptSupport) {
     log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages, {} of them PTs for 2 MiB regions mapped in 4 KiB pages and {} spare PTs for the guest's MTRR writes; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        "EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT {}; 1 GiB pages={}; MAXPHYADDR {} bits.",
+        support.invept.name(),
+        support.rules.huge_pages,
+        support.rules.physical_address_bits,
+    );
+}
+
+/// Prints the EPT identity map [`Ept::build`] made, and how its entries
+/// (`types`) map each run of it: read back from the entries, so the lines
+/// show what the CPU walks.
+pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
+    let layout = ept.layout();
+    log!(
+        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages: {} PDPT(s); {} PD(s), for 0x0..{:#x}, with {} PTs for 2 MiB regions mapped in 4 KiB pages and {} spare PTs for the guest's MTRR writes; {} GiB above as 1 GiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
         ept.end(),
         ept.end() >> 30,
         ept.table_pages(),
+        layout.pdpts(),
+        layout.pd_gibs(),
+        layout.pd_end(),
         ept.split_regions(),
         ept.spare_pts(),
+        layout.huge_gibs(),
     );
     let ram = types.ram().ranges();
     log!(

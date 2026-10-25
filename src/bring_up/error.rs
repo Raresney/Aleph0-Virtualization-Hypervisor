@@ -195,9 +195,8 @@ pub fn report_error(error: BringUpError) {
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
         BringUpError::Mtrr(error) => log!("MTRR setup failed: {error}."),
-        BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(
-            "EPT setup failed: the memory map reaches {end:#x}, past the {:#x} one PDPT maps.",
-            vmx::ept::MAX_IDENTITY_MAP,
+        BringUpError::Ept(EptError::RangeTooLarge { end, limit }) => log!(
+            "EPT setup failed: the memory map reaches {end:#x}, past {limit:#x}, the end of the guest-physical address space (MAXPHYADDR, at most the 48 bits a 4-level EPT walk translates)."
         ),
         BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
         BringUpError::Host(error) => log!("Host environment setup failed: {error:?}"),
