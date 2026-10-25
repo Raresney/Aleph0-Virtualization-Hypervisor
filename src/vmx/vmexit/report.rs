@@ -280,12 +280,9 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
             );
             report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical));
         }
-        ExitEvent::EptMisconfig => {
-            crate::serial_println!(
-                "{tag} VM exit #{number}: an EPT entry on this GPA's path is one the CPU refuses; Ept::build makes none, so the map is wrong."
-            );
-            report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical));
-        }
+        // The read's line already says an entry is invalid; the walk says
+        // which.
+        ExitEvent::EptMisconfig => report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical)),
         ExitEvent::MainVmcall => crate::serial_println!(
             "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); resuming the guest at rip={rip:#018x}."
         ),
