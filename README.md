@@ -37,7 +37,9 @@ Verified on Hyper-V with nested virtualization:
       firmware
 - [ ] Virtualize the running firmware in place (it launches on Hyper-V, then
       stops at its first synthetic MSR, `0x40000020`, until #27)
-- [ ] Stay resident after `ExitBootServices`
+- [ ] Stay resident after `ExitBootServices` (resident memory, the image
+      copy and the `ExitBootServices` event are in; the test harness's run
+      waits for #27, like the firmware)
 - [ ] Hide Aleph0's own memory from the guest through EPT
 - [ ] An OS guest on multiple vCPUs
 - [ ] Anti-cheat research: guest memory introspection, EPT protection and
@@ -89,13 +91,15 @@ cargo build            # produces target\x86_64-unknown-uefi\debug\aleph0hypervi
 
 ```powershell
 cargo test-host        # alias for: cargo test --target x86_64-pc-windows-msvc
-cargo fmt --check      # formatting (rustfmt.toml: 120 columns)
+cargo fmt --all --check   # formatting (rustfmt.toml: 120 columns)
 cargo clippy           # lints for the UEFI build
 cargo clippy --features test-guest                     # lints for the regression mode
 cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
+cargo clippy -p ebs-harness                            # lints for the ExitBootServices harness
+cargo test -p ebs-harness --target x86_64-pc-windows-msvc   # its host unit tests
 ```
 
-All five pass without warnings, and CI runs them with `cargo build` on every
+All of them pass without warnings, and CI runs them with `cargo build` on every
 push to `master` and every pull request. `clippy::undocumented_unsafe_blocks` is on,
 so every `unsafe` block needs a `// SAFETY:` comment saying why it is sound,
 and every `unsafe fn` has a `# Safety` section for its callers.
@@ -146,6 +150,12 @@ kernel that is to boot as Aleph0's guest, as one EFI file in `run\linux\`.
 `-WithoutAleph0` boots it in Aleph0's place, streaming its console (COM1). See
 [docs/LINUX_GUEST.md](docs/LINUX_GUEST.md).
 
+**The ExitBootServices harness:** `-Harness` boots `tools/ebs-harness` in
+Aleph0's place, which starts Aleph0, exits boot services as its guest,
+overwrites every page the OS may reclaim and checks that Aleph0 still handles
+its exits; `-SetVirtualAddressMap` adds that call. See
+[docs/RESIDENT.md](docs/RESIDENT.md).
+
 **QEMU + OVMF (no VMX):** put `OVMF_CODE.fd` and `OVMF_VARS.fd` from
 [rust-osdev/ovmf-prebuilt](https://github.com/rust-osdev/ovmf-prebuilt) in
 `ovmf/`, then run `.\scripts\run.ps1`. Without nested VMX this only exercises the
@@ -155,7 +165,9 @@ diagnostics that run before VMXON.
 
 | Path | Purpose |
 | --- | --- |
-| `src/main.rs` | UEFI entry point and the `log!` macro |
+| `src/main.rs` | UEFI entry point and the `log!` macro; copies the image to resident memory and runs on from the copy |
+| `src/resident/` | Staying resident after `ExitBootServices`: the relocated image copy and the `ExitBootServices` event (`mod.rs`), which memory types the OS reclaims (`memory.rs`), PE32+ base relocation (`pe.rs`) |
+| `src/vmx/page.rs` | Page allocation in the resident memory types, with the list of resident allocations bring-up checks |
 | `src/bring_up/` | The bring-up sequence (`mod.rs`), its errors (`error.rs`), status lines (`report.rs`) and the return to firmware (`teardown.rs`) |
 | `src/output.rs` | Output phases and the firmware-free panic handler |
 | `src/serial.rs` | Serial logger usable without firmware, on COM2 (`SerialPort`); COM1 is left to the guest |
@@ -164,6 +176,7 @@ diagnostics that run before VMXON.
 | `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
 | `src/vmx/host/` | What VMX root operation runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
+| `src/vmx/vmcall.rs` | Aleph0's own VMCALLs, told apart by RAX: the end of boot services, and a test call |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | The built-in test guest's code, data, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/ept/` | EPT: support check, the identity map of the whole guest-physical address space (`MapLayout`: PDs for the memory map, UC 1 GiB pages above) with the guest's data page read-only, write grant and INVEPT, and the memory types that follow the guest's MTRRs, with spare PTs (`mod.rs`); the walk of a GPA through the tables and what the CPU refuses in an entry, for the stop on any other EPT exit (`walk.rs`) |
@@ -175,6 +188,7 @@ diagnostics that run before VMXON.
 | `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); the guest's copy of its MTRRs (`guest_mtrrs.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
 | `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
+| `tools/ebs-harness/` | The ExitBootServices test harness, an EFI application of its own (see [docs/RESIDENT.md](docs/RESIDENT.md)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
 | `scripts/run-hyperv.ps1`, `scripts/read-serial.ps1` | Hyper-V test VM runner and serial reader (Windows PowerShell) |
 | `scripts/linux/` | The Linux target's build (`build.sh`, bash for Linux or WSL), its kernel configuration fragment (`aleph0.config`) and its initramfs's `/init` (see [docs/LINUX_GUEST.md](docs/LINUX_GUEST.md)) |
@@ -195,6 +209,7 @@ references it relies on:
 - [NMI.md](docs/NMI.md): catching NMIs in the guest and reinjecting them
 - [CLEAN_STOP.md](docs/CLEAN_STOP.md): stopping the guest, leaving VMX and returning to firmware
 - [FIRMWARE_GUEST.md](docs/FIRMWARE_GUEST.md): launching in place, so the firmware itself runs as the guest
+- [RESIDENT.md](docs/RESIDENT.md): staying resident after `ExitBootServices`: resident memory, the relocated image copy, the event, the test harness
 - [LINUX_GUEST.md](docs/LINUX_GUEST.md): the Linux target, how it is built and staged, and its boot without Aleph0
 
 ## Contributing

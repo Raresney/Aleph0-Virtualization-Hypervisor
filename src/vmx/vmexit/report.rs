@@ -342,6 +342,12 @@ fn report_event(
         ExitEvent::GuestInvalidOpcode => crate::serial_println!(
             "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
         ),
+        ExitEvent::BootServicesEnded => crate::serial_println!(
+            "{tag} VM exit #{number}: VMCALL from Aleph0's ExitBootServices event (rax={rax:#x}): boot services are over; output phase now runtime (serial only); going on at rip={rip:#018x}."
+        ),
+        ExitEvent::TestVmcall => {
+            crate::serial_println!("{tag} VM exit #{number}: test VMCALL (rax={rax:#x}); going on at rip={rip:#018x}.")
+        }
         ExitEvent::Unexpected if guest == GuestKind::BuiltInTest => crate::serial_println!(
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),

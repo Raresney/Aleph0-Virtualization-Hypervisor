@@ -127,8 +127,8 @@ fn next_rip(rip: u64, length: u64) -> Option<u64> {
 #[unsafe(no_mangle)]
 extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     // First, so every line below (and any panic) skips the firmware console.
-    // Put back when the guest resumes. After a stop that returns, bring-up
-    // switches it back once it has left VMX operation.
+    // Put back when the guest resumes ([`resume_phase`]). After a stop that
+    // returns, bring-up switches it back once it has left VMX operation.
     let phase = crate::output::set_phase(Phase::VmExit);
     #[cfg(feature = "host-fault-test")]
     host::fault_on_purpose();
@@ -172,9 +172,20 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
         }
         // Last, after every VMCS write of this exit.
         keep_nmi_window_for_host_nmi(number);
-        crate::output::set_phase(phase);
+        crate::output::set_phase(resume_phase(event, phase));
     }
     stub_return(outcome.action(), number, read.raw_reason())
+}
+
+/// The output phase the guest resumes in after `event`: the one the exit
+/// found (`found`), except after the `ExitBootServices` VMCALL, from which
+/// on it is [`Phase::Runtime`] for good: the firmware console is gone.
+fn resume_phase(event: ExitEvent, found: Phase) -> Phase {
+    if event == ExitEvent::BootServicesEnded {
+        Phase::Runtime
+    } else {
+        found
+    }
 }
 
 /// Halts after a stop of a `guest` whose stop cannot return to bring-up

@@ -34,14 +34,20 @@ verified. [README.md](README.md) covers building and running;
 ```powershell
 cargo build                                            # the .efi
 cargo test-host                                        # host unit tests
-cargo fmt --check                                      # rustfmt.toml: 120 columns
+cargo fmt --all --check                                # rustfmt.toml: 120 columns, both packages
 cargo clippy                                           # lints for the UEFI build
 cargo clippy --features test-guest                     # lints for the regression mode
 cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
+cargo clippy -p ebs-harness                            # lints for the ExitBootServices harness
+cargo clippy -p ebs-harness --features set-virtual-address-map
+cargo test -p ebs-harness --target x86_64-pc-windows-msvc            # its host tests
+cargo clippy -p ebs-harness --target x86_64-pc-windows-msvc --tests  # lints for them
 ```
 
 All of them must pass without warnings. Use your host triple instead of
-`x86_64-pc-windows-msvc` on Linux or macOS.
+`x86_64-pc-windows-msvc` on Linux or macOS. The harness (`tools/ebs-harness`)
+is the workspace's second package; Cargo commands without `-p` act on Aleph0
+alone.
 
 ## Code conventions
 
@@ -128,6 +134,7 @@ planned. A change that affects what runs in VMX operation needs a boot:
 .\scripts\run-hyperv.ps1 -ProcessorCount 1   # the firmware, virtualized in place
 .\scripts\run-hyperv.ps1 -TestGuest          # the test guest: the regression mode
 .\scripts\run-hyperv.ps1 -InjectNmi          # the test guest, with NMI reinjection
+.\scripts\run-hyperv.ps1 -Harness -ProcessorCount 1   # the ExitBootServices harness
 ```
 
 A default build virtualizes the running firmware: Aleph0 returns to it in

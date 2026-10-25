@@ -30,6 +30,7 @@ pub mod page;
 pub mod paging;
 pub mod region;
 pub mod segment;
+pub mod vmcall;
 pub mod vmcs;
 pub mod vmexit;
 pub mod vmxon;

@@ -28,6 +28,7 @@ macro_rules! log {
 mod bring_up;
 mod output;
 mod port;
+mod resident;
 mod serial;
 mod vmx;
 
@@ -52,6 +53,34 @@ fn main() -> Status {
         Err(error) => log!("Serial output disabled on {OUTPUT_PORT}: {error:?}; console only."),
     }
 
+    // The firmware unloads this image when `main` returns, and the OS may
+    // reuse its pages after ExitBootServices; the copy stays.
+    // SAFETY: boot services are active, and the only statics written so far
+    // are the serial port, its readiness, the output phase and the `uefi`
+    // crate's image handle and system table: none an address in the image.
+    match unsafe { resident::ResidentImage::copy() } {
+        Ok(image) => {
+            log!(
+                "Image copied to resident memory: {:#018x} -> {:#018x}, {} bytes, {} fixups applied; running on from the copy.",
+                image.loaded(),
+                image.base(),
+                image.size(),
+                image.fixups(),
+            );
+            // SAFETY: `image` is this image's copy, and nothing below uses
+            // this image's statics again.
+            unsafe { image.call(run) }
+        }
+        Err(error) => {
+            log!("Image not copied to resident memory: {error:?}; Aleph0 cannot outlive boot services.");
+            Status::ABORTED
+        }
+    }
+}
+
+/// Everything after the copy, in the resident image: bring-up, and the
+/// return to the firmware.
+fn run() -> Status {
     // Bring-up returns once the test guest has stopped, once the firmware
     // runs as the guest, or at the first failure. In the first and last case
     // it has left VMX operation if it entered it, unless VMXOFF failed: then

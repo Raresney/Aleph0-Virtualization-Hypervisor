@@ -27,10 +27,11 @@
 //!   purpose (KVM does, for MMIO, and emulates the access in
 //!   `handle_ept_misconfig`), so one means the map is broken.
 //!
-//! The guest's kind (`GuestKind`) only decides the test guest's own exits.
-//! The firmware has no scripted end: its VMCALLs (Hyper-V hypercalls, #27)
-//! and every EPT violation stop it, so it never finishes and runs until an
-//! exit Aleph0 does not handle.
+//! The guest's kind (`GuestKind`) decides the VMCALLs and the test guest's
+//! own exits. The firmware has no scripted end: its VMCALLs are Aleph0's
+//! own (`vmx::vmcall`) or else Hyper-V hypercalls (#27), which stop it, and
+//! so does every EPT violation, so it never finishes and runs until an exit
+//! Aleph0 does not handle.
 //!
 //! An exit reason without a handler stops the guest. Nothing here counts
 //! exits: `vmexit::stats` does, for every guest, from what the handler
@@ -40,6 +41,7 @@ mod emulation;
 mod scenario;
 
 use crate::vmx::mtrr::MtrrCapabilities;
+use crate::vmx::vmcall;
 use crate::vmx::vmcs::GuestKind;
 
 pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in, wrmsr_value};
@@ -439,6 +441,12 @@ pub enum ExitEvent {
     /// them: the guest's CPUID.1:ECX bit 3 (MONITOR/MWAIT) is clear under
     /// Hyper-V, and `cpuid_policy` passes it through.
     GuestInvalidOpcode,
+    /// Aleph0's `ExitBootServices` event ran in the guest
+    /// ([`vmcall::BOOT_SERVICES_ENDED`]): resume past its VMCALL, from now
+    /// on in the runtime output phase.
+    BootServicesEnded,
+    /// A VMCALL that only tests the exit ([`vmcall::TEST`]): resume past it.
+    TestVmcall,
     /// Anything else.
     Unexpected,
 }
@@ -610,7 +618,9 @@ impl ExitEvent {
                 ..ResumePlan::PAST_INSTRUCTION
             }),
             Self::GuestGeneralProtection => ExitAction::Resume(ResumePlan::INJECT_GP),
-            Self::Halted => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
+            Self::Halted | Self::BootServicesEnded | Self::TestVmcall => {
+                ExitAction::Resume(ResumePlan::PAST_INSTRUCTION)
+            }
             Self::GuestInvalidOpcode => ExitAction::Resume(ResumePlan::INJECT_UD),
             Self::LastMainVmcall => ExitAction::Finished,
             Self::EptWriteMissing
@@ -648,7 +658,19 @@ pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent,
         EXIT_REASON_EPT_VIOLATION => (ExitEvent::EptViolation, state),
         EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),
         EXIT_REASON_VMCALL if test_guest => scenario::vmcall(state, &exit),
+        EXIT_REASON_VMCALL => (aleph0_vmcall(&exit), state),
         _ => (ExitEvent::Unexpected, state),
+    }
+}
+
+/// A VMCALL of the firmware, or of the OS after it: one of Aleph0's own
+/// (`vmx::vmcall`), told apart by RAX, or else a Hyper-V hypercall, which
+/// stops the guest until #27 forwards them.
+fn aleph0_vmcall(exit: &ExitInfo) -> ExitEvent {
+    match exit.guest_rax {
+        vmcall::BOOT_SERVICES_ENDED => ExitEvent::BootServicesEnded,
+        vmcall::TEST => ExitEvent::TestVmcall,
+        _ => ExitEvent::Unexpected,
     }
 }
 

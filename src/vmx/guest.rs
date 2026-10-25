@@ -43,8 +43,6 @@
 
 use core::ptr::NonNull;
 
-use uefi::boot::MemoryType;
-
 use super::apic::{APIC_BASE_MODE, APIC_BASE_XAPIC, IA32_APIC_BASE, INTEGRATED_APIC_VERSIONS, LAPIC_VERSION};
 use super::cpuid::ADDRESS_SIZES;
 use super::cr::{self, read_cr4};
@@ -52,7 +50,7 @@ use super::ept::SIZE_2M;
 use super::exit_decision::NMI_VECTOR;
 use super::msr::IA32_KERNEL_GS_BASE;
 use super::mtrr::{self, IA32_MTRR_PHYSBASE0, IA32_MTRRCAP, PHYSMASK_VALID};
-use super::page::{PAGE_SIZE, allocate_zeroed_pages_of_type};
+use super::page::{PAGE_SIZE, RESIDENT_CODE, allocate_zeroed_page, allocate_zeroed_pages_of_type};
 use super::paging::{self, Mapping, WalkError};
 use super::segment::{self, DescriptorTable, GATE_SIZE};
 use super::vmexit::VcpuStats;
@@ -516,20 +514,23 @@ impl GuestMemory {
     /// Allocate the pages, copy the guest code into the code page, write the
     /// seed into the data page, and write the NMI gate into the IDT page.
     ///
-    /// The code and data pages are one two-page `LOADER_CODE` allocation:
-    /// `LOADER_CODE` because firmware may map `LOADER_DATA` no-execute, and
-    /// one allocation because the guest finds the data page right after its
-    /// code. The stack and IDT pages are `LOADER_DATA`. The gate uses the
-    /// current CS selector, which the guest state copies.
+    /// The code and data pages are one two-page [`RESIDENT_CODE`]
+    /// allocation: a code type because firmware may map data types
+    /// no-execute, and one allocation because the guest finds the data page
+    /// right after its code. The stack and IDT pages are resident data. All
+    /// four are resident although the test guest never runs after
+    /// `ExitBootServices`: EPT keeps the data page read-only for the firmware
+    /// guest too, so an OS reusing it would stop at an EPT violation. The
+    /// gate uses the current CS selector, which the guest state copies.
     pub fn allocate() -> Result<Self, GuestMemoryError> {
         let code_bytes = guest_code();
         if code_bytes.len() > PAGE_SIZE {
             return Err(GuestMemoryError::CodeTooLarge);
         }
 
-        let code = allocate_zeroed_pages_of_type(2, MemoryType::LOADER_CODE, GuestMemoryError::CodeAllocationFailed)?;
-        let stack = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::StackAllocationFailed)?;
-        let idt = allocate_zeroed_pages_of_type(1, MemoryType::LOADER_DATA, GuestMemoryError::IdtAllocationFailed)?;
+        let code = allocate_zeroed_pages_of_type(2, RESIDENT_CODE, GuestMemoryError::CodeAllocationFailed)?;
+        let stack = allocate_zeroed_page(GuestMemoryError::StackAllocationFailed)?;
+        let idt = allocate_zeroed_page(GuestMemoryError::IdtAllocationFailed)?;
 
         // SAFETY: `code` is a fresh two-page allocation, and the code is at
         // most one page (checked above).

@@ -283,7 +283,8 @@ which level lacks it.
 ## 5. The guest's data page
 
 The guest gets one more page: the **data page**, allocated together with
-the code page as two contiguous `LOADER_CODE` pages. Contiguity lets the
+the code page as two contiguous `RUNTIME_SERVICES_CODE` pages (`LOADER_CODE`
+until #23, [RESIDENT.md](RESIDENT.md) section 2). Contiguity lets the
 copied guest code find it RIP-relative, without being told an address.
 Aleph0 writes a seed, `0xDA7A`, at its start before launch.
 
@@ -590,9 +591,9 @@ section 10).
   flush them. A performance feature, independent of EPT.
 - **INVEPT before VMXOFF**: the EPT pages are never freed, so cached
   translations of them cannot point at reused memory.
-- **Persistence after `ExitBootServices`**: the EPT tables are
-  `LOADER_DATA`, which the OS may reclaim. They must live in memory the OS
-  does not touch, and be hidden from it.
+- **Hiding the tables**: since #23 the EPT tables are
+  `RUNTIME_SERVICES_DATA`, which the OS keeps ([RESIDENT.md](RESIDENT.md)),
+  but the identity map still shows them to the guest.
 
 ## Cheat sheet
 
