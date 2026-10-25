@@ -251,9 +251,10 @@ mode from bits 11:10, named as KVM's `enum lapic_mode` names them
 (disabled, xAPIC, x2APIC, invalid).
 
 Before VMXON, bring-up checks that the test guest can read the page
-(`check_local_apic`), and stops with `LocalApic` otherwise:
-- the Local APIC is in xAPIC mode (EN = 1, EXTD = 0): in x2APIC mode the
-  registers are MSRs and the page decodes nothing;
+(`check_local_apic`). Only xAPIC mode (EN = 1, EXTD = 0) has one: in x2APIC
+mode the registers are MSRs and the page decodes nothing, so in any other
+mode bring-up prints that the guest skips its read, and the guest jumps
+past it. In xAPIC mode bring-up stops with `LocalApic` unless:
 - the page tables the guest shares with bring-up (the firmware's) map the
   page to itself, since the guest reads it through that linear address;
 - the walk of the page through EPT (section 6) maps it to itself, UC and
@@ -266,7 +267,7 @@ mov ecx, 0x1b                ; IA32_APIC_BASE, which the MSR bitmap passes throu
 rdmsr
 mov ecx, eax
 and ecx, 0xc00               ; EN and EXTD
-cmp ecx, 0x800               ; xAPIC mode, or ud2 with the fail marker
+cmp ecx, 0x800               ; xAPIC mode, or straight to the hlt
 ...
 and rax, r10                 ; bits below MAXPHYADDR (R10, from the MTRR part)
 and rax, -0x1000             ; the register page
@@ -390,8 +391,9 @@ misconfigured entry.
 per level, as the CPU does, until an entry maps a page, is not present, or
 is one the CPU refuses. It returns every entry it read, with what the CPU
 refuses in it, and how the walk ended: mapped (with the HPA, page size,
-access and memory type), not present, misconfigured, or a pointer outside
-the tables. It reads entries through a function its caller gives it.
+access and memory type), not present, misconfigured, a pointer outside
+the tables, or a GPA above the 48 bits a 4-level walk translates, which
+it does not walk: its levels would index it like the GPA 2^48 below. It reads entries through a function its caller gives it.
 `TypeTables::walk`, which the exit handler uses, gives it one that reads
 only the table pages `Ept::build` allocated, so a corrupt pointer is
 reported, never followed into memory that is not EPT. The walk starts from
@@ -416,17 +418,32 @@ a page's memory type must not be 2, 3 or 7. An entry with bits 2:0 = 000b
 is not present: a walk reaching it is an EPT violation, never a
 misconfiguration.
 
-For example, a 2 MiB page at `0x400000` planted with W = 1 but R = 0 would
-print (addresses made up):
+The test-only `ept-misconfig-test` Cargo feature (`run-hyperv.ps1
+-Features ept-misconfig-test`) plants one on purpose: before VMLAUNCH,
+bring-up clears R in the PDPT entry of the Local APIC's GiB
+(`TypeTables::misconfigure`), so the guest's read of the version register
+is an EPT misconfiguration. On Hyper-V the CPU refused the same entry the
+walk names:
 
 ```text
-VM exit #N: an EPT entry on this GPA's path is one the CPU refuses; Ept::build makes none, so the map is wrong.
-VM exit #N: EPT walk of GPA 0x0000000000400010 from EPTP 0x7eaa901e:
-VM exit #N:   PML4 entry 0x0 at 0x7eaa9000 = 0x000000007eaaa007: ok
-VM exit #N:   PDPT entry 0x0 at 0x7eaaa000 = 0x000000007eb2a007: ok
-VM exit #N:   PD entry 0x2 at 0x7eb2a010 = 0x00000000004000b6: write without read
-VM exit #N:   the CPU refuses the last entry: an EPT misconfiguration.
+ept-misconfig-test: the PDPT entry of GiB 0x3 is now W without R.
+...
+VM exit #21: reason=49 (EPT misconfiguration)
+VM exit #21: EPT misconfiguration at GPA 0x00000000fee00030: an EPT entry for it is invalid.
+VM exit #21: guest rip=0x000000007eaa613f instruction length=2
+VM exit #21: EPT walk of GPA 0x00000000fee00030 from EPTP 0x7eaa101e:
+VM exit #21:   PML4 entry 0x0 at 0x7eaa1000 = 0x000000007ea21007: ok
+VM exit #21:   PDPT entry 0x3 at 0x7ea21018 = 0x00000000c0000086: write without read
+VM exit #21:   the CPU refuses the last entry: an EPT misconfiguration.
+VM exit #21: stopping the guest; returning to bring-up.
+...
+Guest stopped at VM exit #21: reason=49 (EPT misconfiguration); Aleph0 did not resume the guest.
 ```
+
+The walk ran in exit context, on Aleph0's own page tables, from the EPTP
+the VMCS holds. The entry is the 1 GiB UC page at `0xc0000000`, RWX
+(`0x87`) less R: `0x86`. The run then tears down as for any stop, and
+returns `ABORTED`.
 
 The host tests check each rule at each level, every entry `Ept::build`
 makes, walks through hand-built tables and through the full Hyper-V map,
@@ -527,7 +544,9 @@ VM exit #21: guest rax=0x0000000000050014 rbx=0x0000000000000000 rcx=0x000000000
   APIC through Aleph0's EPT, and the read added no exit: the run ended
   after 24 exits with `SUCCESS`, and the `-InjectNmi` run after 26, the
   same as before #20.
-- No `EptViolation` or `EptMisconfig` stop came; their walk is
+- No EPT stop came. `-Features ept-misconfig-test` shows the
+  misconfiguration stop and its walk on real VMX (section 6); an
+  `EptViolation` stop prints the same walk after its own line, and is
   host-tested only.
 
 ## 9. What the identity map does not hide

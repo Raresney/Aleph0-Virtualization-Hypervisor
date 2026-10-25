@@ -25,7 +25,7 @@ Verified on Hyper-V with nested virtualization:
       memory types the MTRRs give to RAM and UC for MMIO and everything
       else (1 GiB pages above RAM); a read-only guest page whose write exits
       to Aleph0, which grants the write and retries it; any other EPT exit
-      stops with a walk of the GPA (that stop host-tested only)
+      stops with a walk of the GPA through the tables
 - [x] Keeps the guest's MTRR writes in a copy, never the CPU's, with the #GP
       of a value the CPU would refuse, and gives EPT the types the copy gives
       (the #GP host-tested only)
@@ -126,7 +126,8 @@ guest an NMI after its first VMCALL, and `-Features` builds with the
 test-only switches in `Cargo.toml`: `host-fault-test` and `host-nmi-test` (see
 [docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8),
 `unexpected-exit-test` and `trace-exits` (see
-[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)). `-ProcessorCount` sets the
+[docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)), and `ept-misconfig-test`
+(see [docs/EPT.md](docs/EPT.md) section 6). `-ProcessorCount` sets the
 vCPUs (2 by default, 1 with `-InjectNmi`).
 
 **The Linux target:** `scripts/linux/build.sh` (Linux or WSL) builds the
