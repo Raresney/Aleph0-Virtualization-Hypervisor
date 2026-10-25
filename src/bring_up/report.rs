@@ -9,7 +9,7 @@ use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
 use crate::vmx::ept::{Ept, EptSupport, TypeTables, WalkEnd};
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
-use crate::vmx::guest_state::GuestState;
+use crate::vmx::guest_state::{GuestEntry, GuestState};
 use crate::vmx::host::{HostEnvironment, InterruptStack};
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
@@ -276,7 +276,12 @@ pub(super) fn passthrough_state(before: PassthroughState, after: PassthroughStat
 /// Prints the guest state that was written to the VMCS. If VM entry later
 /// fails with "invalid guest state" (exit reason 33), these are the values
 /// the CPU rejected.
-pub(super) fn guest_state(state: &GuestState) {
+pub(super) fn guest_state(state: &GuestState, entry: GuestEntry) {
     state.report(format_args!("Guest"));
+    if let GuestEntry::InPlace { .. } = entry {
+        log!(
+            "Guest rip, rsp and rflags are placeholders: VMLAUNCH writes its own, and the code after it goes on as the guest."
+        );
+    }
     log!("VMCS guest fields written and read back; VM entry not attempted.");
 }

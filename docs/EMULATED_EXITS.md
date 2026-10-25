@@ -814,12 +814,13 @@ outside a shadow cost no extra VMWRITE.
 | `GuestKind` | Bitmap | Why |
 |---|---|---|
 | `BuiltInTest` | all ones | its IDT has only the NMI gate; its `ud2` paths rely on the #UD exit |
-| `OwnIdt` | 0 | the guest takes its own faults (Linux builds its early page tables from #PF) |
+| `Firmware` | 0 | the firmware takes its own faults, as an OS will (Linux builds its early page tables from #PF) |
 
 With a bitmap of 0, NMIs still exit (the NMI-exiting pin control, not the
 bitmap), and a fault the guest cannot handle ends in a triple fault (reason
-2), which stops it. Bring-up selects `BuiltInTest`; `OwnIdt` is for the
-firmware as the guest (#21).
+2), which stops it. Bring-up selects `GuestKind::SELECTED`: `Firmware` by
+default, `BuiltInTest` with the `test-guest` Cargo feature (#21, see
+[FIRMWARE_GUEST.md](FIRMWARE_GUEST.md)).
 
 **The test.** The test guest runs one `hlt` after its I/O checks, with
 IF = 0, so no interrupt could end the halt; only Aleph0 moving RIP past it
@@ -846,7 +847,7 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Injected #GP | `0x80000B0D`, error code 0, RIP unchanged |
 | Injected #UD (MWAIT, MONITOR) | `0x80000306`, no error code, RIP unchanged |
 | Exit reason 12 / 36 / 39 | HLT / MWAIT / MONITOR |
-| Exception bitmap | all ones for the test guest, 0 for a guest with its own IDT |
+| Exception bitmap | all ones for the test guest, 0 for the firmware |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
 | `guest::expected_stats` | cpuid 2, MSR reads 2, MSR writes 2, MTRR reads 3, MTRR writes 7, in 2, out 2, halt 1, exceptions 0 |

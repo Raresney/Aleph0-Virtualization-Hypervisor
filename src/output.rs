@@ -62,8 +62,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// Stops this CPU permanently, with interrupts disabled.
 ///
 /// Used wherever execution must end without firmware help: after a panic,
-/// and after an exception in VMX root operation (`vmx::host`). The VM-exit
-/// handler does not halt; it hands a stop back to bring-up.
+/// after an exception in VMX root operation (`vmx::host`), and after a stop
+/// of the firmware guest, which has nothing to return to. The test guest's
+/// stop does not halt; the VM-exit handler hands it back to bring-up.
 ///
 /// * `CLI` clears RFLAGS.IF, so maskable interrupts (timer, devices) are no
 ///   longer delivered. During boot services UEFI runs with interrupts on and
@@ -95,6 +96,7 @@ pub fn halt_forever() -> ! {
 ///
 /// `#[repr(u8)]` with explicit values makes `phase as u8` a fixed number, so
 /// the phase can live in an [`AtomicU8`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Phase {
     /// Ordinary UEFI code before `ExitBootServices`: `main` and bring-up,
@@ -102,13 +104,25 @@ pub enum Phase {
     /// which the firmware console may be used.
     BootServices = 0,
     /// After `ExitBootServices`: the firmware console is gone and the OS
-    /// owns the machine.
-    #[expect(dead_code, reason = "set after ExitBootServices, ROADMAP section 5")]
+    /// owns the machine. Nothing sets it yet (ROADMAP section 0b).
     Runtime = 1,
-    /// From the first VM exit until teardown switches back: the VM-exit
-    /// handler, then bring-up until it has left VMX operation. Interrupts
-    /// off, firmware state unknown.
+    /// The VM-exit handler, which puts the phase it found back when it
+    /// resumes the guest (in place, the guest is Aleph0's own code too, which
+    /// may use the console again); after a stop that returns to bring-up,
+    /// bring-up until teardown has left VMX operation. Interrupts off,
+    /// firmware state unknown.
     VmExit = 2,
+}
+
+impl Phase {
+    /// The phase stored as `value`.
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::BootServices,
+            1 => Self::Runtime,
+            _ => Self::VmExit,
+        }
+    }
 }
 
 /// The current [`Phase`], stored as its `u8` value. Starts in boot services,
@@ -118,9 +132,10 @@ pub enum Phase {
 /// only one CPU runs this code, so `Relaxed` would do.
 static PHASE: AtomicU8 = AtomicU8::new(Phase::BootServices as u8);
 
-/// Switches the output phase; later `log!` lines and panics follow it.
-pub fn set_phase(phase: Phase) {
-    PHASE.store(phase as u8, Ordering::SeqCst);
+/// Switches the output phase, and returns the one it replaces; later `log!`
+/// lines and panics follow it.
+pub fn set_phase(phase: Phase) -> Phase {
+    Phase::from_u8(PHASE.swap(phase as u8, Ordering::SeqCst))
 }
 
 /// Whether the firmware console may be used right now.

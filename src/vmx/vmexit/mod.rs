@@ -7,8 +7,9 @@
 //! to 0x2), and the guest's general-purpose registers are still live in the
 //! CPU, so the stub saves them before any Rust code can clobber them.
 //!
-//! `bring_up::run` enters the guest through `vmcs::launch`, so the guest's
-//! first VM exit lands here. The handler (`handler.rs`) prints each exit over
+//! `bring_up::run` enters the guest through `vmcs::launch` (the test guest)
+//! or `vmcs::launch_in_place` (the firmware), so the guest's first VM exit
+//! lands here. The handler (`handler.rs`) prints each exit over
 //! serial, and `exit_decision::decide` says what it is: an instruction to
 //! execute for the guest (CPUID, RDMSR, WRMSR, IN, OUT), an access to its
 //! copy of its MTRRs (`guest_mtrrs.rs`), or a #GP to inject for an MSR it
@@ -17,8 +18,10 @@
 //! resume past, an NMI to reinject, an NMI window to inject in, the last
 //! planned VMCALL, or something unexpected. To resume, the
 //! handler updates the VMCS and returns 0, and the stub executes VMRESUME. To
-//! stop, it returns a stop value, and the stub jumps back into
-//! `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`). The
+//! stop the test guest, it returns a stop value, and the stub jumps back
+//! into `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`).
+//! A stop of the firmware has no launch frame to return to, so the handler
+//! halts once it has printed the stop. The
 //! lines that only print live in `report.rs`; how much of each exit they
 //! print is `policy.rs`'s decision. Every exit is counted in the vCPU's
 //! statistics (`stats.rs`). Every stop adds the guest's state and registers
@@ -186,7 +189,8 @@ vmexit_entry:
     call vmexit_handler
 
     // RAX = 0: resume the guest. Anything else is a stop value: return it
-    // from vmx_launch (vmx/vmcs/launch.rs), abandoning this stack.
+    // from vmx_launch (vmx/vmcs/launch.rs), abandoning this stack. Only the
+    // test guest's stops get here; the firmware's halt in the handler.
     test rax, rax
     jnz vmx_return_to_launcher
 

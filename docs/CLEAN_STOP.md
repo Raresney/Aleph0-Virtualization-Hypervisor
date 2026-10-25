@@ -300,6 +300,10 @@ with ABORTED.`
 - After `ExitBootServices` Aleph0 must stay resident instead of returning
   (ROADMAP section 5). The stop path is then the way to shut the hypervisor
   down, not the normal end of a run.
+- All of this is the test guest's path, the regression mode (Cargo feature
+  `test-guest`). A default build virtualizes the firmware in place, which
+  has no stop to return from: a stop of the firmware halts after its report,
+  and no teardown runs. See [FIRMWARE_GUEST.md](FIRMWARE_GUEST.md).
 
 ## Cheat sheet
 

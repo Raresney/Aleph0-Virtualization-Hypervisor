@@ -1,5 +1,7 @@
 //! The test guest's own exits: its write to the EPT-protected data page,
-//! its main VMCALLs, and NMI reinjection.
+//! its main VMCALLs, and NMI reinjection. `decide` sends only the test
+//! guest's VMCALLs and EPT violations here; NMI reinjection serves every
+//! guest, the firmware too.
 //!
 //! The guest (`guest.rs`) writes its read-only data page, makes two main
 //! VMCALLs, with `GUEST_MARKER` and then `GUEST_MARKER + 1` in RAX, and
