@@ -21,7 +21,7 @@ use core::fmt;
 use super::level::{Level, Pd, Pdpt, Pml4, Pt};
 use super::{
     ADDRESS_MASK, EPT_EXECUTE, EPT_READ, EPT_RWX, EPT_WRITE, EntryRules, Eptp, LARGE_PAGE, MEMORY_TYPE_BITS,
-    MEMORY_TYPE_SHIFT, leaf_memory_type,
+    MEMORY_TYPE_SHIFT, WALK_ADDRESS_BITS, leaf_memory_type,
 };
 use crate::vmx::mtrr::MemoryType;
 
@@ -237,6 +237,10 @@ pub enum WalkEnd {
     /// The last entry points to `table` (or the EPTP does, with no entry
     /// read), which is not one of the tables: not followed.
     OutsideTables { table: u64 },
+    /// The GPA has a bit set above the 48 a 4-level walk translates, which
+    /// a CPU whose MAXPHYADDR is larger lets the guest use: nothing maps
+    /// it, and no entry is read.
+    BeyondWalk,
 }
 
 impl fmt::Display for WalkEnd {
@@ -267,6 +271,7 @@ impl fmt::Display for WalkEnd {
             Self::OutsideTables { table } => {
                 write!(f, "points to {table:#x}, none of Aleph0's EPT tables: not followed")
             }
+            Self::BeyondWalk => f.write_str("beyond the 48 bits a 4-level walk translates: nothing maps the GPA"),
         }
     }
 }
@@ -293,6 +298,15 @@ impl EptWalk {
 /// the tables, where the walk stops instead of reading on.
 pub fn walk(eptp: Eptp, gpa: u64, rules: EntryRules, read: impl Fn(u64) -> Option<u64>) -> EptWalk {
     let mut entries = [None; 4];
+    // The levels index bits 47:12 only: walked, such a GPA would alias one
+    // 2^48 lower.
+    if gpa >> WALK_ADDRESS_BITS != 0 {
+        return EptWalk {
+            gpa,
+            entries,
+            end: WalkEnd::BeyondWalk,
+        };
+    }
     let mut table = eptp.pml4();
     let mut level = WalkLevel::Pml4;
     for slot in &mut entries {

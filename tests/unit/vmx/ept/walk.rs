@@ -355,6 +355,25 @@ fn a_pointer_outside_the_tables_is_reported_and_not_followed() {
 }
 
 #[test]
+fn a_gpa_above_48_bits_is_not_walked_into_the_one_it_would_alias() {
+    // Walked, 1 << 48 would index like GPA 0 and read as mapped there.
+    let memory = memory();
+    for gpa in [1 << 48, (1 << 51) | 0x5123] {
+        let beyond = walk_in(&memory, gpa, HYPER_V);
+        assert_eq!(beyond.end, WalkEnd::BeyondWalk, "{gpa:#x}");
+        assert_eq!(beyond.entries().count(), 0);
+    }
+    assert!(matches!(
+        walk_in(&memory, (1 << 48) - 1, HYPER_V).end,
+        WalkEnd::NotPresent
+    ));
+    assert_eq!(
+        WalkEnd::BeyondWalk.to_string(),
+        "beyond the 48 bits a 4-level walk translates: nothing maps the GPA"
+    );
+}
+
+#[test]
 fn levels_name_and_index_like_the_typed_levels() {
     let gpa = (3 << 39) | (5 << 30) | (7 << 21) | (9 << 12);
     assert_eq!(ALL_LEVELS.map(|level| level.index(gpa)), [3, 5, 7, 9]);
