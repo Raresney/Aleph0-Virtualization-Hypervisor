@@ -142,20 +142,41 @@ job waits for a line only the test guest's VMCALLs print. The
 turn it on themselves; `host-fault-test` and `trace-exits` work in both
 modes.
 
-What to expect from the firmware, which nothing has shown on real VMX yet:
+On Hyper-V Gen 2, the keyboard, disk and video are VMBus devices: the
+firmware's hypercalls are VMCALLs, which stop it, and its reads and writes
+of the synthetic MSRs (`0x40000000`-`0x400000FF`) lie outside the MSR
+bitmap, so they get a #GP. The first Hyper-V run showed which comes first:
 
-- its idle loop runs HLT, which exits and resumes at once, so the exit
-  counts grow quickly; the print policy keeps the first 16 of each reason
-  in full and then one summary line per power of two;
-- on Hyper-V Gen 2, the keyboard, disk and video are VMBus devices: the
-  firmware's hypercalls are VMCALLs, which stop it, and its reads and writes
-  of the synthetic MSRs (`0x40000000`-`0x400000FF`) lie outside the MSR
-  bitmap, so they get a #GP. Whichever comes first is the input to #27.
+```text
+Launching the firmware in place with VMLAUNCH; its VM exits are reported on serial only.
+VM exit #1: CPUID leaf=0x1 subleaf=0x1 -> ... resuming at rip=0x000000007ff1b167.
+   (#2 to #6: CPUID leaves 0 and 1 at the same RIP)
+VM exit #7: reason=31 (RDMSR)
+VM exit #7: MSR 0x40000020 is outside the MSR bitmap, or the WRMSR value is not canonical; injecting #GP(0) at rip=0x000000007ff1d9c8.
+VM exit #8: reason=2 (triple fault)
+VM exit #8: guest rip=0x00000000047466e4 instruction length=0
+VM exit #8: NOT an exit Aleph0 handles for the firmware.
+VM exit #8: stopping the guest; halting: the firmware has nothing to return to.
+VM exit #8: guest gdtr=0x000000007eaba000/0x004f idtr=0x0000000000000000/0x0000; ...
+VM exit #8: exits by reason: 2 (triple fault)=1, 10 (CPUID)=6, 31 (RDMSR)=1.
+```
+
+The launch itself worked: the console showed the tag of `main`'s line
+after it, so Aleph0's own code ran on as the guest. Drawing that line, the
+firmware read `0x40000020`, `HV_X64_MSR_TIME_REF_COUNT` (the partition
+reference counter its timer code uses), got the #GP, and its fatal-error
+path loaded a zero IDT (the stop's `idtr=0/0`) and triple-faulted on
+purpose. The firmware cannot run on until #27 decides what the guest sees
+of that MSR. The test guest's runs printed the same exits as before: 24
+and `SUCCESS`, and 26 with `-InjectNmi`.
 
 ## 6. Not covered yet
 
-- The Hyper-V runs: the firmware for a fixed time with no unexpected stop,
-  and the regression mode with and without `-InjectNmi` (ROADMAP section 5).
+- The firmware running for a fixed time with no unexpected stop: it stops at
+  its first synthetic MSR, `0x40000020` (section 5).
+- Its idle loop: HLT exits and resumes at once, so the exit counts would
+  grow quickly, with the print policy keeping the first 16 of each reason in
+  full and then one summary line per power of two. The run never got there.
 - Hypercalls and synthetic MSRs (#27); CR0/CR4 masks, so the firmware sees
   CR4.VMXE today (#24); re-delivering interrupted events and the interrupt
   policy for an OS (#26).

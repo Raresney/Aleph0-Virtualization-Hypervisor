@@ -35,8 +35,8 @@ Verified on Hyper-V with nested virtualization:
       the guest's own IDT
 - [x] Reports every exit over serial, then leaves VMX operation and returns to
       firmware
-- [ ] Virtualize the running firmware in place (built and host-tested; the
-      Hyper-V run is pending)
+- [ ] Virtualize the running firmware in place (it launches on Hyper-V, then
+      stops at its first synthetic MSR, `0x40000020`, until #27)
 - [ ] Stay resident after `ExitBootServices`
 - [ ] Hide Aleph0's own memory from the guest through EPT
 - [ ] An OS guest on multiple vCPUs
