@@ -69,42 +69,16 @@ fn ept(hpa: u64, access: u64, memory_type: MemoryType) -> WalkEnd {
 }
 
 #[test]
-fn the_registers_are_readable_in_xapic_mode_through_identity_maps_and_uc() {
+fn the_registers_are_readable_through_identity_maps_and_uc() {
     let base = 0xFEE0_0000;
     assert_eq!(
-        check_registers(
-            XAPIC_BSP,
-            base,
-            mapped_at(base),
-            ept(base, EPT_RWX, MemoryType::Uncacheable)
-        ),
+        check_registers(base, mapped_at(base), ept(base, EPT_RWX, MemoryType::Uncacheable)),
         Ok(())
     );
     assert_eq!(
-        check_registers(
-            XAPIC_BSP,
-            base,
-            mapped_at(base),
-            ept(base, EPT_READ, MemoryType::Uncacheable)
-        ),
+        check_registers(base, mapped_at(base), ept(base, EPT_READ, MemoryType::Uncacheable)),
         Ok(())
     );
-}
-
-#[test]
-fn any_mode_but_xapic_is_refused() {
-    let base = 0xFEE0_0000;
-    for apic_base in [ApicBase(0xFEE0_0000), ApicBase(0xFEE0_0C00), ApicBase(0xFEE0_0400)] {
-        assert_eq!(
-            check_registers(
-                apic_base,
-                base,
-                mapped_at(base),
-                ept(base, EPT_RWX, MemoryType::Uncacheable)
-            ),
-            Err(LocalApicError::Mode(apic_base))
-        );
-    }
 }
 
 #[test]
@@ -113,14 +87,14 @@ fn the_guests_page_tables_must_map_the_registers_to_themselves() {
     let uc = ept(base, EPT_RWX, MemoryType::Uncacheable);
     let unmapped = Err(WalkError::NotPresent { level: 3 });
     assert_eq!(
-        check_registers(XAPIC_BSP, base, unmapped, uc),
+        check_registers(base, unmapped, uc),
         Err(LocalApicError::GuestMapping {
             address: base,
             translation: unmapped
         })
     );
     assert!(matches!(
-        check_registers(XAPIC_BSP, base, mapped_at(0x8000_0000), uc),
+        check_registers(base, mapped_at(0x8000_0000), uc),
         Err(LocalApicError::GuestMapping { .. })
     ));
 }
@@ -136,7 +110,7 @@ fn ept_must_map_the_registers_to_themselves_uc_and_readable() {
         ept(base, 0, MemoryType::Uncacheable),
     ] {
         assert_eq!(
-            check_registers(XAPIC_BSP, base, mapped_at(base), end),
+            check_registers(base, mapped_at(base), end),
             Err(LocalApicError::EptMapping { address: base, end }),
             "{end:?}"
         );

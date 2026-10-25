@@ -97,12 +97,10 @@ impl fmt::Display for ApicBase {
     }
 }
 
-/// Why the test guest could not read the Local APIC's registers.
+/// Why the test guest could not read the Local APIC's registers, in xAPIC
+/// mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalApicError {
-    /// The Local APIC is not in xAPIC mode, so there is no register page to
-    /// read.
-    Mode(ApicBase),
     /// The page tables the guest shares with bring-up do not map the
     /// register page at `address` to itself: how they translate it instead.
     GuestMapping {
@@ -114,21 +112,17 @@ pub enum LocalApicError {
     EptMapping { address: u64, end: WalkEnd },
 }
 
-/// Checks that the test guest can read the registers of the Local APIC
-/// IA32_APIC_BASE describes (`apic_base`): xAPIC mode; the guest's page
-/// tables translating the register page at `address` to itself
-/// (`translation`, as `paging::walk_current` gives it), since the guest
-/// reads it through that linear address; and EPT mapping it to itself, UC,
-/// readable, as the walk of it ended (`walk_end`).
+/// Checks that the test guest can read the registers of a Local APIC in
+/// xAPIC mode, at `address`: the guest's page tables translating the page
+/// to itself (`translation`, as `paging::walk_current` gives it), since the
+/// guest reads it through that linear address, and EPT mapping it to
+/// itself, UC, readable, as the walk of it ended (`walk_end`). In any other
+/// mode there is no register page, and the guest skips its read.
 pub fn check_registers(
-    apic_base: ApicBase,
     address: u64,
     translation: Result<Mapping, WalkError>,
     walk_end: WalkEnd,
 ) -> Result<(), LocalApicError> {
-    if apic_base.mode() != LapicMode::Xapic {
-        return Err(LocalApicError::Mode(apic_base));
-    }
     if translation.map(|mapping| mapping.physical) != Ok(address) {
         return Err(LocalApicError::GuestMapping { address, translation });
     }

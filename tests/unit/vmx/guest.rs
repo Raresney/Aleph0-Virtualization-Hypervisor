@@ -106,7 +106,7 @@ fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then
             0x89, 0xC1, // mov ecx, eax
             0x81, 0xE1, 0x00, 0x0C, 0x00, 0x00, // and ecx, APIC_BASE_MODE
             0x81, 0xF9, 0x00, 0x08, 0x00, 0x00, // cmp ecx, APIC_BASE_XAPIC
-            0x75, 0x65, // jne guest_emulation_failed (+101)
+            0x75, 0x1B, // jne guest_local_apic_done (+27): not xAPIC, no read
             0x48, 0xC1, 0xE2, 0x20, // shl rdx, 32
             0x48, 0x09, 0xD0, // or rax, rdx
             0x4C, 0x21, 0xD0, // and rax, r10

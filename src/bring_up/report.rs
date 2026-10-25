@@ -153,6 +153,12 @@ pub(super) fn local_apic(apic_base: ApicBase, registers: u64, walk_end: WalkEnd)
     );
 }
 
+/// Prints that the Local APIC IA32_APIC_BASE describes is not in xAPIC mode,
+/// so the test guest has no register page to read, and skips its read.
+pub(super) fn local_apic_skipped(apic_base: ApicBase) {
+    log!("Local APIC: IA32_APIC_BASE={apic_base}: no register page to read; the test guest skips its read.");
+}
+
 /// Prints what VMX root operation will run on: the host page tables next to
 /// the firmware's CR3 they replace, the GDT, TSS and IDT, and the interrupt
 /// stacks.

@@ -23,9 +23,10 @@
 //! reaches only Aleph0's copy of its MTRRs and the EPT memory types. Then it
 //! reads the Local APIC's version register, device memory above RAM that
 //! EPT maps UC (`vmx::apic`), which must not exit and must hold a version an
-//! integrated APIC has. Then it runs one `hlt` with IF = 0, with that
-//! register in EAX for the exit's report: only Aleph0 moving RIP past it
-//! lets the guest go on.
+//! integrated APIC has; outside xAPIC mode there is no register page, and it
+//! skips the read. Then it runs one `hlt` with IF = 0, with that register
+//! (or IA32_APIC_BASE's low half) in EAX for the exit's report: only Aleph0
+//! moving RIP past it lets the guest go on.
 //!
 //! Guest RIP is [`GuestMemory::code_base`], guest RSP
 //! [`GuestMemory::stack_top`], and guest IDTR [`GuestMemory::idt`];
@@ -111,8 +112,7 @@ pub const GUEST_IO_VALUE: u8 = 0xA5;
 pub const GUEST_MTRR_BASE: u64 = SIZE_2M;
 
 /// Value the guest loads into EAX before `ud2` when an emulated instruction
-/// returned the wrong value, or the Local APIC is not in xAPIC mode or
-/// reads as no integrated APIC. The #UD exit (vector 6) stops the guest,
+/// returned the wrong value, or the Local APIC reads as no integrated APIC. The #UD exit (vector 6) stops the guest,
 /// and this marker in RAX on serial says why; its RIP says which check.
 pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 
@@ -255,17 +255,18 @@ guest_code_start:
     mov eax, r11d
     mov edx, r12d
     wrmsr
-    // The Local APIC: IA32_APIC_BASE, which the MSR bitmap passes through,
-    // must say xAPIC mode, where its registers are a page of MMIO at the
-    // base address (bits MAXPHYADDR-1:12, R10 still masking the first).
-    // EPT maps that page UC, outside RAM, so the read of the version
-    // register must not exit, and must give an integrated APIC's version.
+    // The Local APIC: in xAPIC mode, which IA32_APIC_BASE (passed through by
+    // the MSR bitmap) says, its registers are a page of MMIO at the base
+    // address (bits MAXPHYADDR-1:12, R10 still masking the first). EPT maps
+    // that page UC, outside RAM, so the read of the version register must
+    // not exit, and must give an integrated APIC's version. In any other
+    // mode there is no page to read: EAX keeps the MSR's low half.
     mov ecx, {apic_base_msr}
     rdmsr
     mov ecx, eax
     and ecx, {apic_mode_bits}
     cmp ecx, {xapic_mode}
-    jne guest_emulation_failed
+    jne guest_local_apic_done
     shl rdx, 32
     or rax, rdx
     and rax, r10
@@ -275,6 +276,7 @@ guest_code_start:
     jb guest_emulation_failed
     cmp al, {apic_version_max}
     ja guest_emulation_failed
+guest_local_apic_done:
     // HLT exits (HLT exiting is on), with the version register in EAX. IF =
     // 0, so no interrupt could ever end the halt: the guest goes on only
     // because Aleph0 resumes past it.

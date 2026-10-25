@@ -33,9 +33,9 @@ pub enum BringUpError {
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
     /// failed. Both happen before VMXON.
     Ept(EptError),
-    /// The test guest could not read the Local APIC's registers: not in
-    /// xAPIC mode, or EPT does not map their page to itself, UC. Before
-    /// VMXON.
+    /// The test guest could not read the Local APIC's registers in xAPIC
+    /// mode: its page tables or EPT do not map their page to itself, EPT
+    /// with UC. Before VMXON.
     LocalApic(LocalApicError),
     /// Building the page tables, GDT, TSS or IDT that VMX root operation
     /// runs on failed. Before VMXON.
@@ -210,9 +210,6 @@ pub fn report_error(error: BringUpError) {
             "EPT setup failed: the memory map reaches {end:#x}, past {limit:#x}, the end of the guest-physical address space (MAXPHYADDR, at most the 48 bits a 4-level EPT walk translates)."
         ),
         BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
-        BringUpError::LocalApic(LocalApicError::Mode(apic_base)) => log!(
-            "The Local APIC is not in xAPIC mode (IA32_APIC_BASE={apic_base}): it has no register page for the test guest to read."
-        ),
         BringUpError::LocalApic(LocalApicError::GuestMapping { address, translation }) => log!(
             "The page tables the guest shares do not map the Local APIC's registers at {address:#x} to themselves: {translation:?}."
         ),
