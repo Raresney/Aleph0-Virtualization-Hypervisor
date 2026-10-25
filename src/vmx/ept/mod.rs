@@ -47,6 +47,11 @@
 //! and [`ProtectedPage::grant_write`] makes it writable when that exit
 //! arrives.
 //!
+//! Any other EPT violation, and every EPT misconfiguration, means the map
+//! is wrong: `walk.rs` follows the GPA through the tables as the CPU does,
+//! and names what the CPU refuses in each entry, so the exit handler can
+//! print where the map went wrong ([`TypeTables::walk`]).
+//!
 //! The guest's writes to its MTRRs change the types its memory should have.
 //! [`TypeTables::apply`] rewrites the entries whose type changed and runs
 //! INVEPT. A 2 MiB region whose pages come to differ in type needs a PT,
@@ -68,6 +73,10 @@ use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::fields::SECONDARY_ENABLE_EPT;
 
 use self::level::{Level, Pd, Pdpt, Pml4, Pt, TableLevel};
+
+mod walk;
+
+pub use walk::{EptWalk, walk};
 
 /// Entry bit 0: reads allowed.
 pub const EPT_READ: u64 = 1 << 0;
@@ -106,6 +115,8 @@ const WALK_ADDRESS_BITS: u8 = 48;
 const LOW_DEVICE_END: u64 = 4 * SIZE_1G;
 
 // IA32_VMX_EPT_VPID_CAP bits this module needs.
+/// Bit 0: an entry may allow execution without reads (execute-only).
+const CAP_EXECUTE_ONLY: u64 = 1 << 0;
 /// Bit 6: 4-level EPT page walks.
 const CAP_WALK_LENGTH_4: u64 = 1 << 6;
 /// Bit 14: the EPT tables themselves may be write-back.
@@ -178,6 +189,9 @@ pub struct EntryRules {
     /// Whether a PDPT entry may map a 1 GiB page (IA32_VMX_EPT_VPID_CAP
     /// bit 17).
     pub huge_pages: bool,
+    /// Whether an entry may allow execution alone, X = 1 with R = W = 0
+    /// (bit 0). Aleph0 never makes such an entry; the checks need to know.
+    pub execute_only: bool,
 }
 
 /// What this CPU's EPT offers Aleph0: see [`check_support`].
@@ -227,6 +241,7 @@ pub fn check_support(
         rules: EntryRules {
             physical_address_bits,
             huge_pages: ept_vpid_cap & CAP_1G_PAGES != 0,
+            execute_only: ept_vpid_cap & CAP_EXECUTE_ONLY != 0,
         },
     })
 }
@@ -526,9 +541,21 @@ impl Eptp {
         Self((pml4 & ADDRESS_MASK) | MemoryType::WriteBack.raw() | EPTP_WALK_LENGTH_4)
     }
 
+    /// The pointer as the VMCS EPT_POINTER field holds it, read back in
+    /// exit context: whatever its bits, [`walk`] only reads the tables it
+    /// is given.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// The pointer as the CPU reads it.
     pub fn raw(self) -> u64 {
         self.0
+    }
+
+    /// The physical address of the PML4 table it names.
+    pub fn pml4(self) -> u64 {
+        self.0 & ADDRESS_MASK
     }
 }
 
@@ -1006,6 +1033,7 @@ impl Ept {
             table_pages: 1 + layout.pdpts() + layout.pd_gibs + pt_count,
         };
         let tables = TypeTables {
+            pml4,
             pdpts: pdpts as *mut EptEntry<Pdpt>,
             layout,
             pds: pds as *mut EptEntry<Pd>,
@@ -1020,6 +1048,7 @@ impl Ept {
             ram_len: ram.ranges().len(),
             eptp: ept.eptp,
             invept: support.invept,
+            rules: support.rules,
         };
         publish(ProtectedPage {
             gpa: protected_page,
@@ -1078,6 +1107,8 @@ impl Ept {
 /// map back. Made once, by `build`; the exit handler keeps it
 /// (`vmexit::guest_mtrrs`), and applies the guest's MTRRs with it.
 pub struct TypeTables {
+    /// The PML4's physical address.
+    pml4: u64,
     /// The PDPTs, back to back: entry g maps GiB g, `layout.gibs` of them.
     pdpts: *mut EptEntry<Pdpt>,
     layout: MapLayout,
@@ -1100,6 +1131,8 @@ pub struct TypeTables {
     ram_len: usize,
     eptp: Eptp,
     invept: InveptType,
+    /// What the CPU refuses in an entry, for [`walk`].
+    rules: EntryRules,
 }
 
 impl TypeTables {
@@ -1153,6 +1186,43 @@ impl TypeTables {
     /// The INVEPT type [`apply`](Self::apply) uses.
     pub fn invept(&self) -> InveptType {
         self.invept
+    }
+
+    /// Walks `gpa` through the tables `eptp` names ([`walk`]), reading only
+    /// the table pages `build` allocated ([`contains_entry`](Self::contains_entry)):
+    /// a pointer to anything else is reported, never followed. For the exit
+    /// handler's report of an EPT violation or misconfiguration, which
+    /// passes the EPTP the VMCS holds, and for bring-up's check of a device
+    /// page.
+    pub fn walk(&self, eptp: Eptp, gpa: u64) -> EptWalk {
+        walk(eptp, gpa, self.rules, |address| {
+            self.contains_entry(address).then(|| {
+                // SAFETY: `address` is an aligned entry inside one of the
+                // table pages `build` allocated, which are never freed and
+                // identity-mapped: by UEFI at bring-up, by Aleph0's host page
+                // tables, which map the memory map's range, in exit context.
+                // Only `apply` writes them, through `&mut self`, so not while
+                // this reads; `ProtectedPage::grant_write` writes one PT
+                // entry in the same exit handler, never during a walk.
+                unsafe { (address as *const u64).read_volatile() }
+            })
+        })
+    }
+
+    /// Whether `address` is an 8-byte aligned entry inside one of the
+    /// table pages `build` allocated: the PML4, the PDPTs, the PDs or the
+    /// PTs, spare ones included.
+    fn contains_entry(&self, address: u64) -> bool {
+        let tables = [
+            (self.pml4, 1),
+            (self.pdpts as u64, self.layout.pdpts()),
+            (self.pds as u64, self.layout.pd_gibs),
+            (self.pts_address, self.pt_count),
+        ];
+        address.is_multiple_of(size_of::<u64>() as u64)
+            && tables
+                .iter()
+                .any(|&(start, pages)| (start..start + (pages * PAGE_SIZE) as u64).contains(&address))
     }
 
     /// How many PTs are free, set aside or given back.
