@@ -76,7 +76,7 @@ use self::level::{Level, Pd, Pdpt, Pml4, Pt, TableLevel};
 
 mod walk;
 
-pub use walk::{EptWalk, walk};
+pub use walk::{EptWalk, WalkEnd, walk};
 
 /// Entry bit 0: reads allowed.
 pub const EPT_READ: u64 = 1 << 0;

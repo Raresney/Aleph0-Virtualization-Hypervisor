@@ -5,7 +5,8 @@
 
 use super::PassthroughState;
 use crate::vmx;
-use crate::vmx::ept::{Ept, EptSupport, TypeTables};
+use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
+use crate::vmx::ept::{Ept, EptSupport, TypeTables, WalkEnd};
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::GuestState;
@@ -140,6 +141,16 @@ pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
     for run in types.region_runs(0, ept.end()) {
         log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
     }
+}
+
+/// Prints IA32_APIC_BASE and how EPT maps the Local APIC's register page at
+/// `registers`, as the walk of it ended (`walk_end`), for the test guest's
+/// read of its version register.
+pub(super) fn local_apic(apic_base: ApicBase, registers: u64, walk_end: WalkEnd) {
+    log!(
+        "Local APIC: IA32_APIC_BASE={apic_base}; its registers at {registers:#x} are {walk_end}; the test guest reads the version register at {:#x}.",
+        registers + LAPIC_VERSION,
+    );
 }
 
 /// Prints what VMX root operation will run on: the host page tables next to

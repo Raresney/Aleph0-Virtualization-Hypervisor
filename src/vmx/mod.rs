@@ -13,6 +13,7 @@
 //! on a CPU that doesn't (per CPUID) risks a #GP with no exception handler
 //! installed yet.
 
+pub mod apic;
 pub mod context_tables;
 pub mod cpuid;
 pub mod cr;

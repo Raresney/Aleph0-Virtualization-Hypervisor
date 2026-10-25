@@ -50,6 +50,7 @@ pub use error::{BringUpError, report_error};
 
 use crate::vmx;
 use crate::vmx::VmxCapabilities;
+use crate::vmx::apic::{self, ApicBase, IA32_APIC_BASE};
 use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::ept::{self, Ept, EptSupport, TypeTables};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
@@ -254,6 +255,7 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         )
     }?;
     report::ept(&ept, &types, guest.data_page());
+    check_local_apic(&ept, &types, ept_support)?;
 
     let bitmaps = ExitBitmaps::allocate()?;
     report::exit_bitmaps(&bitmaps, capabilities);
@@ -330,6 +332,24 @@ fn activate_context_tables() -> Result<ContextTables, BringUpError> {
         _tss: tss,
         _gdt: gdt,
     })
+}
+
+/// Checks that the test guest can read the Local APIC's version register:
+/// IA32_APIC_BASE in xAPIC mode, and both the page tables the guest shares
+/// and EPT mapping the register page, device memory above the UEFI memory
+/// map, to itself, EPT with UC.
+fn check_local_apic(ept: &Ept, types: &TypeTables, support: EptSupport) -> Result<(), BringUpError> {
+    // SAFETY: IA32_APIC_BASE exists on every CPU with a Local APIC, which
+    // every x86-64 CPU has, and reading it has no side effects.
+    let apic_base = ApicBase(unsafe { vmx::msr::rdmsr(IA32_APIC_BASE) });
+    let registers = apic_base.address(support.rules.physical_address_bits);
+    // SAFETY: boot services are still active, so the firmware's tables are
+    // identity-mapped.
+    let translation = unsafe { vmx::paging::walk_current(registers) };
+    let walk = types.walk(ept.eptp(), registers);
+    report::local_apic(apic_base, registers, walk.end);
+    apic::check_registers(apic_base, registers, translation, walk.end)?;
+    Ok(())
 }
 
 /// Detects VMX, reads the capability MSRs the VMCS controls are chosen from,
