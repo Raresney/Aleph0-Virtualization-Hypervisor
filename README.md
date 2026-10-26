@@ -40,9 +40,9 @@ Verified on Hyper-V with nested virtualization:
       firmware
 - [x] Virtualizes the running firmware in place: on Hyper-V it runs as the
       guest, draws its boot screen and answers the keyboard over VMBus
-- [ ] Stay resident after `ExitBootServices` (resident memory, the image
-      copy and the `ExitBootServices` event are in; the test harness's run
-      is next)
+- [x] Stays resident after `ExitBootServices`: a harness exits boot
+      services as Aleph0's guest and overwrites every page the OS may
+      reclaim, and Aleph0 still handles its exits
 - [ ] Hide Aleph0's own memory from the guest through EPT
 - [ ] An OS guest on multiple vCPUs
 - [ ] Anti-cheat research: guest memory introspection, EPT protection and

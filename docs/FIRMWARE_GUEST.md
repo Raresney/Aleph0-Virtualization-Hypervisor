@@ -192,9 +192,10 @@ Aleph0 (HYPERV_INTERFACE.md section 7). Left alone at that screen, it ran
 - The firmware guest still gets the test guest's pages, because `Ept::build`
   protects their data page. Nothing in the firmware touches it, and since
   #23 they are resident, so no OS reuses them either.
-- Staying resident after `ExitBootServices` (#23) is implemented
-  ([RESIDENT.md](RESIDENT.md)); its harness run stopped where the firmware
-  did, at `0x40000020`, and is to be run again now that #27 forwards it.
+- Staying resident after `ExitBootServices` (#23): since #27 the harness
+  runs past `0x40000020`, exits boot services as Aleph0's guest and
+  overwrites every reclaimable page, and Aleph0 still handles its exits
+  ([RESIDENT.md](RESIDENT.md) section 7).
 
 ## Cheat sheet
 

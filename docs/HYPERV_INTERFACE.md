@@ -371,9 +371,10 @@ directory of its own; it is not part of the repository.
   Today the identity map already lets the guest write Aleph0's pages, so
   this opens nothing new; before Aleph0 hides its pages, these GPAs must be
   checked against its resident allocations and refused with #GP.
-- **Whether Linux boots on the forwarded interface:** #28. The harness run
-  of #23, which stopped at `0x40000020` like the firmware, can be retried
-  now ([RESIDENT.md](RESIDENT.md) section 7).
+- **Whether Linux boots on the forwarded interface:** #28. The harness of
+  #23 now gets through `ExitBootServices`, during which the firmware's
+  VMBus drivers post a message (`0x5c`), zero the synthetic timers and mask
+  the SINTs, all forwarded ([RESIDENT.md](RESIDENT.md) section 7).
 - **Synthetic interrupts:** with external-interrupt exiting off, Hyper-V's
   interrupts reach the guest's IDT directly (the firmware timer above); the
   interrupt policy is #26.
