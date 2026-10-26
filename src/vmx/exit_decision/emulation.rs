@@ -16,6 +16,11 @@
 //! would get on bare metal. So does an MTRR address the CPU has no MSR at,
 //! which the MSR bitmap intercepts too.
 //!
+//! Hyper-V's hypercalls and synthetic MSRs are passed through one level
+//! further: Aleph0 makes the same access in root operation, and L0 Hyper-V
+//! answers it (`vmx::hyperv`), or refuses it with the exception the guest
+//! then gets.
+//!
 //! HLT is decided here too, but never executed: Aleph0 resumes past it (see
 //! [`hlt`]).
 //!
@@ -27,6 +32,7 @@ use core::arch::x86_64::CpuidResult;
 
 use super::{ExitEvent, ExitInfo};
 use crate::vmx::exit_bitmaps::{INTERCEPTED_MSRS, MsrAccess, msr_bit};
+use crate::vmx::hyperv;
 use crate::vmx::mtrr::{self, MtrrCapabilities, MtrrMsr};
 
 /// An instruction the exit handler executes for the guest.
@@ -50,6 +56,14 @@ pub enum Emulation {
     In { port: u16, size: IoSize },
     /// OUT of `value` (`size` wide) to `port`.
     Out { port: u16, size: IoSize, value: u32 },
+    /// VMCALL with the hypercall input value `input` in RCX: made again in
+    /// root operation with the guest's RCX, RDX and R8, for Hyper-V.
+    Hypercall { input: u64 },
+    /// RDMSR of `msr`, one of Hyper-V's synthetic MSRs: from Hyper-V.
+    SyntheticRead { msr: u32 },
+    /// WRMSR of `value` to `msr`, one of Hyper-V's synthetic MSRs: to
+    /// Hyper-V, which checks the value.
+    SyntheticWrite { msr: u32, value: u64 },
 }
 
 /// CPUID.1:ECX bit 5: VMX.
@@ -60,9 +74,10 @@ const CPUID_1_ECX_VMX: u32 = 1 << 5;
 ///
 /// Everything passes through except CPUID.1:ECX.VMX. A guest that saw it
 /// would try VMXON, which always exits (reason 27), and Aleph0 does not
-/// emulate VMX. Left as the processor says, for the OS-guest step:
+/// emulate VMX. Left as the processor says:
 /// - ECX bit 31 (hypervisor present) and the leaves from 0x40000000, which
-///   under Hyper-V describe Hyper-V;
+///   under Hyper-V describe Hyper-V: the guest keeps Hyper-V's interface,
+///   and Aleph0 forwards it (docs/HYPERV_INTERFACE.md);
 /// - values that depend on CR4 and XCR0 (CPUID.1:ECX.OSXSAVE, leaf 0xD),
 ///   which are right for the guest only while it shares the host's.
 pub fn cpuid_policy(leaf: u32, raw: CpuidResult) -> CpuidResult {
@@ -111,19 +126,28 @@ enum MsrRoute {
     /// IA32_MTRRCAP.FIX, any of them without MTRRs). The bitmap intercepts
     /// these too, and the guest gets the #GP a CPU without the MSR gives.
     AbsentMtrr,
+    /// One of Hyper-V's synthetic MSRs ([`hyperv::SYNTHETIC_MSRS`]), with
+    /// Hyper-V's interface present: forward it.
+    Synthetic,
     /// Outside both MSR-bitmap ranges, so it exits whatever the bitmap
-    /// says. Aleph0 does not know it exists, and a real RDMSR/WRMSR of a
-    /// missing MSR would #GP in the host, so the guest gets the #GP.
+    /// says, and not forwarded. Aleph0 does not know it exists, and a real
+    /// RDMSR/WRMSR of a missing MSR would #GP in the host, so the guest gets
+    /// the #GP.
     OutOfRange,
     /// In range but its bit is clear, so it should never have exited: the
     /// bitmap is broken. Stop.
     NotIntercepted,
 }
 
-/// Which [`MsrRoute`] `msr` takes, for a guest whose MTRR MSRs are `mtrr`.
-fn route(msr: u32, mtrr: MtrrCapabilities) -> MsrRoute {
+/// Which [`MsrRoute`] `msr` takes, for a guest whose MTRR MSRs are `mtrr`,
+/// with Hyper-V's interface (`hyperv`) or without.
+fn route(msr: u32, mtrr: MtrrCapabilities, hyperv: bool) -> MsrRoute {
     if msr_bit(msr, MsrAccess::Read).is_none() {
-        MsrRoute::OutOfRange
+        if hyperv && hyperv::SYNTHETIC_MSRS.contains(&msr) {
+            MsrRoute::Synthetic
+        } else {
+            MsrRoute::OutOfRange
+        }
     } else if INTERCEPTED_MSRS.contains(&msr) {
         MsrRoute::Intercepted
     } else if let Some(msr) = mtrr.msr(msr) {
@@ -138,9 +162,10 @@ fn route(msr: u32, mtrr: MtrrCapabilities) -> MsrRoute {
 /// RDMSR (exit reason 31) of the MSR in ECX.
 pub(super) fn rdmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
-    match route(msr, exit.mtrr) {
+    match route(msr, exit.mtrr, exit.hyperv) {
         MsrRoute::Intercepted => ExitEvent::Emulated(Emulation::Rdmsr { msr }),
         MsrRoute::Mtrr(msr) => ExitEvent::Emulated(Emulation::MtrrRead { msr }),
+        MsrRoute::Synthetic => ExitEvent::Emulated(Emulation::SyntheticRead { msr }),
         MsrRoute::AbsentMtrr | MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
         MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }
@@ -156,7 +181,7 @@ pub fn wrmsr_value(exit: &ExitInfo) -> u64 {
 pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
     let value = wrmsr_value(exit);
-    match route(msr, exit.mtrr) {
+    match route(msr, exit.mtrr, exit.hyperv) {
         // Every intercepted MSR holds an address (only IA32_KERNEL_GS_BASE
         // today). A real WRMSR of a non-canonical one would #GP in the host,
         // in exit context, so the guest gets that #GP instead.
@@ -168,6 +193,7 @@ pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
             Ok(()) => ExitEvent::Emulated(Emulation::MtrrWrite { msr, value }),
             Err(_) => ExitEvent::GuestGeneralProtection,
         },
+        MsrRoute::Synthetic => ExitEvent::Emulated(Emulation::SyntheticWrite { msr, value }),
         MsrRoute::AbsentMtrr | MsrRoute::OutOfRange => ExitEvent::GuestGeneralProtection,
         MsrRoute::NotIntercepted => ExitEvent::Unexpected,
     }

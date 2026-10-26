@@ -1,5 +1,7 @@
 //! What the host IDT's gates run: an NMI handler that hands the NMI to the
-//! guest, and a fault handler that prints and halts.
+//! guest, and a fault handler that prints and halts, except for the #UD or
+//! #GP Hyper-V raises at an instruction Aleph0 forwards for the guest
+//! (`hyperv::recovery`), which it resumes at the forwarder's recovery point.
 //!
 //! Both run in VMX root operation with the guest's VMCS current: the CPU
 //! loads this IDT only on a VM exit, and teardown loads the firmware's IDT
@@ -38,6 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use super::idt::{exception_name, has_error_code};
 use crate::vmx::cr::read_cr2;
 use crate::vmx::exit_decision::NMI_VECTOR;
+use crate::vmx::hyperv;
 use crate::vmx::vmcs;
 
 /// Bytes per fault stub: each starts on a 16-byte boundary and fits in it.
@@ -60,8 +63,12 @@ static NMIS_TAKEN: AtomicU32 = AtomicU32::new(0);
 //
 // `host_exception_common`: passes a pointer to the frame to
 // `host_exception_handler` (Microsoft x64 ABI: first argument in RCX,
-// RSP 16-byte aligned at the call, 32 bytes of shadow space). It never
-// returns.
+// RSP 16-byte aligned at the call, 32 bytes of shadow space), keeping the
+// frame's address in RBP, which the handler preserves. The handler returns
+// only for a fault it recovers from, with the frame's RIP moved to the
+// recovery point: then it drops the vector and error code and returns with
+// IRETQ. Nothing else is restored: the forwarders resume with the registers
+// the ABI lets a call change, possibly changed, which they allow for.
 //
 // `host_nmi_entry`: saves the registers the ABI lets a callee change (RAX,
 // RCX, RDX, R8-R11; no vector registers, the target is soft-float, see
@@ -85,12 +92,17 @@ host_vector_stubs:
     .endr
 
 host_exception_common:
-    movq %rsp, %rcx
+    pushq %rbp
+    movq %rsp, %rbp
+    leaq 8(%rbp), %rcx
     andq $-16, %rsp
     subq $32, %rsp
     cld
     call host_exception_handler
-    ud2
+    movq %rbp, %rsp
+    popq %rbp
+    addq $16, %rsp
+    iretq
 
     .balign 16
     .globl host_nmi_entry
@@ -153,14 +165,22 @@ struct ExceptionFrame {
 
 /// Called by the fault stubs: prints where Aleph0 faulted and halts this
 /// CPU for good. A fault in root operation is a bug in Aleph0, and the
-/// state it broke is unknown, so nothing is retried.
+/// state it broke is unknown, so nothing is retried. The one exception is
+/// Hyper-V refusing an instruction Aleph0 forwards for the guest: that
+/// fault moves the frame's RIP to the forwarder's recovery point and
+/// returns, and `host_exception_common` resumes there.
 #[unsafe(no_mangle)]
-extern "efiapi" fn host_exception_handler(frame: *const ExceptionFrame) -> ! {
+extern "efiapi" fn host_exception_handler(frame: *mut ExceptionFrame) {
     // SAFETY: `host_exception_common` passes the address of the frame on
-    // its stack, which stays put because this never returns.
-    let frame = unsafe { &*frame };
-    let tag = crate::TAG;
+    // its stack, which stays put until it returns with IRETQ, and nothing
+    // else touches it meanwhile.
+    let frame = unsafe { &mut *frame };
     let vector = frame.vector as u8;
+    if let Some(resume) = hyperv::recovery(frame.rip, vector) {
+        frame.rip = resume;
+        return;
+    }
+    let tag = crate::TAG;
     crate::serial_println!(
         "{tag} HOST EXCEPTION in VMX root operation: vector {vector} ({}).",
         exception_name(vector)

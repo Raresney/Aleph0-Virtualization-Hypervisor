@@ -306,6 +306,9 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let bitmaps = ExitBitmaps::allocate()?;
     report::exit_bitmaps(&bitmaps, capabilities);
     vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
+    let hyperv = vmx::hyperv::Detection::read();
+    report::hyperv(&hyperv);
+    vmx::hyperv::publish(hyperv.offers_interface());
 
     // Every address the UEFI memory map reaches, which holds the image,
     // every allocation (the EPT tables included) and the firmware stack:

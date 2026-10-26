@@ -394,8 +394,8 @@ fn check_exits() {
     if WITH_ALEPH0 {
         // SAFETY: the harness is Aleph0's guest (checked in `main`), so the
         // VMCALL exits to Aleph0, which resumes past it and changes no register.
-        unsafe { asm!("vmcall", inout("rax") vmcall::TEST => _, options(nomem, nostack)) };
-        say!("test VMCALL (rax={:#x}): resumed past it.", vmcall::TEST);
+        unsafe { asm!("vmcall", inout("rcx") vmcall::TEST => _, options(nomem, nostack)) };
+        say!("test VMCALL (rcx={:#x}): resumed past it.", vmcall::TEST);
     }
 }
 

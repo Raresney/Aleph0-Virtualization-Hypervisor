@@ -31,18 +31,19 @@ use crate::output::Phase;
 use crate::port;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, Emulation, ExitAction, ExitEvent,
-    ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON,
-    after_skipped_instruction, cpuid_policy, decide, is_canonical_48, merge_in,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation,
+    ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan,
+    UNREADABLE_REASON, after_skipped_instruction, cpl_from_ss, cpuid_policy, decide, is_canonical_48, merge_in,
 };
 use crate::vmx::host;
+use crate::vmx::hyperv::{self, HypercallRegisters};
 use crate::vmx::instruction::VmxFail;
 use crate::vmx::msr;
 use crate::vmx::mtrr::MtrrMsr;
 use crate::vmx::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, IDT_VECTORING_ERROR_CODE,
-    IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO,
-    VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, GUEST_SS_ACCESS_RIGHTS,
+    IDT_VECTORING_ERROR_CODE, IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN,
+    VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
 use crate::vmx::vmcs::{self, GuestKind, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
@@ -132,6 +133,8 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let phase = crate::output::set_phase(Phase::VmExit);
     #[cfg(feature = "host-fault-test")]
     host::fault_on_purpose();
+    #[cfg(feature = "forward-refusal-test")]
+    hyperv::refuse_on_purpose();
 
     let guest = GuestKind::SELECTED;
     let number = stats::update(VcpuStats::count_exit);
@@ -146,6 +149,7 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
     let outcome = carry_out(event, &read, next, frame);
     if let Outcome::Resumed { plan, .. } = outcome {
         stats::update(|stats| stats.count_resumed(event, plan));
+        stats::update_forwarded(|forwarded| forwarded.count(plan.emulate));
     }
     // Before anything prints, so a panic while printing still shows this exit.
     history::record(read.record(number, event));
@@ -209,6 +213,8 @@ pub(super) struct ExitRead {
     pub(super) qualification: Result<u64, VmcsError>,
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only (`None` for others).
     pub(super) guest_physical: Option<Result<u64, VmcsError>>,
+    /// GUEST_SS_ACCESS_RIGHTS, the CPL, read for VMCALL exits only.
+    pub(super) ss_access_rights: Option<Result<u64, VmcsError>>,
     /// GUEST_RIP.
     pub(super) rip: Result<u64, VmcsError>,
     /// VM_EXIT_INSTRUCTION_LEN.
@@ -267,6 +273,7 @@ impl ExitRead {
             self.interruption_info,
             self.qualification,
             self.guest_physical.unwrap_or(Ok(0)),
+            self.ss_access_rights.unwrap_or(Ok(0)),
             self.rip,
             self.length,
             self.interruptibility,
@@ -288,6 +295,11 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
         !reason.entry_failure && matches!(reason.basic, EXIT_REASON_EPT_VIOLATION | EXIT_REASON_EPT_MISCONFIG)
     });
     let guest_physical = ept_exit.then(|| read_field(GUEST_PHYSICAL_ADDRESS));
+    // Only a VMCALL is judged by the CPL; 0 otherwise, which `decide` never
+    // looks at, and an unreadable one leaves the VMCALL unjudged.
+    let vmcall_exit = decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_VMCALL);
+    let ss_access_rights = vmcall_exit.then(|| read_field(GUEST_SS_ACCESS_RIGHTS));
+    let guest_cpl = ss_access_rights.map_or(Some(0), |rights| rights.ok().map(cpl_from_ss));
     let rip = read_field(GUEST_RIP);
     let length = read_field(VM_EXIT_INSTRUCTION_LEN);
     let interruptibility = read_field(GUEST_INTERRUPTIBILITY_STATE);
@@ -316,8 +328,17 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
         idt_vectoring.ok(),
         qualification_for_decide,
         guest_physical_for_decide,
+        guest_cpl,
     ) {
-        (Some(reason), Some(info), Some(blocking), Some(vectoring), Some(qualification), Some(guest_physical)) => {
+        (
+            Some(reason),
+            Some(info),
+            Some(blocking),
+            Some(vectoring),
+            Some(qualification),
+            Some(guest_physical),
+            Some(guest_cpl),
+        ) => {
             Some(ExitInfo {
                 reason,
                 interruption_info: InterruptionInfo(info as u32),
@@ -332,6 +353,8 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
                 guest_physical,
                 protected_page: protected.map_or(0, |page| page.gpa),
                 mtrr,
+                hyperv: hyperv::offered(),
+                guest_cpl,
             })
         }
         // An unreadable field is reported later; without it the exit cannot
@@ -344,6 +367,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
         interruption_info,
         qualification,
         guest_physical,
+        ss_access_rights,
         rip,
         length,
         interruptibility,
@@ -413,7 +437,7 @@ fn carry_out(event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut Reg
             };
             match plan {
                 Some(plan) => match prepare_resume(read, plan, frame) {
-                    Ok(resumed) => Outcome::Resumed { plan, resumed },
+                    Ok((plan, resumed)) => Outcome::Resumed { plan, resumed },
                     Err(failure) => Outcome::ResumeFailed(failure),
                 },
                 None => Outcome::ResumeFailed(ResumeFailure::RedeliveryConflict),
@@ -500,11 +524,36 @@ pub(super) enum EmulationOutcome {
     In { port: u16, size: IoSize, value: u32 },
     /// OUT of `value` (`size` wide) to `port`.
     Out { port: u16, size: IoSize, value: u32 },
+    /// The hypercall with input value `input` went to Hyper-V, which
+    /// returned `result` in RAX: the status in bits 15:0, the reps done in
+    /// bits 43:32.
+    Hypercall { input: u64, result: u64 },
+    /// RDMSR of the synthetic MSR `msr` returned `value`, from Hyper-V.
+    SyntheticRead { msr: u32, value: u64 },
+    /// WRMSR wrote `value` to the synthetic MSR `msr`, at Hyper-V.
+    SyntheticWrite { msr: u32, value: u64 },
+    /// Hyper-V refused the forwarded `emulation` with `exception`, which the
+    /// guest gets at its own instruction instead.
+    Refused {
+        emulation: Emulation,
+        exception: InterruptionInfo,
+    },
+}
+
+impl EmulationOutcome {
+    /// The exception the guest gets when Hyper-V refused the access.
+    fn refused(self) -> Option<InterruptionInfo> {
+        match self {
+            Self::Refused { exception, .. } => Some(exception),
+            _ => None,
+        }
+    }
 }
 
 /// Executes `emulation` in root operation and writes its result into the
 /// guest's registers in `frame`. Only an access to the guest's MTRRs can
-/// fail.
+/// fail; one Hyper-V refuses comes back as [`EmulationOutcome::Refused`],
+/// with `frame` unchanged.
 fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationOutcome, ResumeFailure> {
     Ok(match emulation {
         Emulation::Cpuid { leaf, subleaf } => {
@@ -592,6 +641,60 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
             }
             EmulationOutcome::Out { port, size, value }
         }
+        Emulation::Hypercall { input } => {
+            let mut registers = HypercallRegisters {
+                rcx: input,
+                rdx: frame.rdx,
+                r8: frame.r8,
+                rax: 0,
+            };
+            // SAFETY: exit context: VMX root operation at CPL 0 with the host
+            // IDT loaded, the guest stopped at its VMCALL. `decide` forwards
+            // only with Hyper-V's interface present and from the guest's CPL
+            // 0, so this is a hypercall the guest could have made itself.
+            match unsafe { hyperv::forward_hypercall(&mut registers) } {
+                Ok(()) => {
+                    frame.rax = registers.rax;
+                    frame.rcx = registers.rcx;
+                    frame.rdx = registers.rdx;
+                    frame.r8 = registers.r8;
+                    EmulationOutcome::Hypercall {
+                        input,
+                        result: registers.rax,
+                    }
+                }
+                Err(_) => EmulationOutcome::Refused {
+                    emulation,
+                    exception: InterruptionInfo::INVALID_OPCODE,
+                },
+            }
+        }
+        Emulation::SyntheticRead { msr } => {
+            // SAFETY: as for Hypercall, at the guest's RDMSR, which needs CPL
+            // 0 to exit at all.
+            match unsafe { hyperv::forward_rdmsr(msr) } {
+                Ok(value) => {
+                    // RDMSR writes EAX and EDX, which zero-extends them.
+                    frame.rax = value & 0xFFFF_FFFF;
+                    frame.rdx = value >> 32;
+                    EmulationOutcome::SyntheticRead { msr, value }
+                }
+                Err(_) => EmulationOutcome::Refused {
+                    emulation,
+                    exception: InterruptionInfo::GENERAL_PROTECTION,
+                },
+            }
+        }
+        Emulation::SyntheticWrite { msr, value } => {
+            // SAFETY: as for SyntheticRead, at the guest's WRMSR.
+            match unsafe { hyperv::forward_wrmsr(msr, value) } {
+                Ok(()) => EmulationOutcome::SyntheticWrite { msr, value },
+                Err(_) => EmulationOutcome::Refused {
+                    emulation,
+                    exception: InterruptionInfo::GENERAL_PROTECTION,
+                },
+            }
+        }
     })
 }
 
@@ -661,23 +764,19 @@ fn write_for_resume(field: u32, value: u64, what: &'static str) -> Result<(), Re
 /// instruction into `frame`, moves GUEST_RIP past the exiting instruction
 /// and ends an STI or MOV SS shadow, queues an NMI or an exception for
 /// injection at the next VM entry, turns NMI-window exiting on or off, and
-/// makes the protected page writable. Returns how the guest resumes, or
-/// why it cannot.
-fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) -> Result<Resumed, ResumeFailure> {
-    let ResumePlan {
-        advance_rip,
-        inject_nmi,
-        nmi_window,
-        grant_write,
-        emulate,
-        inject_exception,
-        redeliver,
-    } = plan;
+/// makes the protected page writable. Returns the plan carried out, which
+/// injects an exception instead of advancing RIP when Hyper-V refused a
+/// forwarded access, and how the guest resumes; or why it cannot.
+fn prepare_resume(
+    read: &ExitRead,
+    plan: ResumePlan,
+    frame: &mut RegisterFrame,
+) -> Result<(ResumePlan, Resumed), ResumeFailure> {
     let rip = read.rip.map_err(|_| ResumeFailure::RipUnreadable)?;
     // Checked before the emulation: with the length unreadable or the new RIP
     // wrapping or non-canonical, a WRMSR or OUT would already have happened
     // when the guest stops, and serial would never show it.
-    let advance_to = if advance_rip {
+    let advance_to = if plan.advance_rip {
         let length = read.length.map_err(|_| ResumeFailure::LengthUnreadable)?;
         Some(next_rip(rip, length).ok_or(ResumeFailure::NextRipInvalid)?)
     } else {
@@ -685,7 +784,21 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
     };
     // Before RIP moves: the guest resumes past the instruction with its
     // result already in its registers.
-    let emulated = emulate.map(|emulation| execute(emulation, frame)).transpose()?;
+    let emulated = plan.emulate.map(|emulation| execute(emulation, frame)).transpose()?;
+    // Hyper-V refused a forwarded access: the guest gets the same exception,
+    // at its own instruction, as it would without Aleph0.
+    let (plan, advance_to) = match emulated.and_then(EmulationOutcome::refused) {
+        Some(exception) => (plan.refused_with(exception), None),
+        None => (plan, advance_to),
+    };
+    let ResumePlan {
+        inject_nmi,
+        nmi_window,
+        grant_write,
+        inject_exception,
+        redeliver,
+        ..
+    } = plan;
 
     let resume_rip = if let Some(next) = advance_to {
         write_for_resume(GUEST_RIP, next, "advance guest RIP")?;
@@ -705,8 +818,8 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
     } else {
         // An NMI exit: the guest goes on at the instruction it was about to
         // run, and the injected NMI is delivered before it. An EPT
-        // violation: the faulting write runs again. A #GP: delivered at the
-        // RDMSR/WRMSR, which faults.
+        // violation: the faulting write runs again. A #GP or #UD: delivered
+        // at the RDMSR, WRMSR or VMCALL, which faults.
         rip
     };
 
@@ -755,11 +868,14 @@ fn prepare_resume(read: &ExitRead, plan: ResumePlan, frame: &mut RegisterFrame) 
     } else {
         None
     };
-    Ok(Resumed {
-        rip: resume_rip,
-        invept,
-        emulated,
-    })
+    Ok((
+        plan,
+        Resumed {
+            rip: resume_rip,
+            invept,
+            emulated,
+        },
+    ))
 }
 
 /// Queues `exception` for the next VM entry, with error code 0 if it
