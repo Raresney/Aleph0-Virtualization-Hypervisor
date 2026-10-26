@@ -23,6 +23,7 @@ pub mod exit_decision;
 pub mod guest;
 pub mod guest_state;
 pub mod host;
+pub mod hyperv;
 pub mod instruction;
 pub mod msr;
 pub mod mtrr;

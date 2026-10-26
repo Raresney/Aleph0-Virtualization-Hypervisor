@@ -46,8 +46,10 @@
     runs in VMX root operation), unexpected-exit-test (the guest stops at
     main VMCALL #1 as an unexpected exit), ept-misconfig-test (the guest's
     Local APIC read is an EPT misconfiguration, which stops it with a walk
-    of the tables), or trace-exits (every VM exit printed in full). All but
-    host-fault-test and trace-exits turn on test-guest themselves.
+    of the tables), forward-refusal-test (a forwarded WRMSR Hyper-V
+    refuses, recovered in root operation), or trace-exits (every VM exit
+    printed in full). All but host-fault-test, forward-refusal-test and
+    trace-exits turn on test-guest themselves.
 
 .PARAMETER ProcessorCount
     vCPUs to give the VM: 2 by default, 1 with -InjectNmi, which refuses any

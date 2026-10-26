@@ -7,13 +7,16 @@
 use super::guest_mtrrs::{self, MtrrWrite};
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
 use super::policy::{COUNTERS, Detail, Histogram};
+use super::stats::Tally;
 use super::{RegisterFrame, dump, history, read_field, stats};
 use crate::vmx::ept::{Eptp, InveptType, Retyped};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_WRMSR, EptQualification, ExitEvent, ExitInfo,
-    ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax, wrmsr_value,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_RDMSR, EXIT_REASON_VMCALL, EXIT_REASON_WRMSR,
+    EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name,
+    expected_main_rax, wrmsr_value,
 };
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
+use crate::vmx::hyperv;
 use crate::vmx::mtrr::{self, FIXED_END, MtrrMsr, Mtrrs};
 use crate::vmx::page::PAGE_SIZE;
 use crate::vmx::vmcs::fields::{EPT_POINTER, GUEST_LINEAR_ADDRESS};
@@ -68,6 +71,7 @@ pub(super) fn report_exit(report: &ExitReport<'_>) {
                 "{tag} VM exit #{number}: reason={basic} ({}), {count} exits of this reason so far.",
                 exit_reason_name(basic),
             );
+            report_forwarded(number, basic);
             if host_nmi {
                 report_host_nmi(number);
             }
@@ -162,6 +166,9 @@ fn report_read(number: u64, read: &ExitRead) {
     report_unreadable(number, "VM_EXIT_INTERRUPTION_INFO", read.interruption_info);
     report_unreadable(number, "GUEST_INTERRUPTIBILITY_STATE", read.interruptibility);
     report_unreadable(number, "IDT_VECTORING_INFO", read.idt_vectoring);
+    if let Some(rights) = read.ss_access_rights {
+        report_unreadable(number, "GUEST_SS_ACCESS_RIGHTS", rights);
+    }
 }
 
 /// Prints that the VMCS field `name` could not be read at exit `number`, if
@@ -244,16 +251,41 @@ fn report_host_nmi(number: u64) {
     );
 }
 
+/// Prints, after the summary line of exit `number`, what Aleph0 forwarded
+/// to Hyper-V so far at exits of its reason `basic`: hypercalls by call code
+/// for VMCALL, synthetic MSRs for RDMSR and WRMSR. Nothing when none was,
+/// or for another reason.
+fn report_forwarded(number: u64, basic: u16) {
+    let forwarded = stats::forwarded();
+    let (what, tally) = match basic {
+        EXIT_REASON_VMCALL => ("hypercalls by call code", forwarded.hypercalls),
+        EXIT_REASON_RDMSR => ("synthetic MSR reads", forwarded.synthetic_reads),
+        EXIT_REASON_WRMSR => ("synthetic MSR writes", forwarded.synthetic_writes),
+        _ => return,
+    };
+    if tally != Tally::EMPTY {
+        crate::serial_println!(
+            "{} VM exit #{number}: forwarded to Hyper-V so far: {what}: {tally}.",
+            crate::TAG
+        );
+    }
+}
+
 /// Prints what every stop adds after the lines of exit `number`: the
-/// guest's state and registers (`frame`), the vCPU's exit statistics, how
-/// many exits of each reason there were (`exits_by_reason`), including those
-/// the print policy left out, and the last exits, oldest first.
+/// guest's state and registers (`frame`), the vCPU's exit statistics with
+/// what was forwarded to Hyper-V, how many exits of each reason there were
+/// (`exits_by_reason`), including those the print policy left out, and the
+/// last exits, oldest first.
 pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &[u64; COUNTERS]) {
     dump::report_guest(number, frame);
+    let tag = crate::TAG;
+    crate::serial_println!("{tag} VM exit #{number}: exit statistics: {}.", stats::snapshot());
+    let forwarded = stats::forwarded();
     crate::serial_println!(
-        "{} VM exit #{number}: exit statistics: {}.",
-        crate::TAG,
-        stats::snapshot()
+        "{tag} VM exit #{number}: forwarded to Hyper-V: hypercalls by call code: {}; synthetic MSR reads: {}; synthetic MSR writes: {}.",
+        forwarded.hypercalls,
+        forwarded.synthetic_reads,
+        forwarded.synthetic_writes,
     );
     crate::serial_println!(
         "{} VM exit #{number}: exits by reason: {}.",
@@ -276,6 +308,7 @@ fn report_event(
 ) {
     let tag = crate::TAG;
     let rax = exit.map_or(0, |exit| exit.guest_rax);
+    let rcx = exit.map_or(0, |exit| exit.guest_rcx);
     let rip = resumed.map_or(0, |resumed| resumed.rip);
     let nmis_injected = stats::snapshot().nmi_injections;
     match event {
@@ -339,21 +372,18 @@ fn report_event(
         // Not "resuming the guest": `run-hyperv.ps1 -InjectNmi` waits for
         // that text after main VMCALL #1, and this exit comes before it.
         ExitEvent::Halted => crate::serial_println!("{tag} VM exit #{number}: HLT; going on at rip={rip:#018x}."),
-        ExitEvent::GuestInvalidOpcode => crate::serial_println!(
-            "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
-        ),
+        ExitEvent::GuestInvalidOpcode => report_invalid_opcode(number, exit, rip),
         ExitEvent::BootServicesEnded => crate::serial_println!(
-            "{tag} VM exit #{number}: VMCALL from Aleph0's ExitBootServices event (rax={rax:#x}): boot services are over; output phase now runtime (serial only); going on at rip={rip:#018x}."
+            "{tag} VM exit #{number}: VMCALL from Aleph0's ExitBootServices event (rcx={rcx:#x}): boot services are over; output phase now runtime (serial only); going on at rip={rip:#018x}."
         ),
         ExitEvent::TestVmcall => {
-            crate::serial_println!("{tag} VM exit #{number}: test VMCALL (rax={rax:#x}); going on at rip={rip:#018x}.")
+            crate::serial_println!("{tag} VM exit #{number}: test VMCALL (rcx={rcx:#x}); going on at rip={rip:#018x}.")
         }
         ExitEvent::Unexpected if guest == GuestKind::BuiltInTest => crate::serial_println!(
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),
         ),
-        // The firmware has no script: the lines above name the exit, and a
-        // VMCALL is a Hyper-V hypercall (#27).
+        // The firmware has no script: the lines above name the exit.
         ExitEvent::Unexpected => {
             crate::serial_println!("{tag} VM exit #{number}: NOT an exit Aleph0 handles for the firmware.")
         }
@@ -407,7 +437,52 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
             "{tag} VM exit #{number}: OUT port {port:#x} size={} value={value:#x}; resuming at rip={rip:#018x}.",
             size.bytes(),
         ),
+        Some(EmulationOutcome::Hypercall { input, result }) => crate::serial_println!(
+            "{tag} VM exit #{number}: hypercall {:#06x} (rcx={input:#x}) forwarded to Hyper-V -> status {:#x} (rax={result:#x}); resuming at rip={rip:#018x}.",
+            hyperv::call_code(input),
+            result as u16,
+        ),
+        Some(EmulationOutcome::SyntheticRead { msr, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: RDMSR {msr:#x} (synthetic) forwarded to Hyper-V -> {value:#018x}; resuming at rip={rip:#018x}."
+        ),
+        Some(EmulationOutcome::SyntheticWrite { msr, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: WRMSR {msr:#x} (synthetic) <- {value:#018x} forwarded to Hyper-V; resuming at rip={rip:#018x}."
+        ),
+        Some(EmulationOutcome::Refused { emulation, exception }) => crate::serial_println!(
+            "{tag} VM exit #{number}: Hyper-V refused the forwarded {emulation:?} with {}; injecting it at rip={rip:#018x}.",
+            exception_mnemonic(exception),
+        ),
         None => crate::serial_println!("{tag} VM exit #{number}: emulated instruction not executed."),
+    }
+}
+
+/// `#UD` or `#GP(0)`, the exceptions a forwarded access is refused with.
+fn exception_mnemonic(exception: InterruptionInfo) -> &'static str {
+    if exception == InterruptionInfo::INVALID_OPCODE {
+        "#UD"
+    } else {
+        "#GP(0)"
+    }
+}
+
+/// Prints why the guest gets #UD: for a VMCALL, that it came from CPL > 0
+/// or that there is no Hyper-V to take it; otherwise, that it is MWAIT or
+/// MONITOR.
+fn report_invalid_opcode(number: u64, exit: Option<ExitInfo>, rip: u64) {
+    let tag = crate::TAG;
+    match exit.filter(|exit| exit.reason.basic == EXIT_REASON_VMCALL) {
+        Some(exit) if exit.guest_cpl != 0 => crate::serial_println!(
+            "{tag} VM exit #{number}: VMCALL (rcx={:#x}) from CPL {}, which Hyper-V refuses too; injecting #UD at rip={rip:#018x}.",
+            exit.guest_rcx,
+            exit.guest_cpl,
+        ),
+        Some(exit) => crate::serial_println!(
+            "{tag} VM exit #{number}: VMCALL (rcx={:#x}) is not Aleph0's, and there is no Hyper-V interface to forward it to; injecting #UD at rip={rip:#018x}.",
+            exit.guest_rcx,
+        ),
+        None => crate::serial_println!(
+            "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
+        ),
     }
 }
 

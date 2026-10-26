@@ -37,6 +37,8 @@ fn exit(basic: u16) -> ExitInfo {
         guest_physical: 0,
         protected_page: 0,
         mtrr: MtrrCapabilities::NONE,
+        hyperv: false,
+        guest_cpl: 0,
     }
 }
 
@@ -112,8 +114,9 @@ fn rdmsr_ignores_the_upper_half_of_rcx() {
 
 #[test]
 fn msrs_outside_the_bitmap_get_a_general_protection_fault() {
-    // Hyper-V's synthetic MSRs start at 0x40000000; neither range covers them.
-    for msr in [0x4000_0000, 0xC000_2000] {
+    // Hyper-V's synthetic MSRs start at 0x40000000; neither range covers
+    // them, and without Hyper-V's interface nothing forwards them.
+    for msr in [0x4000_0000, 0x4000_0020, 0xC000_2000] {
         assert_eq!(
             rdmsr(&msr_exit(EXIT_REASON_RDMSR, msr, 0, 0)),
             ExitEvent::GuestGeneralProtection
@@ -122,6 +125,70 @@ fn msrs_outside_the_bitmap_get_a_general_protection_fault() {
             wrmsr(&msr_exit(EXIT_REASON_WRMSR, msr, 0, 0)),
             ExitEvent::GuestGeneralProtection
         );
+    }
+}
+
+/// `exit` from a guest that has Hyper-V's interface.
+fn under_hyperv(exit: ExitInfo) -> ExitInfo {
+    ExitInfo { hyperv: true, ..exit }
+}
+
+#[test]
+fn synthetic_msrs_are_forwarded_under_hyper_v() {
+    // HV_X64_MSR_TIME_REF_COUNT, the firmware's first; the first and last
+    // of the range.
+    for msr in [0x4000_0020, 0x4000_0000, 0x4000_FFFF] {
+        assert_eq!(
+            rdmsr(&under_hyperv(msr_exit(EXIT_REASON_RDMSR, msr.into(), 0, 0))),
+            ExitEvent::Emulated(Emulation::SyntheticRead { msr }),
+            "{msr:#x}"
+        );
+    }
+}
+
+#[test]
+fn a_synthetic_wrmsr_is_forwarded_with_any_value() {
+    // HV_X64_MSR_HYPERCALL with a page GPA and the enable bit, and a value
+    // that is no canonical address: Hyper-V checks it, not Aleph0.
+    for value in [0x7FF2_0001, 0x8000_0000_0000_0000] {
+        let exit = under_hyperv(msr_exit(
+            EXIT_REASON_WRMSR,
+            0x4000_0001,
+            value & 0xFFFF_FFFF,
+            value >> 32,
+        ));
+        assert_eq!(
+            wrmsr(&exit),
+            ExitEvent::Emulated(Emulation::SyntheticWrite {
+                msr: 0x4000_0001,
+                value
+            }),
+            "{value:#x}"
+        );
+    }
+}
+
+#[test]
+fn under_hyper_v_other_msrs_outside_the_bitmap_still_get_a_general_protection_fault() {
+    for msr in [0x3FFF_FFFF, 0x4001_0000, 0xC000_2000] {
+        assert_eq!(
+            rdmsr(&under_hyperv(msr_exit(EXIT_REASON_RDMSR, msr, 0, 0))),
+            ExitEvent::GuestGeneralProtection,
+            "{msr:#x}"
+        );
+        assert_eq!(
+            wrmsr(&under_hyperv(msr_exit(EXIT_REASON_WRMSR, msr, 0, 0))),
+            ExitEvent::GuestGeneralProtection,
+            "{msr:#x}"
+        );
+    }
+}
+
+#[test]
+fn hyper_v_changes_nothing_inside_the_bitmap_ranges() {
+    for msr in bitmap_msr_indexes() {
+        let exit = msr_exit(EXIT_REASON_RDMSR, msr.into(), 0, 0);
+        assert_eq!(rdmsr(&under_hyperv(exit)), rdmsr(&exit), "MSR {msr:#x}");
     }
 }
 

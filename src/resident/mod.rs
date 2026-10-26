@@ -185,7 +185,7 @@ unsafe extern "efiapi" fn on_exit_boot_services(_event: Event, _context: Option<
     unsafe {
         asm!(
             "vmcall",
-            inout("rax") vmcall::BOOT_SERVICES_ENDED => _,
+            inout("rcx") vmcall::BOOT_SERVICES_ENDED => _,
             options(nomem, nostack),
         );
     }
