@@ -87,3 +87,36 @@ fn only_a_resumed_outcome_lets_the_guest_go_on() {
     assert!(Outcome::Stopped(ExitAction::Finished).stops());
     assert_eq!(Outcome::Stopped(ExitAction::Finished).action(), ExitAction::Finished);
 }
+
+#[test]
+fn guest_mtrr_failures_say_what_went_wrong() {
+    assert_eq!(
+        ResumeFailure::GuestMtrrs(MtrrAccessFailure::NotPublished).to_string(),
+        "the guest's MTRRs were never set up"
+    );
+    assert_eq!(
+        ResumeFailure::GuestMtrrs(MtrrAccessFailure::Invept(VmxFail::Invalid)).to_string(),
+        "EPT took the guest's MTRR types, but INVEPT failed (Invalid)"
+    );
+}
+
+#[test]
+fn the_guest_resumes_in_the_phase_the_exit_found() {
+    for found in [Phase::BootServices, Phase::Runtime] {
+        assert_eq!(resume_phase(ExitEvent::Halted, found), found);
+        assert_eq!(resume_phase(ExitEvent::TestVmcall, found), found);
+    }
+}
+
+#[test]
+fn the_exit_boot_services_vmcall_starts_the_runtime_phase_for_good() {
+    assert_eq!(
+        resume_phase(ExitEvent::BootServicesEnded, Phase::BootServices),
+        Phase::Runtime
+    );
+    // A second one, faked by the guest, changes nothing.
+    assert_eq!(
+        resume_phase(ExitEvent::BootServicesEnded, Phase::Runtime),
+        Phase::Runtime
+    );
+}

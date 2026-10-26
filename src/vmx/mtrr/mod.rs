@@ -19,10 +19,17 @@
 //!   4 KiB), one type byte per range.
 //! - Variable ranges: IA32_MTRR_PHYSBASEn / IA32_MTRR_PHYSMASKn pairs. An
 //!   address is in range n when `address & mask == base & mask`.
+//!
+//! This file decodes their values into memory types; `registers.rs` reads
+//! the MSRs and knows which values WRMSR refuses.
 
-use super::cpuid;
-use super::msr::rdmsr;
+use core::fmt;
+
 use super::page::PAGE_SIZE;
+
+mod registers;
+
+pub use registers::{MtrrCapabilities, MtrrMsr, MtrrRegisters, MtrrState, every_msr_address, is_msr_address, read};
 
 /// IA32_MTRRCAP: bits 7:0 count the variable ranges, bit 8 says the fixed
 /// ranges exist.
@@ -40,7 +47,7 @@ const DEF_TYPE_ENABLE: u64 = 1 << 11;
 /// `0x200 + 2n` and its PHYSMASK right after.
 pub const IA32_MTRR_PHYSBASE0: u32 = 0x200;
 /// PHYSMASK bit 11: the range is in use.
-const PHYSMASK_VALID: u64 = 1 << 11;
+pub const PHYSMASK_VALID: u64 = 1 << 11;
 /// Bits 7:0 of IA32_MTRR_DEF_TYPE and of a PHYSBASE: a memory type.
 const TYPE_BITS: u64 = 0xFF;
 /// Bits 51:12 of a PHYSBASE or PHYSMASK: the address part. Bits above the
@@ -164,11 +171,26 @@ impl MemoryType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtrrError {
-    /// An MTRR in use holds a reserved memory type: `value`, in MSR `msr`.
+    /// A type field of MSR `msr` holds the reserved memory type `value`.
     ReservedType { msr: u32, value: u8 },
+    /// MSR `msr` has the reserved bits `bits` set.
+    ReservedBits { msr: u32, bits: u64 },
     /// IA32_MTRRCAP reports `count` variable ranges, more than
     /// [`MAX_VARIABLE_RANGES`].
     TooManyVariableRanges { count: usize },
+}
+
+impl fmt::Display for MtrrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::ReservedType { msr, value } => write!(f, "the reserved memory type {value} in MSR {msr:#x}"),
+            Self::ReservedBits { msr, bits } => write!(f, "reserved bits {bits:#x} set in MSR {msr:#x}"),
+            Self::TooManyVariableRanges { count } => write!(
+                f,
+                "IA32_MTRRCAP reports {count} variable ranges, more than the {MAX_VARIABLE_RANGES} Aleph0 keeps"
+            ),
+        }
+    }
 }
 
 /// A variable range in use (its PHYSMASK valid bit set), decoded.
@@ -206,6 +228,20 @@ impl VariableRange {
         let inside = (size - 1) & ADDRESS_BITS;
         let above = self.mask & !inside;
         self.mask & inside != 0 && base & above == self.base & above
+    }
+}
+
+impl fmt::Display for VariableRange {
+    /// `variable range 0: base=0x000000000000 mask=0x3fff00000000 WB`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "variable range {}: base={:#014x} mask={:#014x} {}",
+            self.number,
+            self.base,
+            self.mask,
+            self.memory_type.name()
+        )
     }
 }
 
@@ -339,6 +375,26 @@ impl Mtrrs {
     }
 }
 
+impl fmt::Display for Mtrrs {
+    /// Whether the MTRRs are on and, when they are, the default type and
+    /// how many ranges apply: `enabled, default type UC; fixed ranges
+    /// enabled; 8 variable ranges, 1 in use`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("not supported (CPUID); all memory is treated as WB"),
+            Self::Disabled => f.write_str("disabled (IA32_MTRR_DEF_TYPE.E=0); all memory is UC"),
+            Self::Enabled(enabled) => write!(
+                f,
+                "enabled, default type {}; fixed ranges {}; {} variable ranges, {} in use",
+                enabled.default_type().name(),
+                if enabled.fixed_enabled() { "enabled" } else { "disabled" },
+                enabled.variable_count(),
+                enabled.variable_ranges().len(),
+            ),
+        }
+    }
+}
+
 impl EnabledMtrrs {
     /// The type of memory no range covers.
     pub fn default_type(&self) -> MemoryType {
@@ -414,47 +470,20 @@ pub struct TypeRun {
     pub memory_type: Option<MemoryType>,
 }
 
+impl TypeRun {
+    /// The run's type for a report: its name, or "mixed" for blocks whose
+    /// pages differ.
+    pub fn type_name(&self) -> &'static str {
+        self.memory_type.map_or("mixed (4 KiB pages)", MemoryType::name)
+    }
+}
+
 /// The memory type in bits 7:0 of `value`, read from MSR `msr`.
 fn decode_type(msr: u32, value: u64) -> Result<MemoryType, MtrrError> {
     let raw = (value & TYPE_BITS) as u8;
     MemoryType::from_raw(raw).ok_or(MtrrError::ReservedType { msr, value: raw })
 }
 
-/// Reads and decodes this CPU's MTRRs, or returns [`Mtrrs::Unsupported`]
-/// when CPUID says it has none.
-pub fn read() -> Result<Mtrrs, MtrrError> {
-    if !cpuid::has_mtrr() {
-        return Ok(Mtrrs::Unsupported);
-    }
-    // SAFETY: CPUID reports MTRRs, so IA32_MTRRCAP and IA32_MTRR_DEF_TYPE
-    // exist. Reading them has no side effects.
-    let (cap, def_type) = unsafe { (rdmsr(IA32_MTRRCAP), rdmsr(IA32_MTRR_DEF_TYPE)) };
-
-    let fixed = if cap & CAP_FIXED != 0 {
-        let mut values = [0; FIXED_MSRS];
-        for (value, &(msr, ..)) in values.iter_mut().zip(&FIXED_RANGES) {
-            // SAFETY: IA32_MTRRCAP says the fixed-range MSRs exist.
-            *value = unsafe { rdmsr(msr) };
-        }
-        Some(values)
-    } else {
-        None
-    };
-
-    let count = (cap & CAP_VARIABLE_COUNT) as usize;
-    if count > MAX_VARIABLE_RANGES {
-        return Err(MtrrError::TooManyVariableRanges { count });
-    }
-    let mut variable = [(0, 0); MAX_VARIABLE_RANGES];
-    for (number, pair) in variable[..count].iter_mut().enumerate() {
-        let base = IA32_MTRR_PHYSBASE0 + 2 * number as u32;
-        // SAFETY: IA32_MTRRCAP counts `count` variable ranges, so the
-        // PHYSBASE and PHYSMASK MSRs of each exist.
-        *pair = unsafe { (rdmsr(base), rdmsr(base + 1)) };
-    }
-    Mtrrs::decode(def_type, fixed, &variable[..count])
-}
-
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/mtrr.rs"]
+#[path = "../../../tests/unit/vmx/mtrr.rs"]
 pub(crate) mod tests;

@@ -7,17 +7,21 @@
 //! to 0x2), and the guest's general-purpose registers are still live in the
 //! CPU, so the stub saves them before any Rust code can clobber them.
 //!
-//! `bring_up::run` enters the guest through `vmcs::launch`, so the guest's
-//! first VM exit lands here. The handler (`handler.rs`) prints each exit over
+//! `bring_up::run` enters the guest through `vmcs::launch` (the test guest)
+//! or `vmcs::launch_in_place` (the firmware), so the guest's first VM exit
+//! lands here. The handler (`handler.rs`) prints each exit over
 //! serial, and `exit_decision::decide` says what it is: an instruction to
-//! execute for the guest (CPUID, RDMSR, WRMSR, IN, OUT), or a #GP to inject
-//! for an MSR it cannot have or a non-canonical value written to one it can,
+//! execute for the guest (CPUID, RDMSR, WRMSR, IN, OUT), an access to its
+//! copy of its MTRRs (`guest_mtrrs.rs`), or a #GP to inject for an MSR it
+//! cannot have or a value written to one that the CPU would refuse,
 //! a write to the EPT-protected data page to allow and retry, a VMCALL to
 //! resume past, an NMI to reinject, an NMI window to inject in, the last
 //! planned VMCALL, or something unexpected. To resume, the
 //! handler updates the VMCS and returns 0, and the stub executes VMRESUME. To
-//! stop, it returns a stop value, and the stub jumps back into
-//! `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`). The
+//! stop the test guest, it returns a stop value, and the stub jumps back
+//! into `vmcs::launch`, which returns to bring-up (see `vmx/vmcs/launch.rs`).
+//! A stop of the firmware has no launch frame to return to, so the handler
+//! halts once it has printed the stop. The
 //! lines that only print live in `report.rs`; how much of each exit they
 //! print is `policy.rs`'s decision. Every exit is counted in the vCPU's
 //! statistics (`stats.rs`). Every stop adds the guest's state and registers
@@ -29,12 +33,14 @@ use super::page::{PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::{self, VmcsError};
 
 mod dump;
+mod guest_mtrrs;
 mod handler;
 mod history;
 mod policy;
 mod report;
 mod stats;
 
+pub use guest_mtrrs::{publish as publish_guest_mtrrs, registers as guest_mtrr_registers};
 pub use stats::{VcpuStats, snapshot as vcpu_stats};
 
 /// Prints the last VM exits, oldest first, each line after `context`: for
@@ -51,7 +57,10 @@ fn read_field(field: u32) -> Result<u64, VmcsError> {
     unsafe { vmcs::vmread(field) }
 }
 
-pub const VM_EXIT_STACK_PAGES: usize = 4;
+/// 64 KiB. A debug build's exits used 21168 bytes on Hyper-V (an MTRR write
+/// that retypes EPT), more than the 16 KiB this once was: nothing guards the
+/// page below the stack, so the handler ran on into the guest's data page.
+pub const VM_EXIT_STACK_PAGES: usize = 16;
 pub const VM_EXIT_STACK_SIZE: usize = VM_EXIT_STACK_PAGES * PAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +90,33 @@ impl VmExitStack {
         assert_eq!(top % 16, 0);
         top as u64
     }
+
+    /// How many bytes of the stack the exit handler has written, from the
+    /// top down to the lowest nonzero word ([`used_bytes`]). The whole size
+    /// means the lowest word was written, which an overflow into the page
+    /// below does on its way.
+    ///
+    /// # Safety
+    ///
+    /// No exit handler may be running on the stack: the guest has stopped.
+    pub unsafe fn used(&self) -> usize {
+        // SAFETY: the allocation is VM_EXIT_STACK_SIZE bytes, page-aligned,
+        // and the caller guarantees nothing writes it meanwhile.
+        let words = unsafe {
+            core::slice::from_raw_parts(self.base.as_ptr().cast::<u64>(), VM_EXIT_STACK_SIZE / size_of::<u64>())
+        };
+        used_bytes(words)
+    }
+}
+
+/// Bytes from the lowest nonzero word of `words`, a stack that started
+/// zeroed, to its top. A word the handler wrote as zero counts as unused,
+/// so this can undercount by the few words below the deepest nonzero one.
+fn used_bytes(words: &[u64]) -> usize {
+    words
+        .iter()
+        .position(|&word| word != 0)
+        .map_or(0, |lowest| (words.len() - lowest) * size_of::<u64>())
 }
 
 #[repr(C)]
@@ -153,7 +189,8 @@ vmexit_entry:
     call vmexit_handler
 
     // RAX = 0: resume the guest. Anything else is a stop value: return it
-    // from vmx_launch (vmx/vmcs/launch.rs), abandoning this stack.
+    // from vmx_launch (vmx/vmcs/launch.rs), abandoning this stack. Only the
+    // test guest's stops get here; the firmware's halt in the handler.
     test rax, rax
     jnz vmx_return_to_launcher
 
@@ -215,3 +252,7 @@ unsafe extern "C" {
 pub fn entry_address() -> u64 {
     vmexit_entry as *const () as usize as u64
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/vmx/vmexit.rs"]
+mod tests;

@@ -1,6 +1,10 @@
 //! Why bring-up stopped, and how that gets printed.
 
+use uefi::Status;
+use uefi::boot::MemoryType;
+
 use crate::vmx;
+use crate::vmx::apic::LocalApicError;
 use crate::vmx::context_tables::{GdtError, TssError};
 use crate::vmx::ept::EptError;
 use crate::vmx::exit_bitmaps::ExitBitmapsError;
@@ -26,11 +30,16 @@ pub enum BringUpError {
     ExitBitmaps(ExitBitmapsError),
     VmxNotSupportedByCpu,
     VmxDisabledByFirmware,
-    /// The MTRRs hold something Aleph0 cannot copy into EPT. Before VMXON.
+    /// An MTRR MSR holds a value the CPU would refuse, or the MTRRs hold
+    /// something Aleph0 cannot copy into EPT. Before VMXON.
     Mtrr(MtrrError),
     /// The CPU lacks EPT support Aleph0 needs, or building the EPT tables
     /// failed. Both happen before VMXON.
     Ept(EptError),
+    /// The test guest could not read the Local APIC's registers in xAPIC
+    /// mode: its page tables or EPT do not map their page to itself, EPT
+    /// with UC. Before VMXON.
+    LocalApic(LocalApicError),
     /// Building the page tables, GDT, TSS or IDT that VMX root operation
     /// runs on failed. Before VMXON.
     Host(HostError),
@@ -54,6 +63,24 @@ pub enum BringUpError {
     /// activation and the launch. The VMCS guest fields were copied from the
     /// activated tables, so the guest would start on stale ones.
     ContextTablesChanged,
+    /// The UEFI memory map, which the resident allocations are checked
+    /// against, could not be read. Before the launch.
+    ResidentMemoryMapUnavailable,
+    /// The resident allocation at `address` lies in memory the OS may reuse
+    /// after `ExitBootServices`: its memory-map region has type
+    /// `memory_type`, or no region holds it (`None`). Before the launch.
+    NotResident {
+        address: u64,
+        memory_type: Option<MemoryType>,
+    },
+    /// `count` resident allocations came after `vmx::page`'s list was full,
+    /// so they could not be checked. Before the launch.
+    ResidentAllocationsUnlisted(usize),
+    /// `vmx::page` listed no resident allocation, not even the image copy,
+    /// so the check would have checked nothing. Before the launch.
+    NoResidentAllocations,
+    /// The `ExitBootServices` event could not be created. Before the launch.
+    ExitBootServicesEvent(Status),
     /// The guest stopped at exit `number`, which the exit handler did not
     /// resume: it does not handle that exit, or it is an expected VMCALL the
     /// handler could not step past. Its lines on serial say which.
@@ -61,6 +88,13 @@ pub enum BringUpError {
         number: u64,
         reason: ExitReason,
     },
+    /// The CPU's MTRRs read differently after the guest than before: a
+    /// guest write reached them instead of the guest's copy.
+    MtrrsChanged,
+    /// The exit handler wrote the lowest word of the VM-exit stack: it used
+    /// all of it and may have run on into the memory below, which nothing
+    /// guards.
+    VmExitStackFull,
     /// The guest finished, but its exit statistics differ from what the
     /// test guest does (`guest::expected_stats`): an emulated exit is
     /// missing or came twice.
@@ -74,6 +108,12 @@ pub enum BringUpError {
     /// before teardown; otherwise that earlier error is returned and this
     /// one was printed when it happened.
     Teardown(TeardownError),
+}
+
+impl From<LocalApicError> for BringUpError {
+    fn from(error: LocalApicError) -> Self {
+        Self::LocalApic(error)
+    }
 }
 
 impl From<TssError> for BringUpError {
@@ -186,18 +226,17 @@ pub fn report_error(error: BringUpError) {
         BringUpError::ExitBitmaps(error) => log!("Exit bitmap allocation failed: {error:?}"),
         BringUpError::VmxNotSupportedByCpu => log!("VMX not supported by this CPU."),
         BringUpError::VmxDisabledByFirmware => log!("VMX supported by CPU but disabled by firmware."),
-        BringUpError::Mtrr(MtrrError::ReservedType { msr, value }) => {
-            log!("MTRR setup failed: MSR {msr:#x} gives a range the reserved memory type {value}.")
-        }
-        BringUpError::Mtrr(MtrrError::TooManyVariableRanges { count }) => log!(
-            "MTRR setup failed: IA32_MTRRCAP reports {count} variable ranges, more than the {} Aleph0 keeps.",
-            vmx::mtrr::MAX_VARIABLE_RANGES,
-        ),
-        BringUpError::Ept(EptError::RangeTooLarge { end }) => log!(
-            "EPT setup failed: the memory map reaches {end:#x}, past the {:#x} one PDPT maps.",
-            vmx::ept::MAX_IDENTITY_MAP,
+        BringUpError::Mtrr(error) => log!("MTRR setup failed: {error}."),
+        BringUpError::Ept(EptError::RangeTooLarge { end, limit }) => log!(
+            "EPT setup failed: the memory map reaches {end:#x}, past {limit:#x}, the end of the guest-physical address space (MAXPHYADDR, at most the 48 bits a 4-level EPT walk translates)."
         ),
         BringUpError::Ept(error) => log!("EPT setup failed: {error:?}"),
+        BringUpError::LocalApic(LocalApicError::GuestMapping { address, translation }) => log!(
+            "The page tables the guest shares do not map the Local APIC's registers at {address:#x} to themselves: {translation:?}."
+        ),
+        BringUpError::LocalApic(LocalApicError::EptMapping { address, end }) => {
+            log!("EPT does not map the Local APIC's registers at {address:#x} to themselves, UC: {end}.")
+        }
         BringUpError::Host(error) => log!("Host environment setup failed: {error:?}"),
         BringUpError::VmxOn(error) => log!("VMXON failed: {error:?}"),
         BringUpError::Vmcs {
@@ -224,11 +263,42 @@ pub fn report_error(error: BringUpError) {
         BringUpError::ContextTablesChanged => {
             log!("Context descriptor tables changed after VMX/UEFI calls; the guest was not launched.")
         }
+        BringUpError::ResidentMemoryMapUnavailable => {
+            log!(
+                "The UEFI memory map is unavailable, so the resident allocations went unchecked; the guest was not launched."
+            )
+        }
+        BringUpError::NotResident {
+            address,
+            memory_type: Some(memory_type),
+        } => log!(
+            "The resident allocation at {address:#018x} is {memory_type:?}, which the OS may reuse after ExitBootServices; the guest was not launched."
+        ),
+        BringUpError::NotResident {
+            address,
+            memory_type: None,
+        } => log!("The resident allocation at {address:#018x} is in no memory-map region; the guest was not launched."),
+        BringUpError::ResidentAllocationsUnlisted(count) => log!(
+            "{count} resident allocation(s) came after the list was full and went unchecked; the guest was not launched."
+        ),
+        BringUpError::NoResidentAllocations => {
+            log!("No resident allocation was listed, not even the image copy; the guest was not launched.")
+        }
+        BringUpError::ExitBootServicesEvent(status) => {
+            log!("The ExitBootServices event could not be created: {status:?}; the firmware was not launched.")
+        }
         BringUpError::UnexpectedExit { number, reason } => log!(
             "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",
             reason.basic,
             vmx::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
+        ),
+        BringUpError::MtrrsChanged => {
+            log!("The CPU's MTRRs changed while the guest ran: a guest write reached them, not its copy.")
+        }
+        BringUpError::VmExitStackFull => log!(
+            "The exit handler used all {} bytes of the VM-exit stack and may have overwritten the memory below it.",
+            vmx::vmexit::VM_EXIT_STACK_SIZE,
         ),
         BringUpError::UnexpectedExitStats(stats) => log!(
             "Guest finished, but its exit statistics were {stats}; expected {}.",

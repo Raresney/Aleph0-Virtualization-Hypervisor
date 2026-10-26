@@ -260,6 +260,9 @@ Aleph0's lines only.
 - `-NoSerial` skips both readers (the ports stay attached). You can also
   connect with PuTTY: connection type *Serial*, serial line
   `\\.\pipe\aleph0-com2`.
+- With `-WithoutAleph0`, which boots the Linux target in Aleph0's place
+  ([LINUX_GUEST.md](LINUX_GUEST.md)), nothing writes COM2: the runner starts
+  only the COM1 reader, and it prints the kernel's console in the window too.
 
 ### QEMU
 
@@ -366,7 +369,9 @@ without another run (`src/vmx/vmexit/dump.rs`, `history.rs`):
 3. **DR7, PAT and EFER**, from wherever the controls leave them: the VMCS
    when an exit control saves them, the MSR when nothing switches it, and
    `not saved` otherwise. Every exit sets DR7 to `0x400`, so under Hyper-V's
-   controls DR7 is `not saved`, and PAT and EFER come from their MSRs.
+   controls DR7 is `not saved`, and EFER comes from its MSR. PAT came from
+   its MSR too until Aleph0 switched it (`vmcs::pat_switch`); where the CPU
+   allows that, it comes from `GUEST_IA32_PAT`.
 4. **The VMCS fields that explain an exit**, one line per group: pending
    events (interruptibility, activity, pending debug exceptions), an
    injection Aleph0 queued, the exit's event and an interrupted delivery

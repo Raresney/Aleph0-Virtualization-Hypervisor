@@ -90,7 +90,7 @@ Three stacks are in play, and only the first one holds the saved frame:
 | Stack | Who uses it | While the guest runs |
 |---|---|---|
 | firmware stack | `main`, `run`, `launch`, `vmx_launch` | frozen; nothing writes it |
-| VM-exit stack (4 pages, `HOST_RSP`) | the exit stub and handler | every exit starts at its top again |
+| VM-exit stack (16 pages, `HOST_RSP`) | the exit stub and handler | every exit starts at its top again |
 | guest stack page | the guest | the guest's RSP |
 
 The guest runs with IF = 0, and every guest exception exits (exception
@@ -298,8 +298,12 @@ with ABORTED.`
 - NMIs: since the NMI step, NMI exiting is on and NMIs are reinjected into
   the guest's own IDT; see NMI.md.
 - After `ExitBootServices` Aleph0 must stay resident instead of returning
-  (ROADMAP section 5). The stop path is then the way to shut the hypervisor
-  down, not the normal end of a run.
+  ([RESIDENT.md](RESIDENT.md)). A stop then halts, as it does for the
+  firmware guest; the OS-mode stop policy is #28.
+- All of this is the test guest's path, the regression mode (Cargo feature
+  `test-guest`). A default build virtualizes the firmware in place, which
+  has no stop to return from: a stop of the firmware halts after its report,
+  and no teardown runs. See [FIRMWARE_GUEST.md](FIRMWARE_GUEST.md).
 
 ## Cheat sheet
 

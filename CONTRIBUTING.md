@@ -34,13 +34,20 @@ verified. [README.md](README.md) covers building and running;
 ```powershell
 cargo build                                            # the .efi
 cargo test-host                                        # host unit tests
-cargo fmt --check                                      # rustfmt.toml: 120 columns
+cargo fmt --all --check                                # rustfmt.toml: 120 columns, both packages
 cargo clippy                                           # lints for the UEFI build
+cargo clippy --features test-guest                     # lints for the regression mode
 cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
+cargo clippy -p ebs-harness                            # lints for the ExitBootServices harness
+cargo clippy -p ebs-harness --features set-virtual-address-map
+cargo test -p ebs-harness --target x86_64-pc-windows-msvc            # its host tests
+cargo clippy -p ebs-harness --target x86_64-pc-windows-msvc --tests  # lints for them
 ```
 
 All of them must pass without warnings. Use your host triple instead of
-`x86_64-pc-windows-msvc` on Linux or macOS.
+`x86_64-pc-windows-msvc` on Linux or macOS. The harness (`tools/ebs-harness`)
+is the workspace's second package; Cargo commands without `-p` act on Aleph0
+alone.
 
 ## Code conventions
 
@@ -101,7 +108,7 @@ working after `ExitBootServices`. In code reachable from it:
 ## Tests
 
 Unit tests live in `tests/unit/`, which mirrors `src/`: the tests for
-`src/vmx/ept.rs` are in `tests/unit/vmx/ept.rs`. Each source file includes its
+`src/vmx/paging.rs` are in `tests/unit/vmx/paging.rs`. Each source file includes its
 tests with
 
 ```rust
@@ -123,9 +130,19 @@ Host tests cannot prove that VM entry succeeds or that an exit behaves as
 planned. A change that affects what runs in VMX operation needs a boot:
 
 ```powershell
-.\scripts\run-hyperv.ps1              # from an elevated PowerShell session
-.\scripts\run-hyperv.ps1 -InjectNmi   # also exercises NMI reinjection
+# From an elevated PowerShell session.
+.\scripts\run-hyperv.ps1 -ProcessorCount 1   # the firmware, virtualized in place
+.\scripts\run-hyperv.ps1 -TestGuest          # the test guest: the regression mode
+.\scripts\run-hyperv.ps1 -InjectNmi          # the test guest, with NMI reinjection
+.\scripts\run-hyperv.ps1 -Harness -ProcessorCount 1   # the ExitBootServices harness
 ```
+
+A default build virtualizes the running firmware: Aleph0 returns to it in
+VMX non-root operation, and it runs until an exit Aleph0 does not handle,
+which halts after the stop's report. The test guest (Cargo feature
+`test-guest`) runs a fixed script, then teardown, and returns `SUCCESS`, so
+its exits can be compared run by run. A change to VM exits is checked in
+both modes.
 
 VM-exit diagnostics appear only on serial (the PowerShell window and
 `run\serial.log`). Put the relevant serial lines in the pull request, and

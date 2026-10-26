@@ -5,6 +5,7 @@
 //! private items.
 
 use super::*;
+use crate::vmx::mtrr::MtrrCapabilities;
 
 #[test]
 fn low_msrs_are_read_from_offset_0() {
@@ -60,8 +61,42 @@ fn fill_sets_exactly_the_intercepted_bits() {
     let ones = |page: &[u8]| page.iter().map(|byte| byte.count_ones()).sum::<u32>();
     assert_eq!(msr[0x420], 1 << 2);
     assert_eq!(msr[0xC20], 1 << 2);
-    assert_eq!(ones(&msr), 2);
+    // IA32_KERNEL_GS_BASE and the 76 MTRR addresses, each read and write.
+    assert_eq!(ones(&msr), 2 + 2 * 76);
     assert_eq!(io_a[0x7F], 1 << 7);
     assert_eq!(ones(&io_a), 1);
     assert_eq!(ones(&io_b), 0);
+}
+
+#[test]
+fn fill_intercepts_both_ways_every_mtrr_address_whatever_the_cpu_has() {
+    let (mut msr, mut io_a, mut io_b) = ([0u8; PAGE_SIZE], [0u8; PAGE_SIZE], [0u8; PAGE_SIZE]);
+    fill(&mut msr, &mut io_a, &mut io_b);
+    let intercepted = |address: u32, access| {
+        let (offset, bit) = msr_bit(address, access).unwrap();
+        msr[offset] & (1 << bit) != 0
+    };
+    // Hyper-V's 28 MTRR MSRs, and the variable ranges past its eight.
+    let hyper_v = MtrrCapabilities::new((1 << 8) | 8, 46).unwrap();
+    for address in hyper_v.msrs().map(|mtrr| mtrr.address()).chain(0x210..0x240) {
+        for access in [MsrAccess::Read, MsrAccess::Write] {
+            assert!(intercepted(address, access), "{address:#x} {access:?}");
+        }
+    }
+    // IA32_MTRRCAP stays the guest's, IA32_PAT is held in the VMCS, and
+    // 0x240 is past the variable ranges Aleph0 keeps.
+    for address in [0xFE, 0x277, 0x240] {
+        assert!(!intercepted(address, MsrAccess::Read), "{address:#x}");
+        assert!(!intercepted(address, MsrAccess::Write), "{address:#x}");
+    }
+}
+
+#[test]
+fn no_mtrr_address_is_passed_through_or_held_in_the_vmcs() {
+    for address in mtrr::every_msr_address() {
+        assert!(msr_bit(address, MsrAccess::Read).is_some(), "{address:#x}");
+        assert!(!INTERCEPTED_MSRS.contains(&address), "{address:#x}");
+        // IA32_PAT (0x277) is the one in their neighbourhood.
+        assert!(!VMCS_HELD_MSRS.contains(&address), "{address:#x}");
+    }
 }

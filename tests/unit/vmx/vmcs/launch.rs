@@ -103,6 +103,19 @@ fn failed_vmresume_keeps_its_flags() {
 }
 
 #[test]
+fn zero_from_the_in_place_launch_means_it_runs_on_as_the_guest() {
+    assert_eq!(decode_in_place(0), Ok(()));
+}
+
+#[test]
+fn rflags_from_a_failed_in_place_launch_say_how_it_failed() {
+    assert_eq!(decode_in_place(RESERVED | IF | CF), Err(VmcsError::VmFailInvalid));
+    assert_eq!(decode_in_place(RESERVED | IF | ZF), Err(VmcsError::VmFailValid));
+    // Clear flags still mean VMLAUNCH fell through, never that it ran.
+    assert_eq!(decode_in_place(RESERVED | IF), Err(VmcsError::LaunchReturned));
+}
+
+#[test]
 fn no_stop_value_is_zero() {
     // The exit handler returns 0 to mean "resume the guest".
     assert_ne!(encode_finished(0), 0);

@@ -19,7 +19,8 @@
 //!    even on a freshly zeroed page.
 //! 3. [`VmcsRegion::vmptrld`] — make it the *current* VMCS. From here on
 //!    [`vmread`]/[`vmwrite`] act on it implicitly, with no address operand.
-//! 4. [`vmwrite`] the fields, then [`launch`] (VMLAUNCH).
+//! 4. [`vmwrite`] the fields, then [`launch`] or [`launch_in_place`]
+//!    (VMLAUNCH).
 //!
 //! [`VmcsRegion::create_current`] runs steps 1-3.
 //!
@@ -42,7 +43,7 @@ use core::arch::asm;
 pub mod fields;
 mod launch;
 
-pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpected, launch};
+pub use launch::{GuestStop, encode_finished, encode_resume_failed, encode_unexpected, launch, launch_in_place};
 
 // Private glob: this file uses dozens of encodings. Callers elsewhere import
 // from `vmcs::fields` themselves, so each constant has a single path.
@@ -84,19 +85,39 @@ impl DesiredControls {
     }
 }
 
-/// Which guest the VMCS is set up for.
+/// Which guest Aleph0 runs. The kind decides where the guest starts
+/// (`guest_state::GuestEntry`), which exceptions exit ([`exception_bitmap`]),
+/// how its exits are decided (`exit_decision::decide`), and where a stop
+/// ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestKind {
-    /// Aleph0's built-in test guest (`vmx::guest`): its IDT has only the NMI
-    /// gate.
+    /// Aleph0's built-in test guest (`vmx::guest`), the regression mode. Its
+    /// IDT has only the NMI gate, and its scripted VMCALLs end the run. A
+    /// stop returns to bring-up ([`launch`]), and bring-up then leaves VMX
+    /// operation.
     BuiltInTest,
-    /// A guest with its own full IDT, such as the firmware or an OS, which
-    /// handles its own faults.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "selected once the firmware runs as the guest (#21)")
-    )]
-    OwnIdt,
+    /// The running firmware, virtualized in place ([`launch_in_place`]). It
+    /// has its own full IDT and handles its own faults. It never finishes,
+    /// and a stop halts: the firmware has reused the stack the launch ran
+    /// on.
+    Firmware,
+}
+
+impl GuestKind {
+    /// The guest this build runs: the built-in test guest with the
+    /// `test-guest` Cargo feature, the firmware otherwise.
+    pub const SELECTED: Self = if cfg!(feature = "test-guest") {
+        Self::BuiltInTest
+    } else {
+        Self::Firmware
+    };
+
+    /// Whether a stop of this guest returns to bring-up, through the frame
+    /// [`launch`] saved. [`launch_in_place`] saves none, so a stop of the
+    /// firmware halts.
+    pub const fn stop_returns_to_bring_up(self) -> bool {
+        matches!(self, Self::BuiltInTest)
+    }
 }
 
 /// The exception bitmap for `kind`.
@@ -107,14 +128,47 @@ pub enum GuestKind {
 /// exception arrive as exit reason 0, where the handler prints the vector;
 /// its `ud2` paths rely on that.
 ///
-/// A guest with its own IDT takes its own faults (Linux builds its early
-/// page tables from #PF), so nothing exits. NMIs still exit, through the
-/// NMI-exiting pin control, not this bitmap; a fault the guest cannot handle
-/// ends in a triple fault (reason 2), which stops it.
+/// The firmware has its own IDT and takes its own faults, as an OS will
+/// (Linux builds its early page tables from #PF), so nothing exits. NMIs
+/// still exit, through the NMI-exiting pin control, not this bitmap; a fault
+/// the guest cannot handle ends in a triple fault (reason 2), which stops it.
 pub const fn exception_bitmap(kind: GuestKind) -> u32 {
     match kind {
         GuestKind::BuiltInTest => u32::MAX,
-        GuestKind::OwnIdt => 0,
+        GuestKind::Firmware => 0,
+    }
+}
+
+/// The VM-exit controls that, with [`PAT_SWITCH_ENTRY`], give the guest an
+/// IA32_PAT of its own: VM exit saves the guest's into GUEST_IA32_PAT and
+/// loads HOST_IA32_PAT.
+const PAT_SWITCH_EXIT: u32 = (VM_EXIT_SAVE_IA32_PAT | VM_EXIT_LOAD_IA32_PAT) as u32;
+/// The VM-entry control that loads GUEST_IA32_PAT.
+const PAT_SWITCH_ENTRY: u32 = VM_ENTRY_LOAD_IA32_PAT as u32;
+
+/// The VM-exit and VM-entry controls to add to a request so that IA32_PAT
+/// is switched between the guest and Aleph0, or none when the CPU does not
+/// allow all three.
+///
+/// The MSR bitmap does not intercept IA32_PAT (`exit_bitmaps`), so the
+/// guest's WRMSR of it reaches the CPU. Without the switch the value stays
+/// after VM exit, and Aleph0's page tables select PAT entry 0 (PWT = PCD =
+/// PAT = 0): a guest that made it UC or WC would set the memory type of all
+/// of Aleph0's own accesses, as a guest write to the MTRRs did before they
+/// were intercepted. With it, VM exit saves the guest's PAT and loads
+/// Aleph0's, and VM entry loads the guest's back (Intel SDM Vol. 3C,
+/// "VM-Exit Controls" and "VM-Entry Controls"). The three only work
+/// together: without the save, VM entry would undo the guest's writes;
+/// without the loads, one PAT would still serve both.
+///
+/// On a CPU without them the PAT stays shared, as before: the stop dump
+/// shows `(MSR, not switched)`, and `docs/HOST_ENVIRONMENT.md` lists it as
+/// not covered.
+fn pat_switch(capabilities: &VmcsControlMsrs) -> (u32, u32) {
+    if capabilities.exit.allows(PAT_SWITCH_EXIT) && capabilities.entry.allows(PAT_SWITCH_ENTRY) {
+        (PAT_SWITCH_EXIT, PAT_SWITCH_ENTRY)
+    } else {
+        (0, 0)
     }
 }
 
@@ -343,7 +397,8 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 /// write them to the current VMCS, and verify each field by reading it back.
 /// When `desired.secondary` is nonzero, the secondary controls are chosen,
 /// written and verified the same way, and primary bit 31 activates them.
-/// Always request 64-bit host mode on VM exit, regardless of `desired.exit`.
+/// Always request 64-bit host mode on VM exit, regardless of `desired.exit`,
+/// and the IA32_PAT switch when the CPU allows it ([`pat_switch`]).
 /// Also zeroes the counts and fields VM entry checks, and writes
 /// `desired.exception_bitmap`. It also checks that the CPU
 /// allows NMI-window exiting (`VmcsError::NmiWindowExitingUnsupported`
@@ -365,10 +420,11 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
     if !capabilities.primary.allows(CPU_BASED_NMI_WINDOW_EXITING) {
         return Err(VmcsError::NmiWindowExitingUnsupported);
     }
+    let (pat_exit, pat_entry) = pat_switch(capabilities);
     let exit = capabilities
         .exit
-        .choose(desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE)?;
-    let entry = capabilities.entry.choose(desired.entry)?;
+        .choose(desired.exit | VM_EXIT_HOST_ADDRESS_SPACE_SIZE | pat_exit)?;
+    let entry = capabilities.entry.choose(desired.entry | pat_entry)?;
 
     // SAFETY: the caller guarantees VMX operation with a current VMCS.
     unsafe {

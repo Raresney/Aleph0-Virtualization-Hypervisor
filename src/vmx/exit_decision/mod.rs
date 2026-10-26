@@ -13,12 +13,25 @@
 //! in one place:
 //!
 //! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID,
-//!   RDMSR, WRMSR, IN, OUT), and HLT, which it skips. Each handler reads the
-//!   exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR, which get
-//!   #UD, need no handler of their own.
-//! - `scenario.rs`: the test guest's own exits (its EPT write, its VMCALLs,
-//!   NMI reinjection), which depend on what came before:
-//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`.
+//!   RDMSR, WRMSR, IN, OUT), RDMSR and WRMSR of the guest's MTRRs, which
+//!   reach a copy of them instead, and HLT, which it skips. Each handler
+//!   reads the exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR,
+//!   which get #UD, need no handler of their own.
+//! - `scenario.rs`: exits that depend on what came before:
+//!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`. NMI reinjection,
+//!   for every guest, and the test guest's own exits: its EPT write and its
+//!   VMCALLs. Any other EPT violation stops the guest as
+//!   [`ExitEvent::EptViolation`].
+//! - An EPT misconfiguration stops the guest as
+//!   [`ExitEvent::EptMisconfig`]. Aleph0 makes no misconfigured entry on
+//!   purpose (KVM does, for MMIO, and emulates the access in
+//!   `handle_ept_misconfig`), so one means the map is broken.
+//!
+//! The guest's kind (`GuestKind`) decides the VMCALLs and the test guest's
+//! own exits. The firmware has no scripted end: its VMCALLs are Aleph0's
+//! own (`vmx::vmcall`) or else Hyper-V hypercalls (#27), which stop it, and
+//! so does every EPT violation, so it never finishes and runs until an exit
+//! Aleph0 does not handle.
 //!
 //! An exit reason without a handler stops the guest. Nothing here counts
 //! exits: `vmexit::stats` does, for every guest, from what the handler
@@ -27,7 +40,11 @@
 mod emulation;
 mod scenario;
 
-pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in};
+use crate::vmx::mtrr::MtrrCapabilities;
+use crate::vmx::vmcall;
+use crate::vmx::vmcs::GuestKind;
+
+pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in, wrmsr_value};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
 /// VM-exit reason, split into the fields of the VM_EXIT_REASON VMCS field.
@@ -109,7 +126,8 @@ pub const EXIT_REASON_MONITOR: u16 = 39;
 /// allow.
 pub const EXIT_REASON_EPT_VIOLATION: u16 = 48;
 /// Basic exit reason of an EPT misconfiguration: an EPT entry the CPU
-/// cannot use at all (for example W = 1 with R = 0). Never handled.
+/// cannot use at all (for example W = 1 with R = 0). It stops the guest
+/// ([`ExitEvent::EptMisconfig`]).
 pub const EXIT_REASON_EPT_MISCONFIG: u16 = 49;
 
 // Exit qualification bits of an EPT violation (Intel SDM Vol. 3C, "Exit
@@ -319,8 +337,13 @@ pub struct ExitInfo {
     pub qualification: u64,
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only; 0 otherwise.
     pub guest_physical: u64,
-    /// GPA of the page EPT maps read-only (`ept::protected_page`), 0 if none.
+    /// GPA of the page EPT maps read-only (`ept::protected_page_for`), 0 if
+    /// none.
     pub protected_page: u64,
+    /// The guest's MTRR MSRs: which exist, and which values WRMSR refuses
+    /// (`vmexit::guest_mtrrs`). [`MtrrCapabilities::NONE`] until bring-up
+    /// publishes them, and on a CPU without MTRRs.
+    pub mtrr: MtrrCapabilities,
 }
 
 impl ExitInfo {
@@ -402,10 +425,19 @@ pub enum ExitEvent {
     /// the guest should have read from its data page: the seed before its
     /// write, its own value after it.
     DataPageMismatch,
+    /// An EPT violation other than the guest's first write to its
+    /// protected data page. The map allows every other access to every GPA
+    /// up to MAXPHYADDR, so the map itself is wrong: stop, and show the walk
+    /// of the GPA.
+    EptViolation,
+    /// An EPT misconfiguration: an entry on the GPA's path is one the CPU
+    /// refuses. `Ept::build` makes none, so stop, and show the walk.
+    EptMisconfig,
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
     /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
-    /// bitmap, or a non-canonical value for an intercepted one.
+    /// bitmap, an MTRR address the CPU has no MSR at, a non-canonical value
+    /// for an intercepted MSR, or a value its MTRRs would refuse.
     GuestGeneralProtection,
     /// HLT: resume past it at once. The guest's next instruction runs as if
     /// an interrupt had woken it.
@@ -414,6 +446,12 @@ pub enum ExitEvent {
     /// them: the guest's CPUID.1:ECX bit 3 (MONITOR/MWAIT) is clear under
     /// Hyper-V, and `cpuid_policy` passes it through.
     GuestInvalidOpcode,
+    /// Aleph0's `ExitBootServices` event ran in the guest
+    /// ([`vmcall::BOOT_SERVICES_ENDED`]): resume past its VMCALL, from now
+    /// on in the runtime output phase.
+    BootServicesEnded,
+    /// A VMCALL that only tests the exit ([`vmcall::TEST`]): resume past it.
+    TestVmcall,
     /// Anything else.
     Unexpected,
 }
@@ -585,26 +623,33 @@ impl ExitEvent {
                 ..ResumePlan::PAST_INSTRUCTION
             }),
             Self::GuestGeneralProtection => ExitAction::Resume(ResumePlan::INJECT_GP),
-            Self::Halted => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
+            Self::Halted | Self::BootServicesEnded | Self::TestVmcall => {
+                ExitAction::Resume(ResumePlan::PAST_INSTRUCTION)
+            }
             Self::GuestInvalidOpcode => ExitAction::Resume(ResumePlan::INJECT_UD),
             Self::LastMainVmcall => ExitAction::Finished,
-            Self::EptWriteMissing | Self::DataPageMismatch | Self::Unexpected => ExitAction::Unexpected,
+            Self::EptWriteMissing
+            | Self::DataPageMismatch
+            | Self::EptViolation
+            | Self::EptMisconfig
+            | Self::Unexpected => ExitAction::Unexpected,
         }
     }
 }
 
-/// Decides what `exit` is, given what happened before (`state`), and
-/// returns the event with the state for the next exit.
+/// Decides what `exit` of a `guest` is, given what happened before
+/// (`state`), and returns the event with the state for the next exit.
 ///
 /// A VM-entry failure is never handled, whatever the reason. Every other
 /// exit goes to the handler for its reason. An exit that interrupted an
 /// event's delivery (`exit.idt_vectoring` valid) is still judged by its
 /// reason; the handler re-delivers the event with the plan's `redeliver`
 /// (built by [`ExitInfo::redelivery`] and [`ResumePlan::redelivering`]).
-pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
+pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
     if exit.reason.entry_failure {
         return (ExitEvent::Unexpected, state);
     }
+    let test_guest = guest == GuestKind::BuiltInTest;
     match exit.reason.basic {
         EXIT_REASON_CPUID => (emulation::cpuid(&exit), state),
         EXIT_REASON_RDMSR => (emulation::rdmsr(&exit), state),
@@ -614,9 +659,23 @@ pub fn decide(state: ExitState, exit: ExitInfo) -> (ExitEvent, ExitState) {
         EXIT_REASON_MWAIT | EXIT_REASON_MONITOR => (ExitEvent::GuestInvalidOpcode, state),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
-        EXIT_REASON_EPT_VIOLATION => scenario::ept_violation(state, &exit),
-        EXIT_REASON_VMCALL => scenario::vmcall(state, &exit),
+        EXIT_REASON_EPT_VIOLATION if test_guest => scenario::ept_violation(state, &exit),
+        EXIT_REASON_EPT_VIOLATION => (ExitEvent::EptViolation, state),
+        EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),
+        EXIT_REASON_VMCALL if test_guest => scenario::vmcall(state, &exit),
+        EXIT_REASON_VMCALL => (aleph0_vmcall(&exit), state),
         _ => (ExitEvent::Unexpected, state),
+    }
+}
+
+/// A VMCALL of the firmware, or of the OS after it: one of Aleph0's own
+/// (`vmx::vmcall`), told apart by RAX, or else a Hyper-V hypercall, which
+/// stops the guest until #27 forwards them.
+fn aleph0_vmcall(exit: &ExitInfo) -> ExitEvent {
+    match exit.guest_rax {
+        vmcall::BOOT_SERVICES_ENDED => ExitEvent::BootServicesEnded,
+        vmcall::TEST => ExitEvent::TestVmcall,
+        _ => ExitEvent::Unexpected,
     }
 }
 

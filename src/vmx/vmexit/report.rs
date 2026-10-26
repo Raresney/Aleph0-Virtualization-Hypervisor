@@ -4,20 +4,25 @@
 //! Like the handler, everything here runs in exit context: only VMREAD and
 //! the serial port, never firmware.
 
+use super::guest_mtrrs::{self, MtrrWrite};
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
 use super::policy::{COUNTERS, Detail, Histogram};
 use super::{RegisterFrame, dump, history, read_field, stats};
-use crate::vmx::ept::InveptType;
+use crate::vmx::ept::{Eptp, InveptType, Retyped};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EptQualification, ExitEvent, ExitInfo, ExitState,
-    InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax,
+    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_WRMSR, EptQualification, ExitEvent, ExitInfo,
+    ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax, wrmsr_value,
 };
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
-use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmcs::fields::GUEST_LINEAR_ADDRESS;
+use crate::vmx::mtrr::{self, FIXED_END, MtrrMsr, Mtrrs};
+use crate::vmx::page::PAGE_SIZE;
+use crate::vmx::vmcs::fields::{EPT_POINTER, GUEST_LINEAR_ADDRESS};
+use crate::vmx::vmcs::{GuestKind, VmcsError};
 
 /// One exit, as its report needs it.
 pub(super) struct ExitReport<'a> {
+    /// The guest it came from.
+    pub(super) guest: GuestKind,
     /// The exit's number, from 1.
     pub(super) number: u64,
     /// How many exits of its reason there have been, this one included.
@@ -42,6 +47,7 @@ pub(super) struct ExitReport<'a> {
 /// detail.
 pub(super) fn report_exit(report: &ExitReport<'_>) {
     let ExitReport {
+        guest,
         number,
         count,
         detail,
@@ -79,14 +85,23 @@ pub(super) fn report_exit(report: &ExitReport<'_>) {
         report_host_nmi(number);
     }
     match outcome {
-        Outcome::Resumed { resumed, .. } => report_event(number, event, read.exit, next, Some(resumed)),
+        Outcome::Resumed { resumed, .. } => report_event(guest, number, event, read.exit, next, Some(resumed)),
         Outcome::ResumeFailed(failure) => {
             crate::serial_println!("{tag} VM exit #{number}: {failure}; not resuming.")
         }
-        Outcome::Stopped(_) => report_event(number, event, read.exit, next, None),
+        Outcome::Stopped(_) => report_event(guest, number, event, read.exit, next, None),
     }
     if outcome.stops() {
-        crate::serial_println!("{tag} VM exit #{number}: stopping the guest; returning to bring-up.");
+        crate::serial_println!("{tag} VM exit #{number}: stopping the guest; {}.", after_stop(guest));
+    }
+}
+
+/// Where a stop of `guest` goes, for its report line.
+pub(super) fn after_stop(guest: GuestKind) -> &'static str {
+    if guest.stop_returns_to_bring_up() {
+        "returning to bring-up"
+    } else {
+        "halting: the firmware has nothing to return to"
     }
 }
 
@@ -184,6 +199,40 @@ fn report_ept_exit(number: u64, basic: u16, qualification: EptQualification, gue
     }
 }
 
+/// Prints the walk of `gpa` through the EPT tables EPT_POINTER names: each
+/// entry on its path, what the CPU refuses in it, and how the walk ended
+/// (`ept::walk`), as KVM prints the hierarchy of an EPT entry with reserved
+/// bits set. The walk reads only Aleph0's own table pages.
+fn report_ept_walk(number: u64, gpa: u64) {
+    let tag = crate::TAG;
+    let eptp = match read_field(EPT_POINTER) {
+        Ok(raw) => Eptp::from_raw(raw),
+        Err(error) => {
+            crate::serial_println!("{tag} VM exit #{number}: EPT_POINTER unreadable ({error:?}); no EPT walk.");
+            return;
+        }
+    };
+    let Some(walk) = guest_mtrrs::inspect(|_, tables| tables.walk(eptp, gpa)) else {
+        crate::serial_println!("{tag} VM exit #{number}: the EPT tables are not available; no EPT walk.");
+        return;
+    };
+    crate::serial_println!(
+        "{tag} VM exit #{number}: EPT walk of GPA {gpa:#018x} from EPTP {:#x}:",
+        eptp.raw()
+    );
+    for entry in walk.entries() {
+        crate::serial_println!(
+            "{tag} VM exit #{number}:   {} entry {:#x} at {:#x} = {:#018x}: {}",
+            entry.level.name(),
+            entry.index,
+            entry.address,
+            entry.raw,
+            entry.faults,
+        );
+    }
+    crate::serial_println!("{tag} VM exit #{number}:   {}.", walk.end);
+}
+
 /// Prints that an NMI arrived while Aleph0 ran in root operation, and is
 /// now pending for the guest. Not "resuming the guest": that text arms
 /// `run-hyperv.ps1 -InjectNmi`.
@@ -214,10 +263,17 @@ pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &
     history::report(format_args!("VM exit #{number}"));
 }
 
-/// Prints what exit `number` turned out to be and what Aleph0 does about
-/// it. `state` is the state after the exit; `resumed` is how the guest goes
-/// on, for events that resume it.
-fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: ExitState, resumed: Option<Resumed>) {
+/// Prints what exit `number` of `guest` turned out to be and what Aleph0
+/// does about it. `state` is the state after the exit; `resumed` is how the
+/// guest goes on, for events that resume it.
+fn report_event(
+    guest: GuestKind,
+    number: u64,
+    event: ExitEvent,
+    exit: Option<ExitInfo>,
+    state: ExitState,
+    resumed: Option<Resumed>,
+) {
     let tag = crate::TAG;
     let rax = exit.map_or(0, |exit| exit.guest_rax);
     let rip = resumed.map_or(0, |resumed| resumed.rip);
@@ -237,6 +293,15 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
         ExitEvent::EptWriteMissing => crate::serial_println!(
             "{tag} VM exit #{number}: main VMCALL (rax={rax:#x}) before any EPT violation: the guest's write to its data page was not caught, so EPT did not protect it."
         ),
+        ExitEvent::EptViolation => {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: an EPT violation Aleph0 does not handle: only the guest's first write to its protected data page is one; the map is wrong for this GPA."
+            );
+            report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical));
+        }
+        // The read's line already says an entry is invalid; the walk says
+        // which.
+        ExitEvent::EptMisconfig => report_ept_walk(number, exit.map_or(0, |exit| exit.guest_physical)),
         ExitEvent::MainVmcall => crate::serial_println!(
             "{tag} VM exit #{number}: expected VMCALL (rax={rax:#x}); resuming the guest at rip={rip:#018x}."
         ),
@@ -270,20 +335,28 @@ fn report_event(number: u64, event: ExitEvent, exit: Option<ExitInfo>, state: Ex
             },
         ),
         ExitEvent::Emulated(_) => report_emulation(number, resumed.and_then(|resumed| resumed.emulated), rip),
-        ExitEvent::GuestGeneralProtection => crate::serial_println!(
-            "{tag} VM exit #{number}: MSR {:#x} is outside the MSR bitmap, or the WRMSR value is not canonical; injecting #GP(0) at rip={rip:#018x}.",
-            exit.map_or(0, |exit| exit.guest_rcx as u32),
-        ),
+        ExitEvent::GuestGeneralProtection => report_general_protection(number, exit, rip),
         // Not "resuming the guest": `run-hyperv.ps1 -InjectNmi` waits for
         // that text after main VMCALL #1, and this exit comes before it.
         ExitEvent::Halted => crate::serial_println!("{tag} VM exit #{number}: HLT; going on at rip={rip:#018x}."),
         ExitEvent::GuestInvalidOpcode => crate::serial_println!(
             "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
         ),
-        ExitEvent::Unexpected => crate::serial_println!(
+        ExitEvent::BootServicesEnded => crate::serial_println!(
+            "{tag} VM exit #{number}: VMCALL from Aleph0's ExitBootServices event (rax={rax:#x}): boot services are over; output phase now runtime (serial only); going on at rip={rip:#018x}."
+        ),
+        ExitEvent::TestVmcall => {
+            crate::serial_println!("{tag} VM exit #{number}: test VMCALL (rax={rax:#x}); going on at rip={rip:#018x}.")
+        }
+        ExitEvent::Unexpected if guest == GuestKind::BuiltInTest => crate::serial_println!(
             "{tag} VM exit #{number}: NOT an expected exit (the next main VMCALL should have rax={:#x}).",
             expected_main_rax(state),
         ),
+        // The firmware has no script: the lines above name the exit, and a
+        // VMCALL is a Hyper-V hypercall (#27).
+        ExitEvent::Unexpected => {
+            crate::serial_println!("{tag} VM exit #{number}: NOT an exit Aleph0 handles for the firmware.")
+        }
     }
     if event == ExitEvent::LastMainVmcall {
         crate::serial_println!(
@@ -316,6 +389,16 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
         Some(EmulationOutcome::Wrmsr { msr, value }) => crate::serial_println!(
             "{tag} VM exit #{number}: WRMSR {msr:#x} <- {value:#018x}; resuming at rip={rip:#018x}."
         ),
+        Some(EmulationOutcome::MtrrRead { msr, value }) => crate::serial_println!(
+            "{tag} VM exit #{number}: RDMSR {:#x} ({msr}) -> {value:#018x}, from the guest's MTRRs; resuming at rip={rip:#018x}.",
+            msr.address(),
+        ),
+        Some(EmulationOutcome::MtrrWrite {
+            msr,
+            value,
+            cpu_value,
+            write,
+        }) => report_mtrr_write(number, msr, value, cpu_value, write, rip),
         Some(EmulationOutcome::In { port, size, value }) => crate::serial_println!(
             "{tag} VM exit #{number}: IN port {port:#x} size={} -> {value:#x}; resuming at rip={rip:#018x}.",
             size.bytes(),
@@ -325,6 +408,116 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
             size.bytes(),
         ),
         None => crate::serial_println!("{tag} VM exit #{number}: emulated instruction not executed."),
+    }
+}
+
+/// Prints why the guest gets a #GP at its RDMSR or WRMSR: for a WRMSR of
+/// one of its MTRRs, what the CPU refuses in the value; for an MTRR address
+/// the CPU has no MSR at, that; otherwise, that the MSR is outside the MSR
+/// bitmap or the value is not canonical.
+fn report_general_protection(number: u64, exit: Option<ExitInfo>, rip: u64) {
+    let tag = crate::TAG;
+    let msr = exit.map_or(0, |exit| exit.guest_rcx as u32);
+    let refused_mtrr = exit
+        .filter(|exit| exit.reason.basic == EXIT_REASON_WRMSR)
+        .and_then(|exit| {
+            let mtrr = exit.mtrr.msr(msr)?;
+            let value = wrmsr_value(&exit);
+            exit.mtrr.check(mtrr, value).err().map(|error| (mtrr, value, error))
+        });
+    let absent_mtrr = exit.is_some_and(|exit| mtrr::is_msr_address(msr) && exit.mtrr.msr(msr).is_none());
+    match refused_mtrr {
+        Some((mtrr, value, error)) => crate::serial_println!(
+            "{tag} VM exit #{number}: WRMSR {msr:#x} ({mtrr}) <- {value:#018x} refused: {error}; the guest's MTRRs unchanged; injecting #GP(0) at rip={rip:#018x}."
+        ),
+        None if absent_mtrr => crate::serial_println!(
+            "{tag} VM exit #{number}: MSR {msr:#x} is an MTRR address this CPU has no MSR at (see IA32_MTRRCAP); injecting #GP(0) at rip={rip:#018x}."
+        ),
+        None => crate::serial_println!(
+            "{tag} VM exit #{number}: MSR {msr:#x} is outside the MSR bitmap, or the WRMSR value is not canonical; injecting #GP(0) at rip={rip:#018x}."
+        ),
+    }
+}
+
+/// Prints a WRMSR of the guest's MTRRs: the write, beside the CPU's own
+/// MSR, which keeps its value; then, if the types changed, the guest's
+/// MTRRs as they now stand and the EPT regions that changed, read back from
+/// the PD entries.
+fn report_mtrr_write(number: u64, msr: MtrrMsr, value: u64, cpu_value: u64, write: MtrrWrite, rip: u64) {
+    let tag = crate::TAG;
+    crate::serial_println!(
+        "{tag} VM exit #{number}: WRMSR {:#x} ({msr}) <- {value:#018x}, into the guest's MTRRs; the CPU's {msr} stays {cpu_value:#018x}.",
+        msr.address(),
+    );
+    match write.retyped {
+        None => crate::serial_println!(
+            "{tag} VM exit #{number}: every address keeps its memory type; EPT unchanged; resuming at rip={rip:#018x}."
+        ),
+        Some(retyped) => {
+            guest_mtrrs::inspect(|mtrrs, types| {
+                report_guest_mtrrs(number, mtrrs, msr.is_fixed());
+                report_retyped(number, &retyped, write.invept, types.free_pts());
+                if let Some((start, end)) = retyped.span {
+                    for run in types.region_runs(start, end) {
+                        crate::serial_println!(
+                            "{tag} VM exit #{number}: EPT {:#014x}..{:#014x}: {}",
+                            run.start,
+                            run.end,
+                            run.mapping
+                        );
+                    }
+                }
+            });
+            crate::serial_println!("{tag} VM exit #{number}: resuming at rip={rip:#018x}.");
+        }
+    }
+}
+
+/// Prints the guest's MTRRs as bring-up prints the CPU's: whether they are
+/// on, the variable ranges in use, and, after a write to a fixed-range MSR
+/// (`fixed_written`), the types of the first MiB.
+fn report_guest_mtrrs(number: u64, mtrrs: &Mtrrs, fixed_written: bool) {
+    let tag = crate::TAG;
+    crate::serial_println!("{tag} VM exit #{number}: guest MTRRs: {mtrrs}.");
+    let Mtrrs::Enabled(enabled) = mtrrs else {
+        return;
+    };
+    for range in enabled.variable_ranges() {
+        crate::serial_println!("{tag} VM exit #{number}: guest MTRR {range}");
+    }
+    if fixed_written && enabled.fixed_enabled() {
+        for run in mtrrs.runs(FIXED_END, PAGE_SIZE as u64) {
+            crate::serial_println!(
+                "{tag} VM exit #{number}: guest MTRR fixed {:#07x}..{:#07x}: {}",
+                run.start,
+                run.end,
+                run.type_name(),
+            );
+        }
+    }
+}
+
+/// Prints what changed in EPT after the guest's MTRRs did, and the spare
+/// PTs `free_pts` left.
+fn report_retyped(number: u64, retyped: &Retyped, invept: Option<InveptType>, free_pts: usize) {
+    let tag = crate::TAG;
+    match invept {
+        Some(invept) => crate::serial_println!(
+            "{tag} VM exit #{number}: EPT: {} region(s) retyped ({} split into a spare PT, {} merged back into one 2 MiB page); {free_pts} spare PT(s) left; INVEPT {}.",
+            retyped.regions,
+            retyped.split,
+            retyped.merged,
+            invept.name(),
+        ),
+        None => crate::serial_println!(
+            "{tag} VM exit #{number}: EPT unchanged: the types changed only where nothing is mapped."
+        ),
+    }
+    if retyped.uncached > 0 {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: EPT: {} region(s) of mixed types mapped UC as one page: no spare PT left.",
+            retyped.uncached,
+        );
     }
 }
 

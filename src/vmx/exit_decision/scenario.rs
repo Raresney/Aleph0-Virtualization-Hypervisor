@@ -1,6 +1,8 @@
 //! The test guest's own exits: its write to the EPT-protected data page,
 //! its main VMCALLs, NMI reinjection, and the reinjected NMI's delivery
-//! faulting on the EPT-protected stack page.
+//! faulting on the EPT-protected stack page. `decide` sends only the test
+//! guest's VMCALLs and EPT violations here; NMI reinjection serves every
+//! guest, the firmware too.
 //!
 //! The guest (`guest.rs`) writes its read-only data page, makes two main
 //! VMCALLs, with `GUEST_MARKER` and then `GUEST_MARKER + 1` in RAX, and
@@ -117,35 +119,35 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
 /// pushes the interrupt frame. The second carries the NMI in its
 /// IDT-vectoring field, which the handler re-delivers on top of the grant
 /// (`ExitInfo::redelivery`); here they differ only in the grant counter they
-/// advance, so a stray repeat of either is still `Unexpected`.
+/// advance. Any other EPT violation, a stray repeat of either included, is
+/// [`ExitEvent::EptViolation`].
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     let protected_write = exit.protected_page != 0
         && exit.guest_physical & !0xFFF == exit.protected_page
         && EptQualification(exit.qualification).is_protected_write();
-    if !protected_write {
-        return (ExitEvent::Unexpected, state);
-    }
-    if exit.idt_vectoring.is_nmi() {
-        // The push for the reinjected NMI faulted on the read-only stack page.
-        if state.nmi_stack_grants == 0 {
+    if protected_write {
+        if exit.idt_vectoring.is_nmi() {
+            // The push for the reinjected NMI faulted on the read-only stack page.
+            if state.nmi_stack_grants == 0 {
+                return (
+                    ExitEvent::EptWriteGranted,
+                    ExitState {
+                        nmi_stack_grants: 1,
+                        ..state
+                    },
+                );
+            }
+        } else if state.ept_writes_granted == 0 {
             return (
                 ExitEvent::EptWriteGranted,
                 ExitState {
-                    nmi_stack_grants: 1,
+                    ept_writes_granted: 1,
                     ..state
                 },
             );
         }
-    } else if state.ept_writes_granted == 0 {
-        return (
-            ExitEvent::EptWriteGranted,
-            ExitState {
-                ept_writes_granted: 1,
-                ..state
-            },
-        );
     }
-    (ExitEvent::Unexpected, state)
+    (ExitEvent::EptViolation, state)
 }
 
 /// VMCALL (exit reason 18): the guest's NMI handler, or its next main

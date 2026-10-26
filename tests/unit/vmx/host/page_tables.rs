@@ -152,8 +152,8 @@ fn large_pages_are_dirty_and_have_ps_set() {
 #[test]
 fn the_end_must_be_whole_gibs_up_to_one_pdpt() {
     assert_eq!(gibs(SIZE_1G), Ok(1));
-    assert_eq!(gibs(MAX_IDENTITY_MAP), Ok(512));
-    for end in [0, SIZE_1G + SIZE_2M, MAX_IDENTITY_MAP + SIZE_1G] {
+    assert_eq!(gibs(PDPT_SPAN), Ok(512));
+    for end in [0, SIZE_1G + SIZE_2M, PDPT_SPAN + SIZE_1G] {
         assert_eq!(gibs(end), Err(HostPagingError::InvalidEnd { end }));
     }
 }

@@ -7,7 +7,8 @@
 use super::*;
 
 #[test]
-fn guest_code_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls() {
+fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls()
+{
     assert_eq!(
         guest_code(),
         [
@@ -15,7 +16,7 @@ fn guest_code_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcal
             0x31, 0xC9, // xor ecx, ecx
             0x0F, 0xA2, // cpuid
             0x0F, 0xBA, 0xE1, 0x05, // bt ecx, 5
-            0x0F, 0x82, 0x90, 0x00, 0x00, 0x00, // jc guest_emulation_failed (+144, too far for a rel8)
+            0x0F, 0x82, 0x81, 0x01, 0x00, 0x00, // jc guest_emulation_failed (+385)
             0xB9, 0x02, 0x01, 0x00, 0xC0, // mov ecx, IA32_KERNEL_GS_BASE
             0x0F, 0x32, // rdmsr
             0x89, 0xC6, // mov esi, eax
@@ -27,9 +28,9 @@ fn guest_code_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcal
             0x31, 0xD2, // xor edx, edx
             0x0F, 0x32, // rdmsr
             0x83, 0xF8, 0x00, // cmp eax, GUEST_MSR_VALUE as u32
-            0x75, 0x6E, // jne guest_emulation_failed (+110)
+            0x0F, 0x85, 0x5B, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+347, too far for a rel8)
             0x81, 0xFA, 0x1E, 0x7A, 0x00, 0x00, // cmp edx, GUEST_MSR_VALUE >> 32
-            0x75, 0x66, // jne guest_emulation_failed (+102)
+            0x0F, 0x85, 0x4F, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+335)
             0x89, 0xF0, // mov eax, esi
             0x89, 0xFA, // mov edx, edi
             0x0F, 0x30, // wrmsr
@@ -41,13 +42,84 @@ fn guest_code_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcal
             0x31, 0xC0, // xor eax, eax
             0xEC, // in al, dx
             0x3C, 0xA5, // cmp al, GUEST_IO_VALUE
-            0x75, 0x4E, // jne guest_emulation_failed (+78)
+            0x0F, 0x85, 0x33, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+307)
             0x40, 0x88, 0xF0, // mov al, sil
             0xEE, // out dx, al
+            0xB8, 0x08, 0x00, 0x00, 0x80, // mov eax, ADDRESS_SIZES
+            0x0F, 0xA2, // cpuid
+            0x89, 0xC1, // mov ecx, eax
+            0x41, 0xBA, 0x01, 0x00, 0x00, 0x00, // mov r10d, 1
+            0x49, 0xD3, 0xE2, // shl r10, cl
+            0x49, 0xFF, 0xCA, // dec r10
+            0xB9, 0xFE, 0x00, 0x00, 0x00, // mov ecx, IA32_MTRRCAP
+            0x0F, 0x32, // rdmsr (not intercepted)
+            0x0F, 0xB6, 0xC8, // movzx ecx, al
+            0x8D, 0x8C, 0x09, 0xFE, 0x01, 0x00, 0x00, // lea ecx, [rcx + rcx + IA32_MTRR_PHYSBASE0 - 2]
+            0x0F, 0x32, // rdmsr (PHYSBASE)
+            0x41, 0x89, 0xC0, // mov r8d, eax
+            0x41, 0x89, 0xD1, // mov r9d, edx
+            0xFF, 0xC1, // inc ecx
+            0x0F, 0x32, // rdmsr (PHYSMASK)
+            0x41, 0x89, 0xC3, // mov r11d, eax
+            0x41, 0x89, 0xD4, // mov r12d, edx
+            0x31, 0xC0, // xor eax, eax
+            0x31, 0xD2, // xor edx, edx
+            0x0F, 0x30, // wrmsr (PHYSMASK: off)
+            0xFF, 0xC9, // dec ecx
+            0xB8, 0x00, 0x00, 0x20, 0x00, // mov eax, GUEST_MTRR_BASE | UC
+            0x0F, 0x30, // wrmsr (PHYSBASE)
+            0xFF, 0xC1, // inc ecx
+            0x4D, 0x89, 0xD5, // mov r13, r10
+            0x49, 0x81, 0xE5, 0x00, 0x00, 0xE0, 0xFF, // and r13, -SIZE_2M
+            0x49, 0x81, 0xCD, 0x00, 0x08, 0x00, 0x00, // or r13, PHYSMASK_VALID
+            0x44, 0x89, 0xE8, // mov eax, r13d
+            0x4C, 0x89, 0xEA, // mov rdx, r13
+            0x48, 0xC1, 0xEA, 0x20, // shr rdx, 32
+            0x0F, 0x30, // wrmsr (PHYSMASK: 2 MiB)
+            0x31, 0xC0, // xor eax, eax
+            0x31, 0xD2, // xor edx, edx
+            0x0F, 0x32, // rdmsr (PHYSMASK)
+            0x48, 0xC1, 0xE2, 0x20, // shl rdx, 32
+            0x48, 0x09, 0xD0, // or rax, rdx
+            0x4C, 0x39, 0xE8, // cmp rax, r13
+            0x0F, 0x85, 0xB3, 0x00, 0x00, 0x00, // jne guest_emulation_failed (+179)
+            0x4D, 0x89, 0xD5, // mov r13, r10
+            0x49, 0x81, 0xE5, 0x00, 0xF0, 0xFF, 0xFF, // and r13, -PAGE_SIZE
+            0x49, 0x81, 0xCD, 0x00, 0x08, 0x00, 0x00, // or r13, PHYSMASK_VALID
+            0x44, 0x89, 0xE8, // mov eax, r13d
+            0x4C, 0x89, 0xEA, // mov rdx, r13
+            0x48, 0xC1, 0xEA, 0x20, // shr rdx, 32
+            0x0F, 0x30, // wrmsr (PHYSMASK: 4 KiB)
+            0x31, 0xC0, // xor eax, eax
+            0x31, 0xD2, // xor edx, edx
+            0x0F, 0x30, // wrmsr (PHYSMASK: off)
+            0xFF, 0xC9, // dec ecx
+            0x44, 0x89, 0xC0, // mov eax, r8d
+            0x44, 0x89, 0xCA, // mov edx, r9d
+            0x0F, 0x30, // wrmsr (PHYSBASE: as it was)
+            0xFF, 0xC1, // inc ecx
+            0x44, 0x89, 0xD8, // mov eax, r11d
+            0x44, 0x89, 0xE2, // mov edx, r12d
+            0x0F, 0x30, // wrmsr (PHYSMASK: as it was)
+            0xB9, 0x1B, 0x00, 0x00, 0x00, // mov ecx, IA32_APIC_BASE
+            0x0F, 0x32, // rdmsr (not intercepted)
+            0x89, 0xC1, // mov ecx, eax
+            0x81, 0xE1, 0x00, 0x0C, 0x00, 0x00, // and ecx, APIC_BASE_MODE
+            0x81, 0xF9, 0x00, 0x08, 0x00, 0x00, // cmp ecx, APIC_BASE_XAPIC
+            0x75, 0x1B, // jne guest_local_apic_done (+27): not xAPIC, no read
+            0x48, 0xC1, 0xE2, 0x20, // shl rdx, 32
+            0x48, 0x09, 0xD0, // or rax, rdx
+            0x4C, 0x21, 0xD0, // and rax, r10
+            0x48, 0x25, 0x00, 0xF0, 0xFF, 0xFF, // and rax, -PAGE_SIZE
+            0x8B, 0x40, 0x30, // mov eax, [rax + LAPIC_VERSION]
+            0x3C, 0x10, // cmp al, 0x10
+            0x72, 0x4E, // jb guest_emulation_failed (+78)
+            0x3C, 0x15, // cmp al, 0x15
+            0x77, 0x4A, // ja guest_emulation_failed (+74)
             0xF4, // hlt
             0x31, 0xDB, // xor ebx, ebx
             0x48, 0x8D, 0x3D, // lea rdi, [rip + guest_code_start]:
-            0x9D, 0xFF, 0xFF, 0xFF, //   -99, back to byte 0
+            0xAC, 0xFE, 0xFF, 0xFF, //   -340, back to byte 0
             0x48, 0x81, 0xC7, // add rdi, 0x1000
             0x00, 0x10, 0x00, 0x00, 0x8B, 0x0F, // mov ecx, [rdi]
             0xC7, 0x07, // mov dword ptr [rdi], GUEST_EPT_VALUE
@@ -77,8 +149,17 @@ fn guest_code_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcal
 
 #[test]
 fn nmi_handler_starts_after_the_main_code() {
-    // Byte 146 in the listing above: right after the ud2.
-    assert_eq!(nmi_handler_offset(), 146);
+    // Byte 387 in the listing above: right after the ud2.
+    assert_eq!(nmi_handler_offset(), 387);
+}
+
+#[test]
+fn the_mtrr_base_is_uc_in_a_physbase_and_2_mib_aligned() {
+    // `mov eax` loads it whole: it fits in 32 bits, with the type, UC (0),
+    // in bits 7:0.
+    let physbase = GUEST_MTRR_BASE | crate::vmx::mtrr::MemoryType::Uncacheable as u64;
+    assert_eq!(physbase, 0x20_0000);
+    assert!(GUEST_MTRR_BASE.is_multiple_of(SIZE_2M));
 }
 
 #[test]

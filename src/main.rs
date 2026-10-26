@@ -28,6 +28,7 @@ macro_rules! log {
 mod bring_up;
 mod output;
 mod port;
+mod resident;
 mod serial;
 mod vmx;
 
@@ -52,13 +53,47 @@ fn main() -> Status {
         Err(error) => log!("Serial output disabled on {OUTPUT_PORT}: {error:?}; console only."),
     }
 
-    // Bring-up returns once the guest has stopped, or at the first failure.
-    // Either way it has left VMX operation if it entered it, unless VMXOFF
-    // failed: then the CPU is still in VMX root operation with CR4.VMXE set,
-    // teardown printed that, and firmware takes over in that state.
+    // The firmware unloads this image when `main` returns, and the OS may
+    // reuse its pages after ExitBootServices; the copy stays.
+    // SAFETY: boot services are active, and the only statics written so far
+    // are the serial port, its readiness, the output phase and the `uefi`
+    // crate's image handle and system table: none an address in the image.
+    match unsafe { resident::ResidentImage::copy() } {
+        Ok(image) => {
+            log!(
+                "Image copied to resident memory: {:#018x} -> {:#018x}, {} bytes, {} fixups applied; running on from the copy.",
+                image.loaded(),
+                image.base(),
+                image.size(),
+                image.fixups(),
+            );
+            // SAFETY: `image` is this image's copy, and nothing below uses
+            // this image's statics again.
+            unsafe { image.call(run) }
+        }
+        Err(error) => {
+            log!("Image not copied to resident memory: {error:?}; Aleph0 cannot outlive boot services.");
+            Status::ABORTED
+        }
+    }
+}
+
+/// Everything after the copy, in the resident image: bring-up, and the
+/// return to the firmware.
+fn run() -> Status {
+    // Bring-up returns once the test guest has stopped, once the firmware
+    // runs as the guest, or at the first failure. In the first and last case
+    // it has left VMX operation if it entered it, unless VMXOFF failed: then
+    // the CPU is still in VMX root operation with CR4.VMXE set, teardown
+    // printed that, and firmware takes over in that state. Once the firmware
+    // runs as the guest, everything below runs in VMX non-root operation.
     let status = match bring_up::run() {
-        Ok(run) => {
-            log!("Guest finished after {} VM exits; VMX operation left.", run.exits);
+        Ok(bring_up::GuestRun::Finished { exits }) => {
+            log!("Guest finished after {exits} VM exits; VMX operation left.");
+            Status::SUCCESS
+        }
+        Ok(bring_up::GuestRun::Virtualized) => {
+            log!("The firmware runs as the guest: Aleph0 returns to it in VMX non-root operation.");
             Status::SUCCESS
         }
         Err(error) => {
@@ -77,8 +112,10 @@ const TIMER_CHECK: Duration = Duration::from_secs(1);
 
 /// Waits on a one-shot UEFI timer event. Only the firmware's timer
 /// interrupt signals it, so getting past the wait shows that interrupts
-/// reach the firmware's handlers through the restored IDT. If they do not,
-/// the wait never ends, and the "Waiting" line is the last one on serial.
+/// reach the firmware's handlers: through the restored IDT, or, once the
+/// firmware runs as the guest, through its own IDT in VMX non-root
+/// operation, with no VM exit. If they do not, the wait never ends, and the
+/// "Waiting" line is the last one on serial.
 ///
 /// WaitForEvent may turn interrupts on by itself (through RestoreTPL), so
 /// this does not show that teardown restored IF; teardown prints IF itself.

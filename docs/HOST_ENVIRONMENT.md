@@ -35,15 +35,18 @@ Only VM exits load them. Bring-up and the test guest keep running on the
 firmware's page tables and IDT and on the GDT copy (`context_tables.rs`), and
 teardown switches back to the firmware's (section 7).
 
-The pages still come from `page.rs` (`LOADER_DATA`). Moving them to memory
-the OS keeps is the next step (#23).
+The pages come from `page.rs` as `RUNTIME_SERVICES_DATA`, which the OS keeps
+after `ExitBootServices` (#23, [RESIDENT.md](RESIDENT.md)).
 
 ## 2. The page tables
 
 An identity map (linear = physical) of every address the UEFI memory map
-reaches, rounded up to 1 GiB: the same range EPT maps (`Ept::end`). That
-range holds the image with the exit handler, every allocation, and the
-firmware stack that `vmx_return_to_launcher` returns to after a stop.
+reaches, rounded up to 1 GiB (`Ept::memory_map_end`). That range holds the
+image with the exit handler, every allocation (the EPT tables included),
+and the firmware stack that `vmx_return_to_launcher` returns to after a
+stop. EPT maps more for the guest, the whole guest-physical address space
+([EPT.md](EPT.md) section 4), but root operation never touches the device
+memory above the memory map.
 
 ```text
 with 1 GiB pages (CPUID.80000001H:EDX bit 26):
@@ -265,8 +268,12 @@ VM exit #15: ... NMIs: 1 reinjected, 1 handled by the guest.
 - **The guest's own tables** once the firmware runs as the guest: #21.
 - **Hiding these pages from the guest** through EPT: after the first boot.
 - **Per-CPU tables** for several vCPUs: after the first boot.
-- **Host PAT and EFER**: the exit controls do not load them, so the guest's
-  values still apply to host accesses.
+- **Host EFER**: the exit controls do not load it, so the bits of the
+  guest's value other than LME and LMA (NXE, SCE) still apply to host
+  accesses. IA32_PAT is switched when the CPU allows the controls for it
+  (`vmcs::pat_switch`: VM exit saves the guest's and loads `HOST_IA32_PAT`,
+  VM entry loads the guest's); on a CPU without them the guest's PAT still
+  applies to host accesses too.
 
 ## Cheat sheet
 
