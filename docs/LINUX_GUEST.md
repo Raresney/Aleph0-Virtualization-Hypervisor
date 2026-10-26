@@ -230,9 +230,9 @@ What the lines say:
   the `tsc_known_freq` flag; `HV_X64_MSR_APIC_FREQUENCY`, `0x40000023`, the
   `LAPIC Timer Frequency` line). It also writes
   `HV_X64_MSR_TSC_INVARIANT_CONTROL` (`0x40000118`) to expose the invariant
-  TSC, and then marks the TSC reliable (`tsc_reliable`). Those MSRs lie in
-  the range that gets a #GP under Aleph0 today; how the guest sees Hyper-V
-  is #27.
+  TSC, and then marks the TSC reliable (`tsc_reliable`). Those MSRs lie
+  outside the MSR bitmap; since #27 Aleph0 forwards them to Hyper-V
+  ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)).
 - **Timer and clock.** The VM has no legacy PIC: the kernel's 8259 probe
   fails (`Using NULL legacy PIC`), so IRQ 0 cannot be requested (`Failed to
   register legacy timer interrupt`), and the kernel's Hyper-V code skips the
@@ -256,7 +256,9 @@ What the lines say:
 - Starting this image under Aleph0, by returning to the boot manager or by
   LoadImage/StartImage of `\EFI\aleph0\linux.efi`: #28.
 - A kernel built without Hyper-V guest support, for the "do not advertise
-  Hyper-V" option: #27. `-Kernel` takes any image, so that is a different
-  build, not a different runner.
+  Hyper-V" option, was booted for #27 (a copy of `scripts/linux/` with
+  `# CONFIG_HYPERVISOR_GUEST is not set`): it reaches its shell, on
+  clocksource `tsc` after calibrating against the ACPI PM timer
+  ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md) section 7).
 - Mapping the ranges above into EPT: #20.
 - More than one vCPU, a VMBus disk, Windows: after the first boot.

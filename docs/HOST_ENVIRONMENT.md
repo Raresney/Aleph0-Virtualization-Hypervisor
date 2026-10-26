@@ -129,6 +129,7 @@ load TR with limit `0x67` and never mark the descriptor busy.
 ```text
 vector 2 (NMI)     ─▶ host_nmi_entry ─▶ host_nmi_handler   (section 6), IRETQ
 every other vector ─▶ stub n ─▶ host_exception_common ─▶ host_exception_handler: print, halt
+                                                         (or resume a forward Hyper-V refused, below)
 ```
 
 The stubs are 16 bytes apart, from `host_vector_stubs`. Each pushes a 0
@@ -154,6 +155,14 @@ HOST EXCEPTION: error code 0x0.
 HOST EXCEPTION: rip=0x... cs=0x0028 rflags=0x... rsp=0x... ss=0x0008 cr2=0x....
 HOST EXCEPTION: halting this CPU.
 ```
+
+One kind of fault is not a bug: Hyper-V refusing an access Aleph0 forwards
+for the guest, #UD at the hypercall forwarder's VMCALL or #GP at its RDMSR
+or WRMSR. `hyperv::recovery` names those three instructions; for one of
+them the handler moves the frame's RIP to the forwarder's recovery point
+and returns, and `host_exception_common`, which kept RSP in RBP, drops the
+vector and error code and returns with IRETQ. The guest then gets the
+exception ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md) section 5).
 
 Maskable interrupts never arrive: a VM exit loads RFLAGS as `0x2` (IF = 0),
 and nothing in root operation sets IF. Their gates exist so a stray `int n`

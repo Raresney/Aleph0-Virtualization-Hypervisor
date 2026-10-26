@@ -163,8 +163,10 @@ The emulation handlers hold for any guest, so they read only the exit
 what it carried out in the vCPU's exit statistics (`vmexit::stats`,
 `VcpuStats`), the way KVM keeps `struct kvm_vcpu_stat`: one counter per
 instruction executed for the guest (`cpuid_exits`, `msr_read_exits`,
-`msr_write_exits`, `io_in_exits`, `io_out_exits`), plus `exits`,
-`halt_exits`, `nmi_injections` and `exception_injections`. An exit counts
+`msr_write_exits`, `io_in_exits`, `io_out_exits`, and, forwarded to
+Hyper-V, `hypercall_exits`, `synthetic_read_exits` and
+`synthetic_write_exits`), plus `exits`, `halt_exits`, `nmi_injections` and
+`exception_injections`. An exit counts
 only once its resume was prepared, so a WRMSR whose next RIP was invalid,
 and which never ran, is not counted. Section 6 uses them. Each counter is a
 `u64`, which no exit rate overflows.
@@ -197,12 +199,15 @@ which always exits (reason 27) in non-root operation, and Aleph0 does not
 emulate VMX. The report line prints both values, so the effect is visible:
 `ecx=` is what the guest got, `processor ecx=` what the CPU returned.
 
-What passes through, and must be decided before an OS guest:
+What passes through:
 - **ECX bit 31 (hypervisor present) and the leaves from 0x40000000.** Under
-  nested Hyper-V they describe Hyper-V. A Windows guest that sees them would
-  use Hyper-V's interface, and its hypercalls are VMCALLs, which exit to
-  Aleph0, not to Hyper-V, and Aleph0 treats them as unexpected.
-- **Values that follow CR4 and XCR0**: CPUID.1:ECX.OSXSAVE and leaf 0xD
+  nested Hyper-V they describe Hyper-V, and a guest that sees them uses
+  Hyper-V's interface: hypercalls, which are VMCALLs and exit to Aleph0,
+  and the synthetic MSRs. Decided in #27: the guest keeps them, and Aleph0
+  forwards the hypercalls and the synthetic MSRs to Hyper-V
+  ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)).
+- **Values that follow CR4 and XCR0**, still to be decided before an OS
+  guest: CPUID.1:ECX.OSXSAVE and leaf 0xD
   (the XSAVE area size). They are right for the guest only while its CR4 and
   XCR0 equal the host's, as they do today.
 
@@ -305,13 +310,14 @@ guest's.
 
 ### The four routes
 
-An RDMSR or WRMSR exit takes one of four routes, chosen by `route`:
+An RDMSR or WRMSR exit takes one of five routes, chosen by `route`:
 
 | MSR | Route | Event |
 |---|---|---|
 | in `INTERCEPTED_MSRS` | emulate with the real RDMSR/WRMSR | `Emulated` |
 | an MTRR MSR the guest has (`ExitInfo::mtrr`) | read or write the guest's copy; a WRMSR value the CPU would refuse gets #GP(0) | `Emulated(MtrrRead)`, `Emulated(MtrrWrite)`, `GuestGeneralProtection` |
-| outside both ranges (`msr_bit` is `None`) | inject #GP(0) into the guest | `GuestGeneralProtection` |
+| outside both ranges, one of Hyper-V's synthetic MSRs, Hyper-V present | forward it to Hyper-V ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)) | `Emulated(SyntheticRead)`, `Emulated(SyntheticWrite)` |
+| outside both ranges otherwise (`msr_bit` is `None`) | inject #GP(0) into the guest | `GuestGeneralProtection` |
 | in range, bit clear | it should never have exited: the bitmap is broken; stop | `Unexpected` |
 
 The MTRRs are the one intercepted MSR family Aleph0 does not pass through:
@@ -749,8 +755,9 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 
 ## 8. Limits before an OS guest
 
-- **The CPUID decisions of section 3**: the hypervisor-present bit, the
-  leaves from 0x40000000, and OSXSAVE with leaf 0xD.
+- **The CPUID decisions of section 3**: OSXSAVE with leaf 0xD. The
+  hypervisor-present bit and the leaves from 0x40000000 pass through, with
+  Hyper-V's interface forwarded (#27).
 - **Unconditional exits.** XSETBV (reason 55), INVD (13), GETSEC (11), the
   VMX instructions and task switches always exit. Aleph0 handles none of
   them (except the test guest's VMCALLs, in `scenario.rs`); they reach the

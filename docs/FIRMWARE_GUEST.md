@@ -40,13 +40,14 @@ hangs off that one value:
 | guest state (`GuestEntry`) | `At`: its code page, stack top, RFLAGS `0x2`, its IDT | `InPlace`: written at VMLAUNCH, the firmware's IDT |
 | launch | `vmcs::launch`, returns at the stop | `vmcs::launch_in_place`, returns as the guest |
 | exception bitmap | all ones | 0 |
-| VMCALL | the script (`scenario::vmcall`) | Aleph0's own (`vmx::vmcall`, [RESIDENT.md](RESIDENT.md)) resume; any other stops: a Hyper-V hypercall (#27) |
+| VMCALL | the script (`scenario::vmcall`) | Aleph0's own (`vmx::vmcall`, [RESIDENT.md](RESIDENT.md)) resume; any other is a Hyper-V hypercall, forwarded ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)) |
 | EPT violation | the protected-page write, once | stops, with the walk of the GPA |
 | a stop | returns to bring-up, teardown, `SUCCESS` or `ABORTED` | halts after the report |
 
 Everything else is the same for both: CPUID, RDMSR/WRMSR (MTRRs to the
-guest's copy, #GP outside the MSR bitmap), IN/OUT, HLT, #UD for MWAIT and
-MONITOR, NMI reinjection, the EPT misconfiguration stop.
+guest's copy, Hyper-V's synthetic MSRs forwarded, #GP for any other MSR
+outside the MSR bitmap), IN/OUT, HLT, #UD for MWAIT and MONITOR, NMI
+reinjection, the EPT misconfiguration stop.
 
 ## 2. The guest state: the running context
 
@@ -143,9 +144,9 @@ turn it on themselves; `host-fault-test` and `trace-exits` work in both
 modes.
 
 On Hyper-V Gen 2, the keyboard, disk and video are VMBus devices: the
-firmware's hypercalls are VMCALLs, which stop it, and its reads and writes
-of the synthetic MSRs (`0x40000000`-`0x400000FF`) lie outside the MSR
-bitmap, so they get a #GP. The first Hyper-V run showed which comes first:
+firmware's hypercalls are VMCALLs, which stopped it, and its reads and
+writes of the synthetic MSRs (`0x40000000` and up) lie outside the MSR
+bitmap, so they got a #GP. The first Hyper-V run showed which comes first:
 
 ```text
 Launching the firmware in place with VMLAUNCH; its VM exits are reported on serial only.
@@ -166,26 +167,34 @@ after it, so Aleph0's own code ran on as the guest. Drawing that line, the
 firmware read `0x40000020`, `HV_X64_MSR_TIME_REF_COUNT` (the partition
 reference counter its timer code uses), got the #GP, and its fatal-error
 path loaded a zero IDT (the stop's `idtr=0/0`) and triple-faulted on
-purpose. The firmware cannot run on until #27 decides what the guest sees
-of that MSR. The test guest's runs printed the same exits as before: 24
-and `SUCCESS`, and 26 with `-InjectNmi`.
+purpose. The test guest's runs printed the same exits as before: 24 and
+`SUCCESS`, and 26 with `-InjectNmi`.
+
+Since #27 Aleph0 forwards the firmware's hypercalls and synthetic MSRs to
+Hyper-V ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)). The same RDMSR at
+`0x7ff1d9c8` now reads the reference counter, and the firmware runs on:
+its timer fires, its VMBus drivers signal the host with hypercall `0x5d`,
+it draws its "Virtual Machine Boot Summary" screen, and Tab then Enter on
+its keyboard press "Restart now", which resets the VM as it does without
+Aleph0 (HYPERV_INTERFACE.md section 7). Left alone at that screen, it ran
+5 min 21 s under Aleph0 with no stop: 67 million exits, nearly all HLT
+(`reason=12 (HLT), 67108864 exits of this reason so far` at exit
+#67319478).
 
 ## 6. Not covered yet
 
-- The firmware running for a fixed time with no unexpected stop: it stops at
-  its first synthetic MSR, `0x40000020` (section 5).
-- Its idle loop: HLT exits and resumes at once, so the exit counts would
-  grow quickly, with the print policy keeping the first 16 of each reason in
-  full and then one summary line per power of two. The run never got there.
-- Hypercalls and synthetic MSRs (#27); CR0/CR4 masks, so the firmware sees
-  CR4.VMXE today (#24); re-delivering interrupted events and the interrupt
-  policy for an OS (#26).
+- Its idle loop: HLT exits and resumes at once, so the exit counts grow
+  quickly: about 36 million exits in three minutes at the Boot Summary
+  screen, nearly all HLT, with the print policy keeping the first 16 of
+  each reason in full and then one summary line per power of two.
+- CR0/CR4 masks, so the firmware sees CR4.VMXE today (#24); re-delivering
+  interrupted events and the interrupt policy for an OS (#26).
 - The firmware guest still gets the test guest's pages, because `Ept::build`
   protects their data page. Nothing in the firmware touches it, and since
   #23 they are resident, so no OS reuses them either.
 - Staying resident after `ExitBootServices` (#23) is implemented
-  ([RESIDENT.md](RESIDENT.md)); its harness run stops where the firmware
-  does, at `0x40000020`.
+  ([RESIDENT.md](RESIDENT.md)); its harness run stopped where the firmware
+  did, at `0x40000020`, and is to be run again now that #27 forwards it.
 
 ## Cheat sheet
 

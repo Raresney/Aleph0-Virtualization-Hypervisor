@@ -12,7 +12,7 @@ Code: `src/resident/` (`mod.rs`: the image copy and the `ExitBootServices`
 event; `memory.rs`: which types the OS reclaims; `pe.rs`: base relocation),
 `src/vmx/page.rs` (the resident allocation path), `src/bring_up/mod.rs`
 (`check_resident_memory`, `virtualize_firmware`), `src/vmx/vmcall.rs`,
-`src/vmx/exit_decision/mod.rs` (`aleph0_vmcall`), `src/vmx/vmexit/handler.rs`
+`src/vmx/exit_decision/mod.rs` (`firmware_vmcall`), `src/vmx/vmexit/handler.rs`
 (`resume_phase`), `tools/ebs-harness/`.
 
 ## 1. What the OS keeps
@@ -191,20 +191,22 @@ phase.
 
 ### Aleph0's own VMCALLs
 
-`vmx::vmcall` holds the values a guest puts in RAX to make a VMCALL a call
+`vmx::vmcall` holds the values a guest puts in RCX to make a VMCALL a call
 to Aleph0. Each is eight ASCII bytes read big-endian, so a register dump
 shows text:
 
-| Constant | RAX | `ExitEvent` | What Aleph0 does |
+| Constant | RCX | `ExitEvent` | What Aleph0 does |
 |---|---|---|---|
 | `BOOT_SERVICES_ENDED` | `0x416c657068304542` "Aleph0EB" | `BootServicesEnded` | resumes past it, switches to the runtime phase |
 | `TEST` | `0x416c657068305453` "Aleph0TS" | `TestVmcall` | resumes past it |
 
-Hyper-V's hypercalls (#27) take their input in RCX and ignore RAX, so a
-guest makes one of these only on purpose; any other RAX is still a
-hypercall, which stops the firmware until #27 forwards them. Both are
-handled for the firmware (and the OS after it) only: the test guest's
-VMCALLs are its script's. A guest may make either at any time; the worst a
+Hyper-V's hypercalls take their input value in RCX too, and both values
+set bit 62, which is reserved there, so no hypercall Hyper-V takes is
+mistaken for one of these; every other VMCALL from CPL 0 is a hypercall,
+and Aleph0 forwards it to Hyper-V ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)
+section 2). Until #27 they were told apart by RAX, which a hypercall
+ignores. Both are handled for the firmware (and the OS after it) only, and
+from CPL 0 only: the test guest's VMCALLs are its script's. A guest may make either at any time; the worst a
 fake `BOOT_SERVICES_ENDED` does is turn Aleph0's console output off early.
 
 ### The runtime phase
@@ -265,8 +267,8 @@ classification (`#[path]` modules), so both agree on them.
 Aleph0's lines go to `run\serial.log` (COM2), the harness's to
 `run\guest-serial.log` (COM1).
 
-Until #27 the firmware stops before `StartImage` returns, so the harness
-never reaches step 2 under Aleph0. `-WithoutAleph0` builds it with its
+Until #27 the firmware stopped before `StartImage` returned, so the
+harness never reached step 2 under Aleph0. `-WithoutAleph0` builds it with its
 `without-aleph0` feature instead: no step 1, no VMCALL, and steps 2 to 4
 (`ExitBootServices`, the switch to its own tables, `SetVirtualAddressMap`,
 the overwrite) run on the firmware alone. Its COM1 then streams to the
@@ -301,10 +303,11 @@ On Hyper-V:
   same `RDMSR 0x40000020`, still inside its own `main`, before `StartImage`
   returned to the harness.
 
-So the harness cannot reach `ExitBootServices` until #27 decides what the
-guest sees of Hyper-V's synthetic MSRs and hypercalls; Hyper-V's VMBus
-drivers would also make hypercalls in their own `ExitBootServices`
-handlers. What that run must show once #27 is in: on COM2 the
+So the harness could not reach `ExitBootServices` until #27 decided what
+the guest sees of Hyper-V's synthetic MSRs and hypercalls; Hyper-V's VMBus
+drivers also make hypercalls in their own `ExitBootServices` handlers. #27
+forwards both now ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)), and the
+firmware runs on past `0x40000020`. What the next harness run must show: on COM2 the
 `BootServicesEnded` exit and the switch to the runtime phase, then the
 harness's CPUID, RDMSR, WRMSR and VMCALL exits, each resumed, and HLT exits
 for 60 s without a stop; on COM1 how much memory was overwritten and the
@@ -322,6 +325,6 @@ results of the checks. The same with `-SetVirtualAddressMap`.
 | `ResidentImage::copy`, `call` | `resident/mod.rs` | copies and relocates the image, runs the copy |
 | `Headers::parse`, `relocate` | `resident/pe.rs` | PE32+ headers, DIR64 fixups |
 | `watch_exit_boot_services` | `resident/mod.rs` | the event whose VMCALL ends boot services |
-| `BOOT_SERVICES_ENDED`, `TEST` | `vmx/vmcall.rs` | Aleph0's VMCALLs, by RAX |
+| `BOOT_SERVICES_ENDED`, `TEST` | `vmx/vmcall.rs` | Aleph0's VMCALLs, by RCX |
 | `resume_phase` | `vmexit/handler.rs` | `Runtime` after `BootServicesEnded` |
 | `-Harness`, `-SetVirtualAddressMap` | `run-hyperv.ps1` | stage and run `tools/ebs-harness` |
