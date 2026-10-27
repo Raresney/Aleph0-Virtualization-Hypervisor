@@ -12,7 +12,7 @@ Code: `src/resident/` (`mod.rs`: the image copy and the `ExitBootServices`
 event; `memory.rs`: which types the OS reclaims; `pe.rs`: base relocation),
 `src/vmx/page.rs` (the resident allocation path), `src/bring_up/mod.rs`
 (`check_resident_memory`, `virtualize_firmware`), `src/vmx/vmcall.rs`,
-`src/vmx/exit_decision/mod.rs` (`aleph0_vmcall`), `src/vmx/vmexit/handler.rs`
+`src/vmx/exit_decision/mod.rs` (`firmware_vmcall`), `src/vmx/vmexit/handler.rs`
 (`resume_phase`), `tools/ebs-harness/`.
 
 ## 1. What the OS keeps
@@ -191,20 +191,22 @@ phase.
 
 ### Aleph0's own VMCALLs
 
-`vmx::vmcall` holds the values a guest puts in RAX to make a VMCALL a call
+`vmx::vmcall` holds the values a guest puts in RCX to make a VMCALL a call
 to Aleph0. Each is eight ASCII bytes read big-endian, so a register dump
 shows text:
 
-| Constant | RAX | `ExitEvent` | What Aleph0 does |
+| Constant | RCX | `ExitEvent` | What Aleph0 does |
 |---|---|---|---|
 | `BOOT_SERVICES_ENDED` | `0x416c657068304542` "Aleph0EB" | `BootServicesEnded` | resumes past it, switches to the runtime phase |
 | `TEST` | `0x416c657068305453` "Aleph0TS" | `TestVmcall` | resumes past it |
 
-Hyper-V's hypercalls (#27) take their input in RCX and ignore RAX, so a
-guest makes one of these only on purpose; any other RAX is still a
-hypercall, which stops the firmware until #27 forwards them. Both are
-handled for the firmware (and the OS after it) only: the test guest's
-VMCALLs are its script's. A guest may make either at any time; the worst a
+Hyper-V's hypercalls take their input value in RCX too, and both values
+set bit 62, which is reserved there, so no hypercall Hyper-V takes is
+mistaken for one of these; every other VMCALL from CPL 0 is a hypercall,
+and Aleph0 forwards it to Hyper-V ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)
+section 2). Until #27 they were told apart by RAX, which a hypercall
+ignores. Both are handled for the firmware (and the OS after it) only, and
+from CPL 0 only: the test guest's VMCALLs are its script's. A guest may make either at any time; the worst a
 fake `BOOT_SERVICES_ENDED` does is turn Aleph0's console output off early.
 
 ### The runtime phase
@@ -265,8 +267,8 @@ classification (`#[path]` modules), so both agree on them.
 Aleph0's lines go to `run\serial.log` (COM2), the harness's to
 `run\guest-serial.log` (COM1).
 
-Until #27 the firmware stops before `StartImage` returns, so the harness
-never reaches step 2 under Aleph0. `-WithoutAleph0` builds it with its
+Until #27 the firmware stopped before `StartImage` returned, so the
+harness never reached step 2 under Aleph0. `-WithoutAleph0` builds it with its
 `without-aleph0` feature instead: no step 1, no VMCALL, and steps 2 to 4
 (`ExitBootServices`, the switch to its own tables, `SetVirtualAddressMap`,
 the overwrite) run on the firmware alone. Its COM1 then streams to the
@@ -301,14 +303,67 @@ On Hyper-V:
   same `RDMSR 0x40000020`, still inside its own `main`, before `StartImage`
   returned to the harness.
 
-So the harness cannot reach `ExitBootServices` until #27 decides what the
-guest sees of Hyper-V's synthetic MSRs and hypercalls; Hyper-V's VMBus
-drivers would also make hypercalls in their own `ExitBootServices`
-handlers. What that run must show once #27 is in: on COM2 the
+So the harness could not reach `ExitBootServices` until #27 decided what
+the guest sees of Hyper-V's synthetic MSRs and hypercalls; Hyper-V's VMBus
+drivers also make hypercalls in their own `ExitBootServices` handlers. #27
+forwards both now ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)), and the
+firmware runs on past `0x40000020`. What the harness run had to show: on COM2 the
 `BootServicesEnded` exit and the switch to the runtime phase, then the
 harness's CPUID, RDMSR, WRMSR and VMCALL exits, each resumed, and HLT exits
 for 60 s without a stop; on COM1 how much memory was overwritten and the
 results of the checks. The same with `-SetVirtualAddressMap`.
+
+### The harness runs after #27
+
+`-Harness -ProcessorCount 1`, the harness's COM1:
+
+```text
+[ebs-harness] starting Aleph0 from \EFI\BOOT\aleph0.efi.
+[ebs-harness] Aleph0 returned SUCCESS; the harness runs as its guest (CPUID hides VMX).
+[ebs-harness] own image 0x7eac5000..0x7eb41000; calling ExitBootServices.
+[ebs-harness] boot services exited; loading the harness's own GDT, IDT, page tables (identity, 4 GiB) and stack.
+[ebs-harness] running on the harness's own tables and stack.
+[ebs-harness] overwrote 2045 MiB in 22 ranges with 0xcccccccccccccccc: every page the OS may reclaim but the harness's image.
+[ebs-harness] CPUID.1: ecx=0xf7fa3203, VMX hidden: Aleph0 answered.
+[ebs-harness] IA32_KERNEL_GS_BASE: wrote 0xffff8000eb5e0000, read back 0xffff8000eb5e0000: match.
+[ebs-harness] test VMCALL (rcx=0x416c657068305453): resumed past it.
+[ebs-harness] idling with HLT; Aleph0 resumes the guest after each one.
+```
+
+Aleph0's COM2 from the event's VMCALL on:
+
+```text
+VM exit #123091: VMCALL from Aleph0's ExitBootServices event (rcx=0x416c657068304542): boot services are over; output phase now runtime (serial only); going on at rip=0x000000007e935dfa.
+VM exit #123092: hypercall 0x005c (rcx=0x5c) forwarded to Hyper-V -> status 0x0 (rax=0x0); resuming at rip=0x000000007f60b003.
+VM exit #123099: WRMSR 0x400000b1 (synthetic) <- 0x0000000000000000 forwarded to Hyper-V; resuming at rip=0x000000007ff1da59.
+   (#123100 to #123106: 0x400000b0 to 0x400000b7, the synthetic timers, set to 0)
+VM exit #123107: WRMSR 0x40000090 (synthetic) <- 0x0000000000010000 forwarded to Hyper-V; resuming at rip=0x000000007ff1da59.
+   (#123108 to #123113: 0x40000091 to 0x40000096, the next SINTs, masked; the rest past the print policy's 16 WRMSRs)
+VM exit #123136: test VMCALL (rcx=0x416c657068305453); going on at rip=0x000000007eaca0d2.
+VM exit #131748: reason=12 (HLT), 131072 exits of this reason so far.
+...
+VM exit #16777892: reason=12 (HLT), 16777216 exits of this reason so far.
+```
+
+Every line after #123091 was printed in the runtime phase, from the
+resident copy, after the event fired, and from #123136 on after the
+harness had overwritten every reclaimable page. Between the event and the
+harness's exits, the firmware's own VMBus drivers tore down: an
+`HvCallPostMessage` (`0x5c`), the synthetic timers zeroed and the SINTs
+masked, all forwarded. The harness's CPUID, WRMSR and RDMSR exits fall
+past the print policy's first 16 of their reasons, so COM2 shows only
+their counts; the values on COM1 came from Aleph0 (VMX hidden, the MSR
+read back through the intercepted IA32_KERNEL_GS_BASE). The VM ran 2
+minutes with no stop.
+
+`-Harness -SetVirtualAddressMap -ProcessorCount 1`: the same lines, with
+`[ebs-harness] SetVirtualAddressMap: 5 runtime regions moved up by
+0xffffff0000000000.` before the overwrite; on COM2 the ExitBootServices
+exit at #96973, the test VMCALL at #97018, and 2 minutes with no stop
+(16777216 HLT exits).
+
+Not made: the optional control run with the resident types set back to
+`LOADER_DATA`, which would show the harness catching the problem.
 
 ## Cheat sheet
 
@@ -322,6 +377,6 @@ results of the checks. The same with `-SetVirtualAddressMap`.
 | `ResidentImage::copy`, `call` | `resident/mod.rs` | copies and relocates the image, runs the copy |
 | `Headers::parse`, `relocate` | `resident/pe.rs` | PE32+ headers, DIR64 fixups |
 | `watch_exit_boot_services` | `resident/mod.rs` | the event whose VMCALL ends boot services |
-| `BOOT_SERVICES_ENDED`, `TEST` | `vmx/vmcall.rs` | Aleph0's VMCALLs, by RAX |
+| `BOOT_SERVICES_ENDED`, `TEST` | `vmx/vmcall.rs` | Aleph0's VMCALLs, by RCX |
 | `resume_phase` | `vmexit/handler.rs` | `Runtime` after `BootServicesEnded` |
 | `-Harness`, `-SetVirtualAddressMap` | `run-hyperv.ps1` | stage and run `tools/ebs-harness` |

@@ -67,6 +67,8 @@ fn exit(basic: u16) -> ExitInfo {
         guest_physical: 0,
         protected_page: PROTECTED_PAGE,
         mtrr: MtrrCapabilities::NONE,
+        hyperv: false,
+        guest_cpl: 0,
     }
 }
 
@@ -87,6 +89,16 @@ fn protected_write() -> ExitInfo {
 fn vmcall(rax: u64) -> ExitInfo {
     ExitInfo {
         guest_rax: rax,
+        ..exit(EXIT_REASON_VMCALL)
+    }
+}
+
+/// A VMCALL of the firmware or the OS, with `rcx` in RCX, from CPL 0, under
+/// Hyper-V.
+fn hypercall(rcx: u64) -> ExitInfo {
+    ExitInfo {
+        guest_rcx: rcx,
+        hyperv: true,
         ..exit(EXIT_REASON_VMCALL)
     }
 }
@@ -1118,10 +1130,15 @@ fn firmware(state: ExitState, exit: ExitInfo) -> ExitAction {
 
 #[test]
 fn the_firmware_resumes_from_every_exit_aleph0_handles() {
-    // Hyper-V's first synthetic MSR, outside the MSR bitmap: #GP, and on.
+    // Hyper-V's first synthetic MSR, outside the MSR bitmap: #GP without
+    // Hyper-V's interface, forwarded with it, and on either way.
     let synthetic_msr = ExitInfo {
         guest_rcx: 0x4000_0000,
         ..exit(EXIT_REASON_RDMSR)
+    };
+    let forwarded_msr = ExitInfo {
+        hyperv: true,
+        ..synthetic_msr
     };
     let pending = ExitState {
         nmi_pending: true,
@@ -1129,6 +1146,9 @@ fn the_firmware_resumes_from_every_exit_aleph0_handles() {
     };
     let handled = emulated_exits().into_iter().map(|exit| (START, exit)).chain([
         (START, synthetic_msr),
+        (START, forwarded_msr),
+        (START, hypercall(0x5C)),
+        (START, vmcall(0)),
         (START, exit(EXIT_REASON_MWAIT)),
         (START, exit(EXIT_REASON_MONITOR)),
         (START, nmi(0)),
@@ -1145,17 +1165,10 @@ fn the_firmware_resumes_from_every_exit_aleph0_handles() {
 }
 
 #[test]
-fn the_firmware_stops_at_its_vmcalls_and_ept_violations() {
-    // The test guest's markers mean nothing in the firmware: its VMCALLs are
-    // Hyper-V hypercalls (#27). No page is the firmware's to write, so every
-    // EPT violation means the map is wrong.
-    for exit in [
-        vmcall(0),
-        vmcall(MARKER),
-        vmcall(NMI_MARKER),
-        protected_write(),
-        ept_violation(0xFEE0_0030, EPT_ACCESS_READ),
-    ] {
+fn the_firmware_stops_at_its_ept_violations() {
+    // No page is the firmware's to write, so every EPT violation means the
+    // map is wrong.
+    for exit in [protected_write(), ept_violation(0xFEE0_0030, EPT_ACCESS_READ)] {
         assert_eq!(
             firmware(START, exit),
             ExitAction::Unexpected,
@@ -1171,41 +1184,164 @@ fn the_firmware_stops_at_its_vmcalls_and_ept_violations() {
 
 #[test]
 fn the_firmware_resumes_past_aleph0s_own_vmcalls() {
-    for (rax, event) in [
+    for (rcx, event) in [
         (vmcall::BOOT_SERVICES_ENDED, ExitEvent::BootServicesEnded),
         (vmcall::TEST, ExitEvent::TestVmcall),
     ] {
-        assert_eq!(decide(GuestKind::Firmware, START, vmcall(rax)), (event, START));
+        // Under Hyper-V or not: they are Aleph0's either way.
+        for hyperv in [false, true] {
+            let exit = ExitInfo {
+                hyperv,
+                ..hypercall(rcx)
+            };
+            assert_eq!(decide(GuestKind::Firmware, START, exit), (event, START));
+        }
         assert_eq!(event.action(), ExitAction::Resume(ResumePlan::PAST_INSTRUCTION));
     }
 }
 
 #[test]
-fn aleph0s_vmcalls_are_told_apart_by_all_of_rax() {
-    // One bit off, or only the low half: a Hyper-V hypercall, whose RAX is
-    // whatever the caller left there.
-    for rax in [
-        vmcall::BOOT_SERVICES_ENDED ^ 1,
-        vmcall::BOOT_SERVICES_ENDED & 0xFFFF_FFFF,
-        vmcall::TEST ^ (1 << 63),
-    ] {
-        assert_eq!(firmware(START, vmcall(rax)), ExitAction::Unexpected, "rax={rax:#x}");
+fn aleph0s_vmcalls_have_reserved_hypercall_bits_set() {
+    // Bits 63:60 of a hypercall input value are reserved, so no hypercall
+    // Hyper-V takes has either value in RCX.
+    for rcx in [vmcall::BOOT_SERVICES_ENDED, vmcall::TEST] {
+        assert_ne!(rcx >> 60, 0, "{rcx:#x}");
     }
     assert_ne!(vmcall::BOOT_SERVICES_ENDED, vmcall::TEST);
     assert_eq!(vmcall::BOOT_SERVICES_ENDED, 0x416c_6570_6830_4542);
 }
 
 #[test]
-fn the_test_guest_has_no_aleph0_vmcalls() {
-    // Its VMCALLs are its script's: the ExitBootServices marker is not the
-    // next main VMCALL's, so it stops the run.
-    for rax in [vmcall::BOOT_SERVICES_ENDED, vmcall::TEST] {
+fn every_other_firmware_vmcall_is_forwarded_under_hyper_v() {
+    // HvCallPostMessage and HvCallSignalEvent as the VMBus drivers make
+    // them, a fast rep hypercall, and Aleph0's values one bit off or cut to
+    // their low half, which are hypercalls too (invalid ones, which Hyper-V
+    // answers).
+    for rcx in [
+        0x5C,
+        0x1_005D,
+        0x0000_0002_0001_0003,
+        vmcall::BOOT_SERVICES_ENDED ^ 1,
+        vmcall::BOOT_SERVICES_ENDED & 0xFFFF_FFFF,
+        vmcall::TEST ^ (1 << 63),
+    ] {
         assert_eq!(
-            decide(GuestKind::BuiltInTest, WRITTEN, vmcall(rax)).0,
-            ExitEvent::Unexpected,
-            "rax={rax:#x}"
+            decide(GuestKind::Firmware, START, hypercall(rcx)),
+            (ExitEvent::Emulated(Emulation::Hypercall { input: rcx }), START),
+            "rcx={rcx:#x}"
         );
     }
+    // Aleph0's values in RAX are no call to Aleph0 any more.
+    let in_rax = ExitInfo {
+        guest_rax: vmcall::BOOT_SERVICES_ENDED,
+        ..hypercall(0x5C)
+    };
+    assert_eq!(
+        decide(GuestKind::Firmware, START, in_rax).0,
+        ExitEvent::Emulated(Emulation::Hypercall { input: 0x5C })
+    );
+}
+
+#[test]
+fn a_forwarded_hypercall_resumes_past_the_vmcall_with_its_result() {
+    let event = decide(GuestKind::Firmware, START, hypercall(0x5C)).0;
+    assert_eq!(
+        event.action(),
+        ExitAction::Resume(ResumePlan {
+            emulate: Some(Emulation::Hypercall { input: 0x5C }),
+            ..ResumePlan::PAST_INSTRUCTION
+        })
+    );
+}
+
+#[test]
+fn a_refused_forward_injects_at_the_instruction_and_keeps_the_rest() {
+    let ExitAction::Resume(plan) = ExitEvent::Emulated(Emulation::Hypercall { input: 0x5C }).action() else {
+        panic!("a forwarded hypercall resumes");
+    };
+    let plan = plan.keeping_pending_nmi(ExitState {
+        nmi_pending: true,
+        ..START
+    });
+    let refused = plan.refused_with(InterruptionInfo::INVALID_OPCODE);
+    assert!(!refused.advance_rip);
+    assert_eq!(refused.inject_exception, Some(InterruptionInfo::INVALID_OPCODE));
+    assert_eq!(
+        (refused.nmi_window, refused.emulate),
+        (Some(true), Some(Emulation::Hypercall { input: 0x5C }))
+    );
+}
+
+#[test]
+fn a_vmcall_without_hyper_v_gets_invalid_opcode() {
+    // As on hardware without a hypervisor: VMCALL outside VMX non-root
+    // operation is #UD.
+    let exit = ExitInfo {
+        hyperv: false,
+        ..hypercall(0x5C)
+    };
+    assert_eq!(
+        decide(GuestKind::Firmware, START, exit),
+        (ExitEvent::GuestInvalidOpcode, START)
+    );
+    assert_eq!(firmware(START, exit), ExitAction::Resume(ResumePlan::INJECT_UD));
+}
+
+#[test]
+fn a_vmcall_from_cpl_3_gets_invalid_opcode_whatever_rcx_holds() {
+    // Hyper-V refuses a hypercall from CPL > 0 with #UD; forwarding it from
+    // root operation would make it at CPL 0 instead. Aleph0's own need CPL 0
+    // too.
+    for cpl in 1..=3 {
+        for rcx in [0x5C, vmcall::BOOT_SERVICES_ENDED, vmcall::TEST] {
+            let exit = ExitInfo {
+                guest_cpl: cpl,
+                ..hypercall(rcx)
+            };
+            assert_eq!(
+                decide(GuestKind::Firmware, START, exit).0,
+                ExitEvent::GuestInvalidOpcode,
+                "cpl={cpl} rcx={rcx:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_cpl_is_the_dpl_of_ss() {
+    // A 64-bit kernel data segment (0xC093) and a user one (0xC0F3).
+    assert_eq!(cpl_from_ss(0xC093), 0);
+    assert_eq!(cpl_from_ss(0xC0F3), 3);
+    assert_eq!(cpl_from_ss(0x1_C0B3), 1);
+}
+
+#[test]
+fn the_test_guest_keeps_its_script_under_hyper_v() {
+    // Its VMCALLs are its script's: Aleph0's values and hypercalls stop the
+    // run, and its markers in RAX do what they always did.
+    for rcx in [vmcall::BOOT_SERVICES_ENDED, vmcall::TEST, 0x5C] {
+        assert_eq!(
+            decide(GuestKind::BuiltInTest, WRITTEN, hypercall(rcx)).0,
+            ExitEvent::Unexpected,
+            "rcx={rcx:#x}"
+        );
+    }
+    let marked = |rax| ExitInfo {
+        hyperv: true,
+        ..vmcall(rax)
+    };
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WRITTEN, marked(MARKER)).0,
+        ExitEvent::MainVmcall
+    );
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, marked(NMI_MARKER)).0,
+        ExitEvent::GuestNmiHandler
+    );
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, marked(MARKER + 1)).0,
+        ExitEvent::LastMainVmcall
+    );
 }
 
 #[test]

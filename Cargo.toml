@@ -25,6 +25,10 @@ host-fault-test = []
 # The exit handler waits in root operation after main VMCALL #1, so the
 # `-InjectNmi` NMI reaches the host NMI handler instead of the guest.
 host-nmi-test = ["test-guest"]
+# At the first exit under Hyper-V, forward an RDMSR and a WRMSR of
+# 0x4000FFFF, which Hyper-V refuses: shows the host fault handler resuming
+# a refused forward (docs/HYPERV_INTERFACE.md section 5).
+forward-refusal-test = []
 # Print every VM exit in full, with no rate limit (vmexit/policy.rs).
 trace-exits = []
 # Expect the wrong RAX at main VMCALL #1, so the guest stops there as an

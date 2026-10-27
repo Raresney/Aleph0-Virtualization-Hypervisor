@@ -13,6 +13,7 @@ use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS}
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::{GuestEntry, GuestState};
 use crate::vmx::host::{HostEnvironment, InterruptStack};
+use crate::vmx::hyperv::{Detection, INTERFACE_LEAF, SYNTHETIC_MSRS, VENDOR_LEAF};
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
 use crate::vmx::page::Allocation;
@@ -260,6 +261,26 @@ pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, mtrr: MtrrCapabilities) {
             mtrr.variable_count(),
             addresses - count,
         ),
+    }
+}
+
+/// Prints what CPUID says of Hyper-V's interface (`detection`), and so what
+/// the guest's hypercalls and synthetic MSRs get.
+pub(super) fn hyperv(detection: &Detection) {
+    let vendor = detection.vendor_bytes();
+    let vendor = core::str::from_utf8(&vendor).unwrap_or("not ASCII");
+    let line = format_args!(
+        "CPUID.1:ECX={:#010x}, leaf {VENDOR_LEAF:#x}: max leaf {:#x} vendor \"{vendor}\", leaf {INTERFACE_LEAF:#x}: interface {:#010x}",
+        detection.leaf1_ecx, detection.vendor.eax, detection.interface,
+    );
+    if detection.offers_interface() {
+        log!(
+            "Hyper-V interface offered ({line}): the guest keeps it; Aleph0 forwards its hypercalls and its synthetic MSRs {:#x}..={:#x} to Hyper-V.",
+            SYNTHETIC_MSRS.start(),
+            SYNTHETIC_MSRS.end(),
+        );
+    } else {
+        log!("No Hyper-V interface ({line}): the guest's VMCALLs other than Aleph0's get #UD, its synthetic MSRs #GP.");
     }
 }
 

@@ -124,7 +124,8 @@ pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 /// run's own (`actual`): two CPUIDs (leaf 1 and the address sizes), two
 /// RDMSRs and two WRMSRs of IA32_KERNEL_GS_BASE, three RDMSRs and seven
 /// WRMSRs of its last variable MTRR, two INs and two OUTs of the COM1
-/// scratch register, one HLT, and no exception injected. Bring-up compares
+/// scratch register, one HLT, no exception injected, and nothing forwarded
+/// to Hyper-V: its VMCALLs are its script's. Bring-up compares
 /// the two once the guest has finished. The number of exits and of NMIs
 /// injected depend on whether an NMI arrived during the run, so they are
 /// taken from `actual`.
@@ -139,6 +140,9 @@ pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
         io_out_exits: 2,
         halt_exits: 1,
         exception_injections: 0,
+        hypercall_exits: 0,
+        synthetic_read_exits: 0,
+        synthetic_write_exits: 0,
         ..*actual
     }
 }

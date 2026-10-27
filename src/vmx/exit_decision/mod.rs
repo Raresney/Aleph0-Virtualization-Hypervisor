@@ -14,9 +14,10 @@
 //!
 //! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID,
 //!   RDMSR, WRMSR, IN, OUT), RDMSR and WRMSR of the guest's MTRRs, which
-//!   reach a copy of them instead, and HLT, which it skips. Each handler
-//!   reads the exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR,
-//!   which get #UD, need no handler of their own.
+//!   reach a copy of them instead, and of Hyper-V's synthetic MSRs, which
+//!   are forwarded to Hyper-V, and HLT, which it skips. Each handler reads
+//!   the exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR, which
+//!   get #UD, need no handler of their own.
 //! - `scenario.rs`: exits that depend on what came before:
 //!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`. NMI reinjection,
 //!   for every guest, and the test guest's own exits: its EPT write and its
@@ -29,9 +30,9 @@
 //!
 //! The guest's kind (`GuestKind`) decides the VMCALLs and the test guest's
 //! own exits. The firmware has no scripted end: its VMCALLs are Aleph0's
-//! own (`vmx::vmcall`) or else Hyper-V hypercalls (#27), which stop it, and
-//! so does every EPT violation, so it never finishes and runs until an exit
-//! Aleph0 does not handle.
+//! own (`vmx::vmcall`) or else Hyper-V hypercalls, forwarded to Hyper-V
+//! (`firmware_vmcall`), and every EPT violation stops it, so it never
+//! finishes and runs until an exit Aleph0 does not handle.
 //!
 //! An exit reason without a handler stops the guest. Nothing here counts
 //! exits: `vmexit::stats` does, for every guest, from what the handler
@@ -344,6 +345,19 @@ pub struct ExitInfo {
     /// (`vmexit::guest_mtrrs`). [`MtrrCapabilities::NONE`] until bring-up
     /// publishes them, and on a CPU without MTRRs.
     pub mtrr: MtrrCapabilities,
+    /// Whether bring-up found Hyper-V's interface (`hyperv::offered`): its
+    /// hypercalls and synthetic MSRs are forwarded to it.
+    pub hyperv: bool,
+    /// The guest's CPL, SS.DPL (Intel SDM Vol. 3C, "Checks on Guest Segment
+    /// Registers": SS.DPL is the CPL), read for VMCALL exits only; 0
+    /// otherwise, which [`decide`] never looks at.
+    pub guest_cpl: u8,
+}
+
+/// The CPL from the guest's SS access rights (GUEST_SS_ACCESS_RIGHTS): its
+/// DPL, bits 6:5.
+pub fn cpl_from_ss(access_rights: u64) -> u8 {
+    (access_rights >> 5) as u8 & 0b11
 }
 
 impl ExitInfo {
@@ -436,15 +450,18 @@ pub enum ExitEvent {
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
     /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
-    /// bitmap, an MTRR address the CPU has no MSR at, a non-canonical value
-    /// for an intercepted MSR, or a value its MTRRs would refuse.
+    /// bitmap that is not forwarded to Hyper-V, an MTRR address the CPU has
+    /// no MSR at, a non-canonical value for an intercepted MSR, or a value
+    /// its MTRRs would refuse.
     GuestGeneralProtection,
     /// HLT: resume past it at once. The guest's next instruction runs as if
     /// an interrupt had woken it.
     Halted,
-    /// MWAIT or MONITOR, which the guest gets #UD for, as on a CPU without
-    /// them: the guest's CPUID.1:ECX bit 3 (MONITOR/MWAIT) is clear under
-    /// Hyper-V, and `cpuid_policy` passes it through.
+    /// An instruction the guest gets #UD for, as on hardware without what
+    /// it asks for: MWAIT or MONITOR (the guest's CPUID.1:ECX bit 3 is clear
+    /// under Hyper-V, and `cpuid_policy` passes it through), or a VMCALL
+    /// that is neither Aleph0's own nor one Hyper-V takes: without Hyper-V's
+    /// interface, or from CPL > 0, which Hyper-V refuses with #UD too.
     GuestInvalidOpcode,
     /// Aleph0's `ExitBootServices` event ran in the guest
     /// ([`vmcall::BOOT_SERVICES_ENDED`]): resume past its VMCALL, from now
@@ -564,6 +581,18 @@ impl ResumePlan {
         }
     }
 
+    /// This plan once Hyper-V refused its forwarded access with `exception`:
+    /// RIP stays on the guest's instruction, which gets the exception, as it
+    /// would without Aleph0. The rest of the plan (NMI window, the emulation
+    /// it tried, for the counts) is kept.
+    pub fn refused_with(self, exception: InterruptionInfo) -> Self {
+        Self {
+            advance_rip: false,
+            inject_exception: Some(exception),
+            ..self
+        }
+    }
+
     /// This plan with `redelivery` added, or `None` when it cannot be added
     /// and the guest must stop.
     ///
@@ -663,19 +692,34 @@ pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent,
         EXIT_REASON_EPT_VIOLATION => (ExitEvent::EptViolation, state),
         EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),
         EXIT_REASON_VMCALL if test_guest => scenario::vmcall(state, &exit),
-        EXIT_REASON_VMCALL => (aleph0_vmcall(&exit), state),
+        EXIT_REASON_VMCALL => (firmware_vmcall(&exit), state),
         _ => (ExitEvent::Unexpected, state),
     }
 }
 
-/// A VMCALL of the firmware, or of the OS after it: one of Aleph0's own
-/// (`vmx::vmcall`), told apart by RAX, or else a Hyper-V hypercall, which
-/// stops the guest until #27 forwards them.
-fn aleph0_vmcall(exit: &ExitInfo) -> ExitEvent {
-    match exit.guest_rax {
+/// A VMCALL of the firmware, or of the OS after it:
+///
+/// | CPL | RCX | Event |
+/// |---|---|---|
+/// | > 0 | anything | #UD, as Hyper-V gives (and KVM's emulation of it) |
+/// | 0 | one of Aleph0's own (`vmx::vmcall`) | handled here |
+/// | 0 | anything else, with Hyper-V's interface | a hypercall, forwarded |
+/// | 0 | anything else, without it | #UD, as on hardware without a hypervisor |
+///
+/// Aleph0's own values have reserved hypercall-input bits set, so no
+/// hypercall Hyper-V would take is mistaken for one.
+fn firmware_vmcall(exit: &ExitInfo) -> ExitEvent {
+    if exit.guest_cpl != 0 {
+        return ExitEvent::GuestInvalidOpcode;
+    }
+    match exit.guest_rcx {
         vmcall::BOOT_SERVICES_ENDED => ExitEvent::BootServicesEnded,
         vmcall::TEST => ExitEvent::TestVmcall,
-        _ => ExitEvent::Unexpected,
+        // shortcut: forwards the x64 register convention only; a guest
+        // calling from 32-bit mode passes its input in EDX:EAX and would
+        // need translating, once a 32-bit guest exists.
+        input if exit.hyperv => ExitEvent::Emulated(Emulation::Hypercall { input }),
+        _ => ExitEvent::GuestInvalidOpcode,
     }
 }
 

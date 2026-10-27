@@ -31,15 +31,18 @@ Verified on Hyper-V with nested virtualization:
       (the #GP host-tested only)
 - [x] Emulates CPUID, RDMSR/WRMSR and IN/OUT by passthrough, with MSR and I/O
       bitmaps limiting which MSRs and ports exit
+- [x] Keeps Hyper-V's interface for its guest: forwards the guest's
+      hypercalls and synthetic MSRs to Hyper-V from root operation, and
+      gives it the #UD or #GP Hyper-V refuses one with
 - [x] Catches an NMI that arrives while the guest runs and reinjects it into
       the guest's own IDT
 - [x] Reports every exit over serial, then leaves VMX operation and returns to
       firmware
-- [ ] Virtualize the running firmware in place (it launches on Hyper-V, then
-      stops at its first synthetic MSR, `0x40000020`, until #27)
-- [ ] Stay resident after `ExitBootServices` (resident memory, the image
-      copy and the `ExitBootServices` event are in; the test harness's run
-      waits for #27, like the firmware)
+- [x] Virtualizes the running firmware in place: on Hyper-V it runs as the
+      guest, draws its boot screen and answers the keyboard over VMBus
+- [x] Stays resident after `ExitBootServices`: a harness exits boot
+      services as Aleph0's guest and overwrites every page the OS may
+      reclaim, and Aleph0 still handles its exits
 - [ ] Hide Aleph0's own memory from the guest through EPT
 - [ ] An OS guest on multiple vCPUs
 - [ ] Anti-cheat research: guest memory introspection, EPT protection and
@@ -141,7 +144,9 @@ test-only switches in `Cargo.toml`: `host-fault-test` and `host-nmi-test` (see
 [docs/HOST_ENVIRONMENT.md](docs/HOST_ENVIRONMENT.md) section 8),
 `unexpected-exit-test` and `trace-exits` (see
 [docs/SERIAL_LOGGING.md](docs/SERIAL_LOGGING.md)), and `ept-misconfig-test`
-(see [docs/EPT.md](docs/EPT.md) section 6). `-ProcessorCount` sets the
+(see [docs/EPT.md](docs/EPT.md) section 6), and `forward-refusal-test`
+(see [docs/HYPERV_INTERFACE.md](docs/HYPERV_INTERFACE.md) section 5).
+`-ProcessorCount` sets the
 vCPUs (2 by default, 1 with `-InjectNmi`).
 
 **The Linux target:** `scripts/linux/build.sh` (Linux or WSL) builds the
@@ -176,7 +181,8 @@ diagnostics that run before VMXON.
 | `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
 | `src/vmx/host/` | What VMX root operation runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |
 | `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
-| `src/vmx/vmcall.rs` | Aleph0's own VMCALLs, told apart by RAX: the end of boot services, and a test call |
+| `src/vmx/vmcall.rs` | Aleph0's own VMCALLs, told apart by RCX: the end of boot services, and a test call |
+| `src/vmx/hyperv.rs` | Hyper-V's interface, which the guest keeps: detecting it, and forwarding the guest's hypercalls and synthetic MSRs from root operation, with the recovery points for those Hyper-V refuses (see [docs/HYPERV_INTERFACE.md](docs/HYPERV_INTERFACE.md), the decision and its runs) |
 | `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
 | `src/vmx/guest.rs`, `paging.rs` | The built-in test guest's code, data, stack and IDT pages; the page-table walk that checks them |
 | `src/vmx/ept/` | EPT: support check, the identity map of the whole guest-physical address space (`MapLayout`: PDs for the memory map, UC 1 GiB pages above) with the guest's data page read-only, write grant and INVEPT, and the memory types that follow the guest's MTRRs, with spare PTs (`mod.rs`); the walk of a GPA through the tables and what the CPU refuses in an entry, for the stop on any other EPT exit (`walk.rs`) |
@@ -186,7 +192,7 @@ diagnostics that run before VMXON.
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU, and where each guest starts |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the test guest stops, and the in-place launch the firmware goes on from as the guest |
 | `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); the guest's copy of its MTRRs (`guest_mtrrs.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
-| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
+| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy and of Hyper-V's synthetic MSRs to Hyper-V are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `tools/ebs-harness/` | The ExitBootServices test harness, an EFI application of its own (see [docs/RESIDENT.md](docs/RESIDENT.md)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |
@@ -211,6 +217,7 @@ references it relies on:
 - [FIRMWARE_GUEST.md](docs/FIRMWARE_GUEST.md): launching in place, so the firmware itself runs as the guest
 - [RESIDENT.md](docs/RESIDENT.md): staying resident after `ExitBootServices`: resident memory, the relocated image copy, the event, the test harness
 - [LINUX_GUEST.md](docs/LINUX_GUEST.md): the Linux target, how it is built and staged, and its boot without Aleph0
+- [HYPERV_INTERFACE.md](docs/HYPERV_INTERFACE.md): how the guest sees Hyper-V: the decision to forward its hypercalls and synthetic MSRs, and the runs behind it
 
 ## Contributing
 

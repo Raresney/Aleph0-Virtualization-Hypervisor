@@ -1276,9 +1276,14 @@ impl TypeTables {
             (self.pts_address, self.pt_count),
         ];
         address.is_multiple_of(size_of::<u64>() as u64)
-            && tables
-                .iter()
-                .any(|&(start, pages)| (start..start + (pages * PAGE_SIZE) as u64).contains(&address))
+            && tables.iter().any(|&(start, pages)| {
+                // `build`'s table bases are well below the top of the address
+                // space, so the end never wraps in practice; saturating keeps
+                // the predicate total rather than panicking if a future base
+                // or page count ever sat near `u64::MAX`.
+                let len = (pages as u64).saturating_mul(PAGE_SIZE as u64);
+                (start..start.saturating_add(len)).contains(&address)
+            })
     }
 
     /// How many PTs are free, set aside or given back.
