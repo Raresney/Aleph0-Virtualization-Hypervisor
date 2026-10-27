@@ -33,16 +33,30 @@ pub const RESIDENT_CODE: MemoryType = MemoryType::RUNTIME_SERVICES_CODE;
 pub struct Allocation {
     pub address: u64,
     pub pages: usize,
+    /// Whether it is [`RESIDENT_CODE`] (the image copy, the guest's code and
+    /// data) rather than [`RESIDENT_DATA`]. Hiding keeps code pages
+    /// executable by the guest (read-only, so they cannot be rewritten),
+    /// since the `ExitBootServices` event callback runs in the guest from
+    /// the image copy; it redirects data pages to the shadow (`vmx::ept`).
+    pub code: bool,
+}
+
+impl Allocation {
+    /// Whether `address` lies in this allocation's pages.
+    pub fn contains(&self, address: u64) -> bool {
+        address >= self.address && address - self.address < (self.pages * PAGE_SIZE) as u64
+    }
 }
 
 /// How many resident allocations [`resident_allocations`] can list.
 /// Bring-up makes 27 on the Hyper-V test VM.
 const LISTED_ALLOCATIONS: usize = 64;
 
-/// Address and page count of each resident allocation, oldest first. Only
-/// bring-up allocates, on one CPU; the atomics just avoid `static mut`.
-static ALLOCATIONS: [[AtomicU64; 2]; LISTED_ALLOCATIONS] =
-    [const { [AtomicU64::new(0), AtomicU64::new(0)] }; LISTED_ALLOCATIONS];
+/// Address, page count and code flag of each resident allocation, oldest
+/// first. Only bring-up allocates, on one CPU; the atomics just avoid
+/// `static mut`.
+static ALLOCATIONS: [[AtomicU64; 3]; LISTED_ALLOCATIONS] =
+    [const { [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)] }; LISTED_ALLOCATIONS];
 /// Resident allocations so far, listed or not.
 static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -53,9 +67,10 @@ fn record(allocation: Allocation, memory_type: MemoryType) {
         return;
     }
     let index = ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-    if let Some([address, pages]) = ALLOCATIONS.get(index) {
+    if let Some([address, pages, code]) = ALLOCATIONS.get(index) {
         address.store(allocation.address, Ordering::Relaxed);
         pages.store(allocation.pages as u64, Ordering::Relaxed);
+        code.store(allocation.code.into(), Ordering::Relaxed);
     }
 }
 
@@ -63,10 +78,23 @@ fn record(allocation: Allocation, memory_type: MemoryType) {
 /// [`LISTED_ALLOCATIONS`].
 pub fn resident_allocations() -> impl Iterator<Item = Allocation> {
     let listed = ALLOCATION_COUNT.load(Ordering::Relaxed).min(LISTED_ALLOCATIONS);
-    ALLOCATIONS[..listed].iter().map(|[address, pages]| Allocation {
+    ALLOCATIONS[..listed].iter().map(|[address, pages, code]| Allocation {
         address: address.load(Ordering::Relaxed),
         pages: pages.load(Ordering::Relaxed) as usize,
+        code: code.load(Ordering::Relaxed) != 0,
     })
+}
+
+/// Whether `gpa` lies in one of Aleph0's own resident pages. Used to guard
+/// the GPAs a forwarded Hyper-V access would have Hyper-V read or overlay
+/// (`vmx::hyperv`): those act on Aleph0's address space past EPT, so one
+/// naming an Aleph0 page must be refused, not forwarded.
+///
+/// Sound only once the allocation list is complete: bring-up refuses to
+/// launch while [`unlisted_resident_allocations`] is non-zero, so by the
+/// time the guest runs [`resident_allocations`] is every page Aleph0 keeps.
+pub fn is_resident(gpa: u64) -> bool {
+    resident_allocations().any(|a| a.contains(gpa))
 }
 
 /// Resident allocations made after the list was full, which
@@ -115,8 +143,13 @@ pub fn allocate_zeroed_pages_of_type<E>(
         Allocation {
             address: pages.as_ptr() as u64,
             pages: count,
+            code: memory_type == RESIDENT_CODE,
         },
         memory_type,
     );
     Ok(pages)
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/vmx/page.rs"]
+mod tests;
