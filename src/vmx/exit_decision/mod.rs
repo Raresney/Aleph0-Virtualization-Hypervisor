@@ -260,6 +260,19 @@ impl InterruptionInfo {
         self.is_valid() && (self.0 >> 8) & 0b111 == Self::TYPE_NMI && self.vector() == Some(NMI_VECTOR)
     }
 
+    /// Whether this field, read as IDT_VECTORING_INFO, reports an NMI whose
+    /// delivery the exit interrupted: valid, vector 2, interruption type 2
+    /// (NMI) or 3 (hardware exception). Vector 2 is the NMI vector and has no
+    /// hardware exception, but a hypervisor underneath (Hyper-V) reports the
+    /// interrupted NMI with type 3, so both types count. Re-delivery re-arms
+    /// it as a true NMI ([`InterruptionInfo::NMI`], type 2), not a vector-2
+    /// hardware exception; [`ExitInfo::redelivery`] does that.
+    pub fn is_nmi_vectoring(self) -> bool {
+        self.is_valid()
+            && self.vector() == Some(NMI_VECTOR)
+            && matches!(self.event_type(), Self::TYPE_NMI | Self::TYPE_HARDWARE_EXCEPTION)
+    }
+
     /// Whether VM entry also delivers VM_ENTRY_EXCEPTION_ERROR_CODE (bit 11).
     pub fn delivers_error_code(self) -> bool {
         self.0 & Self::DELIVER_ERROR_CODE != 0
@@ -339,8 +352,16 @@ pub struct ExitInfo {
     /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only; 0 otherwise.
     pub guest_physical: u64,
     /// GPA of the page EPT maps read-only (`ept::protected_page_for`), 0 if
-    /// none.
+    /// none. For an EPT violation it is the protected page the access fell
+    /// in: the guest's data page, or the reinjected NMI's stack page.
     pub protected_page: u64,
+    /// GPA of the page EPT maps read-only for the reinjected NMI's stack
+    /// (`ept::nmi_stack_page`), 0 if none. The NMI-delivery fault lands in
+    /// this page and the guest's own data write in [`Self::protected_page`]'s;
+    /// the scenario tells the two EPT violations apart by which page the GPA
+    /// is in, not by the vectoring field (a hypervisor may report the
+    /// interrupted NMI as type 2 or 3).
+    pub stack_page: u64,
     /// The guest's MTRR MSRs: which exist, and which values WRMSR refuses
     /// (`vmexit::guest_mtrrs`). [`MtrrCapabilities::NONE`] until bring-up
     /// publishes them, and on a CPU without MTRRs.
@@ -369,7 +390,15 @@ impl ExitInfo {
         if !self.idt_vectoring.is_valid() {
             return None;
         }
-        let info = self.idt_vectoring.for_reentry();
+        // Vector 2 is the NMI vector: re-deliver it as an NMI (type 2)
+        // whatever type the vectoring field reports. Hyper-V reports the
+        // interrupted NMI as a hardware exception (type 3), and re-arming that
+        // verbatim would inject a #2 hardware exception, not an NMI.
+        let info = if self.idt_vectoring.is_nmi_vectoring() {
+            InterruptionInfo::NMI
+        } else {
+            self.idt_vectoring.for_reentry()
+        };
         Some(Redelivery {
             info,
             error_code: info.delivers_error_code().then_some(self.idt_vectoring_error_code),
@@ -498,6 +527,11 @@ pub struct ResumePlan {
     /// or `inject_exception`: only one event is injected per entry
     /// ([`ResumePlan::redelivering`]).
     pub redeliver: Option<Redelivery>,
+    /// Clear blocking by NMI (bit 3) in GUEST_INTERRUPTIBILITY_STATE before
+    /// resuming. Set only when re-delivering an NMI whose delivery faulted:
+    /// that faulted delivery left bit 3 set, and VM entry refuses to inject
+    /// an NMI while it is ([`ResumePlan::redelivering`]).
+    pub clear_nmi_blocking: bool,
 }
 
 impl ResumePlan {
@@ -510,6 +544,7 @@ impl ResumePlan {
         emulate: None,
         inject_exception: None,
         redeliver: None,
+        clear_nmi_blocking: false,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -523,6 +558,7 @@ impl ResumePlan {
         emulate: None,
         inject_exception: None,
         redeliver: None,
+        clear_nmi_blocking: false,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -534,6 +570,7 @@ impl ResumePlan {
         emulate: None,
         inject_exception: None,
         redeliver: None,
+        clear_nmi_blocking: false,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -545,6 +582,7 @@ impl ResumePlan {
         emulate: None,
         inject_exception: None,
         redeliver: None,
+        clear_nmi_blocking: false,
     };
     /// Inject #GP(0); RIP stays on the faulting instruction, as for any
     /// fault.
@@ -556,6 +594,7 @@ impl ResumePlan {
         emulate: None,
         inject_exception: Some(InterruptionInfo::GENERAL_PROTECTION),
         redeliver: None,
+        clear_nmi_blocking: false,
     };
     /// Inject #UD; RIP stays on the faulting instruction.
     pub const INJECT_UD: Self = Self {
@@ -610,6 +649,10 @@ impl ResumePlan {
         }
         Some(Self {
             redeliver: Some(redelivery),
+            // The faulted NMI delivery left blocking by NMI set; clear it so
+            // VM entry can inject the re-delivered NMI. `redelivery.info` is
+            // already re-armed to a type-2 NMI for a vector-2 vectoring.
+            clear_nmi_blocking: redelivery.info.is_nmi(),
             ..self
         })
     }
@@ -626,6 +669,15 @@ impl ResumePlan {
 /// blocked through one more instruction it never asked to protect.
 pub fn after_skipped_instruction(interruptibility: u32) -> u32 {
     interruptibility & !(scenario::BLOCKING_BY_STI | scenario::BLOCKING_BY_MOV_SS)
+}
+
+/// GUEST_INTERRUPTIBILITY_STATE with blocking by NMI (bit 3) cleared, for
+/// re-delivering an NMI whose delivery faulted. VM entry refuses to inject an
+/// NMI while bit 3 is set, and the faulted delivery set it, so re-delivery
+/// must clear it, as KVM's `__vmx_complete_interrupts` does when it re-queues
+/// an NMI from IDT-vectoring.
+pub fn after_nmi_redelivery(interruptibility: u32) -> u32 {
+    interruptibility & !scenario::BLOCKING_BY_NMI
 }
 
 /// What the handler does after an exit.

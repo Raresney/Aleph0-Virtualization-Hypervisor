@@ -33,7 +33,8 @@ use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
     EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation,
     ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan,
-    UNREADABLE_REASON, after_skipped_instruction, cpl_from_ss, cpuid_policy, decide, is_canonical_48, merge_in,
+    UNREADABLE_REASON, after_nmi_redelivery, after_skipped_instruction, cpl_from_ss, cpuid_policy, decide,
+    is_canonical_48, merge_in,
 };
 use crate::vmx::host;
 use crate::vmx::hyperv::{self, HypercallRegisters};
@@ -361,6 +362,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
                 qualification,
                 guest_physical,
                 protected_page: protected.map_or(0, |page| page.gpa),
+                stack_page: ept::nmi_stack_page(),
                 mtrr,
                 hyperv: hyperv::offered(),
                 guest_cpl,
@@ -806,6 +808,7 @@ fn prepare_resume(
         grant_write,
         inject_exception,
         redeliver,
+        clear_nmi_blocking,
         ..
     } = plan;
 
@@ -832,6 +835,21 @@ fn prepare_resume(
         rip
     };
 
+    if clear_nmi_blocking {
+        // Re-delivering an NMI whose delivery faulted: clear blocking by NMI
+        // so VM entry can inject it. `exit` is always read for a resumed exit,
+        // and this plan never also advances RIP (`ResumePlan::redelivering`),
+        // so it does not race the STI/MOV SS clearing above.
+        let interruptibility = read.exit.map_or(0, |exit| exit.interruptibility);
+        let cleared = after_nmi_redelivery(interruptibility);
+        if cleared != interruptibility {
+            write_for_resume(
+                GUEST_INTERRUPTIBILITY_STATE,
+                cleared.into(),
+                "end the guest's NMI blocking for re-delivery",
+            )?;
+        }
+    }
     if inject_nmi {
         write_for_resume(
             VM_ENTRY_INTERRUPTION_INFO,

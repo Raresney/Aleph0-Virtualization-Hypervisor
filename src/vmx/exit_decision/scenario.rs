@@ -116,17 +116,24 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
 /// EPT violation (exit reason 48). Two are handled, each once: the guest's
 /// write to its protected data page (before the first main VMCALL), and the
 /// reinjected NMI's delivery faulting on the read-only stack page as the CPU
-/// pushes the interrupt frame. The second carries the NMI in its
-/// IDT-vectoring field, which the handler re-delivers on top of the grant
-/// (`ExitInfo::redelivery`); here they differ only in the grant counter they
-/// advance. Any other EPT violation, a stray repeat of either included, is
-/// [`ExitEvent::EptViolation`].
+/// pushes the interrupt frame. The reinjected NMI's delivery carries the NMI
+/// in the exit's IDT-vectoring field, which the handler re-delivers on top of
+/// the grant (`ExitInfo::redelivery`).
+///
+/// The two faults are told apart by which read-only page the GPA fell in, not
+/// by the IDT-vectoring field: the guest's main code never touches the stack
+/// (only the NMI handler's push after the grant does), and a hypervisor
+/// underneath may report the interrupted NMI's delivery with interruption
+/// type 3 rather than 2 (Hyper-V does), so the vectoring field is not a
+/// reliable discriminator. Any other EPT violation, a stray repeat of either
+/// included, is [`ExitEvent::EptViolation`].
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+    let frame = exit.guest_physical & !0xFFF;
     let protected_write = exit.protected_page != 0
-        && exit.guest_physical & !0xFFF == exit.protected_page
+        && frame == exit.protected_page
         && EptQualification(exit.qualification).is_protected_write();
     if protected_write {
-        if exit.idt_vectoring.is_nmi() {
+        if exit.stack_page != 0 && frame == exit.stack_page {
             // The push for the reinjected NMI faulted on the read-only stack page.
             if state.nmi_stack_grants == 0 {
                 return (

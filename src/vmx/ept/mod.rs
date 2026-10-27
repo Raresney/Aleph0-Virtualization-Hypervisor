@@ -1660,6 +1660,26 @@ pub fn protected_page_for(gpa: u64) -> Option<ProtectedPage> {
     })
 }
 
+/// GPA of the second published read-only page: the guest's stack page, where
+/// the reinjected NMI's delivery faults. `bring_up` publishes the protected
+/// pages as `[data page, stack page]` (`Ept::build`), so the stack page is
+/// slot 1. Returns 0 before `Ept::build`, or when fewer than two pages were
+/// published. The exit handler carries it into the decision so the scenario
+/// can tell the NMI-stack fault from the data-page write by GPA.
+pub fn nmi_stack_page() -> u64 {
+    // The published flag, as in `protected_page_for`: a reader that sees a
+    // type sees the count and the slots too.
+    if decode_invept(INVEPT_TYPE.load(Ordering::Acquire)).is_none() {
+        return 0;
+    }
+    const STACK_SLOT: usize = 1;
+    if PROTECTED_COUNT.load(Ordering::Relaxed) > STACK_SLOT {
+        PROTECTED_GPAS[STACK_SLOT].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// The 128-bit INVEPT descriptor: the EPTP, then 64 reserved bits that must
 /// be 0.
 #[repr(C, align(16))]

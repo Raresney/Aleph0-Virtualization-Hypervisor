@@ -312,12 +312,24 @@ fn report_event(
     let rip = resumed.map_or(0, |resumed| resumed.rip);
     let nmis_injected = stats::snapshot().nmi_injections;
     match event {
-        ExitEvent::EptWriteGranted => crate::serial_println!(
-            "{tag} VM exit #{number}: write to the protected data page: write granted (W=1), INVEPT {}; retrying the write at rip={rip:#018x}.",
-            resumed
-                .and_then(|resumed| resumed.invept)
-                .map_or("not run", InveptType::name),
-        ),
+        ExitEvent::EptWriteGranted => {
+            // Name the page the grant was for: the guest's data page, or the
+            // reinjected NMI's stack page, told apart by the faulting GPA.
+            let (page, gpa) = exit.map_or(("protected data page", 0), |exit| {
+                let gpa = exit.guest_physical;
+                if exit.stack_page != 0 && gpa & !(PAGE_SIZE as u64 - 1) == exit.stack_page {
+                    ("NMI stack page", gpa)
+                } else {
+                    ("protected data page", gpa)
+                }
+            });
+            crate::serial_println!(
+                "{tag} VM exit #{number}: write to the {page} at GPA {gpa:#018x}: write granted (W=1), INVEPT {}; retrying the write at rip={rip:#018x}.",
+                resumed
+                    .and_then(|resumed| resumed.invept)
+                    .map_or("not run", InveptType::name),
+            )
+        }
         ExitEvent::DataPageMismatch => crate::serial_println!(
             "{tag} VM exit #{number}: the data page read back rcx={:#x} rdx={:#x}, expected {GUEST_DATA_SEED:#x} and {GUEST_EPT_VALUE:#x}.",
             exit.map_or(0, |exit| exit.guest_rcx),
@@ -390,8 +402,9 @@ fn report_event(
     }
     if event == ExitEvent::LastMainVmcall {
         crate::serial_println!(
-            "{tag} VM exit #{number}: EPT: {} write violation(s) on the protected data page, write granted.",
+            "{tag} VM exit #{number}: EPT: {} write violation(s) on the protected data page and {} on the NMI stack page, write granted.",
             state.ept_writes_granted,
+            state.nmi_stack_grants,
         );
     }
 }

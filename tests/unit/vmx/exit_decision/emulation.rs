@@ -36,6 +36,7 @@ fn exit(basic: u16) -> ExitInfo {
         qualification: 0,
         guest_physical: 0,
         protected_page: 0,
+        stack_page: 0,
         mtrr: MtrrCapabilities::NONE,
         hyperv: false,
         guest_cpl: 0,

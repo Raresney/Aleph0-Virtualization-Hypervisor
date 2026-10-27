@@ -344,16 +344,20 @@ Bit 10 confirms directly what `check_mappings` checked: as far as the
 guest's own page tables go the page is writable, so EPT alone refused the
 write.
 
-`exit_decision::decide` (through `scenario::ept_violation`) accepts exactly
-one EPT violation, and only if all
-of these hold:
-- the GPA's page is the protected page;
+`exit_decision::decide` (through `scenario::ept_violation`) accepts one EPT
+violation per read-only page — the guest's data page, and the stack page the
+reinjected NMI's delivery faults on as the CPU pushes the interrupt frame —
+and only if all of these hold:
+- the GPA's page is one of the protected pages (the data page or the stack
+  page; the two are told apart by which page the GPA is in, not by the
+  vectoring field, since a hypervisor underneath may report the interrupted
+  NMI's type as 3, not 2);
 - bits 1, 3, 7 and 8 are set and bit 4 is clear: a write to a readable,
   non-writable page, through the guest's own address;
 - bit 12 is clear (after such an IRET, resuming would need NMI blocking set
   again by hand, which Aleph0 does not do);
-- no write was granted yet (a second violation would mean the grant did not
-  work).
+- no write was granted yet for that page (a second violation on it would mean
+  the grant did not work).
 
 Any other EPT violation stops the guest as `EptViolation`, with a walk of
 the GPA (below). And if main VMCALL #1 arrives **before** any violation, the
@@ -363,7 +367,7 @@ guest stops with a message saying so (`EptWriteMissing`).
 ### Grant and retry
 
 For the accepted violation, the handler:
-1. sets W = 1 in the data page's PT entry (`ept::ProtectedPage::grant_write`);
+1. sets W = 1 in the faulting protected page's PT entry (`ept::ProtectedPage::grant_write`);
 2. runs INVEPT (section 7);
 3. resumes **without advancing RIP**.
 
@@ -611,7 +615,7 @@ section 10).
 | Exit reason 49 | EPT misconfiguration: stops with the walk, which names the bad entry |
 | IA32_APIC_BASE | `0x1B`; xAPIC registers at its bits MAXPHYADDR-1:12, the version register at `+0x30` |
 | Qualification | 0 read, 1 write, 2 fetch, 3/4/5 R/W/X allowed, 7 linear valid, 8 translated access, 12 NMI-unblocking IRET |
-| Accepted violation | write to the protected page, `0x58a` on Hyper-V |
+| Accepted violation | write to a protected page (the data page or the NMI stack page), `0x58a` on Hyper-V |
 | After it | W = 1, INVEPT, resume at the same RIP |
 | `GUEST_DATA_SEED` / `GUEST_EPT_VALUE` | `0xDA7A` / `0x455054` ("EPT") |
 | Hyper-V map (before the MTRR types) | `0x0..0x80000000`, 5 table pages, EPTP `0x7eafc01e` |
