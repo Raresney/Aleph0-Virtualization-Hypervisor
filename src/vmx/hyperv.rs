@@ -123,6 +123,52 @@ pub fn offered() -> bool {
     OFFERED.load(Ordering::Relaxed)
 }
 
+/// Synthetic MSRs whose value overlays a page at a guest-chosen GPA: when
+/// the guest writes one with the enable bit set, Hyper-V lays a page over
+/// that GPA in the virtual processor's address space, which is Aleph0's
+/// (TLFS: the hypercall page, the reference TSC page, the VP assist page,
+/// and the SynIC's message and event pages, SIMP and SIEFP). The guest
+/// pointing one at an Aleph0 page would have Hyper-V overlay Aleph0's own
+/// memory, past EPT, so [`overlay_gpa`] lets the forwarder refuse it.
+const OVERLAY_MSRS: [u32; 5] = [
+    0x4000_0001, // HV_X64_MSR_HYPERCALL
+    0x4000_0021, // HV_X64_MSR_REFERENCE_TSC
+    0x4000_0073, // HV_X64_MSR_VP_ASSIST_PAGE (APIC assist)
+    0x4000_0083, // HV_X64_MSR_SIMP (SynIC message page)
+    0x4000_0084, // HV_X64_MSR_SIEFP (SynIC event flags page)
+];
+
+/// Bit 0 of an overlay MSR: enable. Clear disables the overlay, naming no
+/// GPA to guard.
+const OVERLAY_ENABLE: u64 = 1 << 0;
+
+/// Bits 51:12 of an overlay-MSR value or a hypercall GPA register: the
+/// guest-physical page frame, the rest a page offset or reserved.
+const GPA_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// Bit 16 of a hypercall input value (RCX): a fast hypercall, whose input
+/// and output are in registers (RDX, R8, XMM) rather than at GPAs.
+const FAST: u64 = 1 << 16;
+
+/// The GPA a WRMSR of `value` to synthetic MSR `msr` would have Hyper-V
+/// overlay in Aleph0's address space, or `None` when `msr` overlays no page
+/// or the write disables the overlay ([`OVERLAY_MSRS`]).
+pub fn overlay_gpa(msr: u32, value: u64) -> Option<u64> {
+    (OVERLAY_MSRS.contains(&msr) && value & OVERLAY_ENABLE != 0).then_some(value & GPA_MASK)
+}
+
+/// The GPAs a hypercall with input value `input` names: the input page in
+/// `rdx` and the output page in `r8`, or none for a fast hypercall, whose
+/// data is in registers Hyper-V cannot use to reach Aleph0's memory. The
+/// forwarder refuses the call if either names an Aleph0 page.
+pub fn hypercall_gpas(input: u64, rdx: u64, r8: u64) -> [Option<u64>; 2] {
+    if input & FAST != 0 {
+        [None, None]
+    } else {
+        [Some(rdx & GPA_MASK), Some(r8 & GPA_MASK)]
+    }
+}
+
 /// The call code of a hypercall input value: bits 15:0 of RCX.
 ///
 /// ```text

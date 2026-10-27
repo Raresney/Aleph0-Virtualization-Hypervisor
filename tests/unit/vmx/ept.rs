@@ -710,6 +710,30 @@ impl TypeMap {
     fn pt(&self, index: usize) -> &[EptEntry<Pt>] {
         &self.pts[index * ENTRIES..][..ENTRIES]
     }
+
+    /// Hides one page, redirecting it to `shadow`, as [`TypeTables::hide`]
+    /// does for each of Aleph0's pages.
+    fn hide(&mut self, page: u64, shadow: u64, code: bool) -> Hidden {
+        let (pts, _) = self.pts.as_chunks_mut::<ENTRIES>();
+        let mtrrs = all_write_back();
+        let mut tables = Hiding {
+            pds: &mut self.pds,
+            pts,
+            free: FreePts {
+                stack: &mut self.free,
+                len: &mut self.free_len,
+            },
+            pts_address: PTS_ADDRESS,
+            shadow,
+            types: EptTypes {
+                mtrrs: &mtrrs,
+                ram: self.ram,
+            },
+        };
+        let mut hidden = Hidden::default();
+        hide_page(&mut tables, page, code, &mut hidden).unwrap();
+        hidden
+    }
 }
 
 /// A 2 GiB machine: all of it WB, the default UC above.
@@ -778,6 +802,54 @@ fn a_region_of_one_type_again_gives_its_pt_back() {
     // The PT given back is the next one taken.
     map.retype(&write_back_with(&[range(3 * SIZE_2M, 0x1000, UC)]));
     assert_eq!(map.pds[3], EptEntry::table(PTS_ADDRESS + 0x1000));
+}
+
+/// A shadow HPA for the hiding tests: page-aligned, outside the 2 GiB map.
+const SHADOW: u64 = 0xDEAD_0000;
+
+#[test]
+fn hiding_a_page_splits_its_region_and_redirects_it_to_the_shadow() {
+    // One spare PT, which `hide` takes to split the region (index 1: index 0
+    // is the protected page's PT).
+    let mut map = TypeMap::new(&all_write_back(), 1);
+    let region = 2 * SIZE_2M;
+    let page = region + 5 * 0x1000;
+    assert_eq!(map.pds[2], EptEntry::large_page(region, WB));
+
+    let hidden = map.hide(page, SHADOW, false);
+    assert_eq!((hidden.data_pages, hidden.regions_split), (1, 1));
+    // The region is now a PT; the hidden page points at the shadow,
+    // read-write; its neighbours keep their real identity mappings.
+    assert_eq!(map.pds[2], EptEntry::table(PTS_ADDRESS + PAGE_SIZE as u64));
+    assert_eq!(map.pt(1)[5], EptEntry::page(SHADOW, EPT_READ | EPT_WRITE, WB));
+    assert_eq!(map.pt(1)[0], EptEntry::page(region, EPT_RWX, WB));
+    assert_eq!(map.free_len, 0);
+}
+
+#[test]
+fn a_hidden_code_page_is_kept_read_only_and_executable() {
+    let mut map = TypeMap::new(&all_write_back(), 1);
+    let page = 2 * SIZE_2M + 5 * 0x1000;
+    let hidden = map.hide(page, SHADOW, true);
+    assert_eq!((hidden.code_pages, hidden.regions_split), (1, 1));
+    // Kept at its own address so the guest can still execute it (the
+    // ExitBootServices callback), read-only so it cannot be rewritten.
+    assert_eq!(map.pt(1)[5], EptEntry::page(page, EPT_READ | EPT_EXECUTE, WB));
+}
+
+#[test]
+fn a_hidden_region_is_never_collapsed_by_retype() {
+    let mut map = TypeMap::new(&all_write_back(), 1);
+    let region = 2 * SIZE_2M;
+    map.hide(region + 5 * 0x1000, SHADOW, false);
+
+    // Region 2 is uniform WB, so retype would normally fold its PT back into
+    // one 2 MiB page; the redirect's non-RWX access pins it as a PT, so the
+    // hidden page is never re-exposed.
+    let retyped = map.retype(&all_write_back());
+    assert_eq!(retyped.merged, 0);
+    assert_eq!(map.pds[2], EptEntry::table(PTS_ADDRESS + PAGE_SIZE as u64));
+    assert_eq!(map.pt(1)[5], EptEntry::page(SHADOW, EPT_READ | EPT_WRITE, WB));
 }
 
 #[test]
@@ -1300,6 +1372,7 @@ fn region_runs_read_the_pds_then_the_1_gib_pages_above_them() {
         free: core::ptr::null_mut(),
         free_len: 0,
         protected_regions: [(HYPER_V_DATA_PAGE / SIZE_2M) as usize, usize::MAX],
+        shadow: 0,
         ram: ram.as_ptr(),
         ram_len: ram.len(),
         eptp: Eptp::new(0),
@@ -1489,6 +1562,7 @@ fn the_type_tables_walk_reads_only_the_tables_build_allocated() {
         free: core::ptr::null_mut(),
         free_len: 0,
         protected_regions: [(PROTECTED / SIZE_2M) as usize, usize::MAX],
+        shadow: 0,
         ram: ram.as_ptr(),
         ram_len: ram.len(),
         eptp: Eptp::new(pml4_address),

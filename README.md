@@ -43,7 +43,10 @@ Verified on Hyper-V with nested virtualization:
 - [x] Stays resident after `ExitBootServices`: a harness exits boot
       services as Aleph0's guest and overwrites every page the OS may
       reclaim, and Aleph0 still handles its exits
-- [ ] Hide Aleph0's own memory from the guest through EPT
+- [x] Hides Aleph0's own memory from the guest through EPT: data pages
+      (EPT tables, VMCS, host tables, stacks) redirected to a zero shadow
+      page, the image copy kept read-only but executable; the firmware
+      and the ExitBootServices harness run on with it on Hyper-V
 - [ ] An OS guest on multiple vCPUs
 - [ ] Anti-cheat research: guest memory introspection, EPT protection and
       split views, watching privileged changes

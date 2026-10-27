@@ -554,33 +554,66 @@ VM exit #21: guest rax=0x0000000000050014 rbx=0x0000000000000000 rcx=0x000000000
   `EptViolation` stop prints the same walk after its own line, and is
   host-tested only.
 
-## 9. What the identity map does not hide
+## 9. Hiding Aleph0's own pages
 
-Identity means the guest sees **all** physical memory up to the map's end,
-including Aleph0's own pages: its code and statics in the `.efi` image,
-the VM-exit stack, the VMXON region and VMCS, the host GDT and TSS, **and
-the EPT tables themselves**. In the run above the PML4 sits at
-`0x7eafc000`, in the same 2 MiB region as the guest pages, mapped RWX by
-the very PT Aleph0 built.
+Identity means the guest would see **all** physical memory up to the map's
+end, including Aleph0's own pages: its code and statics in the `.efi` image
+copy, the VM-exit stack, the VMXON region and VMCS, the host GDT and TSS,
+**and the EPT tables themselves**. Left RWX, a guest with kernel rights
+could scan memory and find Aleph0, rewrite the PT entry of a page to make
+it writable without any exit, or change the exit handler's code or stack
+and run its own code in VMX root operation at the next exit.
 
-So a guest that wanted to could:
-- scan memory and find Aleph0;
-- rewrite the PT entry of the data page itself, making it writable without
-  any exit;
-- change the exit handler's code or stack, and run its own code in VMX root
-  operation at the next exit.
+Issue #51 hides them. After every page Aleph0 keeps is allocated
+(`finalize_memory`, just before VMLAUNCH, so no INVEPT is needed: the CPU
+has not yet walked the tables), `TypeTables::hide` walks
+`page::resident_allocations()` and redirects each page:
 
-The tiny guest here is Aleph0's own code, so this does not matter yet. For
-an OS guest, and above all for anti-cheat, where the adversary has kernel
-rights, Aleph0's pages must be removed from the guest's view (see
-section 10).
+- a **data** page (EPT tables, VMCS, VMXON region, host GDT/TSS and page
+  tables, VM-exit stack, exit bitmaps) → a shared zero **shadow** page,
+  read-write. The guest reads zeros, and its writes land in the decoy,
+  never in Aleph0's real page.
+- a **code** page (the image copy) → its own address, read-only and
+  executable. It cannot be rewritten, but the guest can still execute it,
+  which the `ExitBootServices` event callback needs (it runs in the guest
+  from the copy, [RESIDENT.md](RESIDENT.md)).
+
+Aleph0's own accesses are untouched: the exit handler runs in root
+operation on HOST_CR3, which EPT does not translate, so it still reads and
+writes its real pages (its stack, its statics) at their real addresses. A
+2 MiB region holding a hidden page is split into a PT (one of `HIDE_PTS`
+set aside at build) and, because a redirected or read-only entry is not
+full RWX, kept a PT by `retype` (`pt_pinned`): a later MTRR write cannot
+fold it back into one RWX 2 MiB page and re-expose the page. Bring-up
+refuses to launch (`NoHidePt`, `HiddenPageOutsideMap`) rather than leave a
+page exposed. The built-in test guest, whose code, stack and data are
+Aleph0's own resident pages, skips hiding; the firmware (and an OS) run
+from their own, non-resident memory, so hiding never touches the guest.
+One exception: the in-place firmware guest runs on Aleph0's *context* GDT
+and TSS (GDTR `0x7ff80000`, TR base `0x7ff81000` on the test VM), and the
+CPU reads them through EPT on every interrupt and segment load. They stay
+visible (`ContextTables::guest_visible_tables`): with them redirected, the
+first Hyper-V run triple-faulted at exit #1, when the firmware's timer
+interrupt met a zeroed GDT. The guest may read or rewrite its own
+descriptor tables, which gives it nothing it lacks; Aleph0 itself uses the
+host GDT and TSS, which stay hidden.
+
+On Hyper-V: `242 data page(s) redirected to the EPT shadow, 152 code
+page(s) read-only, 2 region(s) split into a PT`; the firmware ran 2 minutes
+(25 million exits) with no stop, and the `ExitBootServices` harness went
+through the event's VMCALL (from the read-only copy), the forwarded VMBus
+teardown, the overwrite of every reclaimable page and its test VMCALL.
+
+EPT does not cover the GPAs Hyper-V reads or overlays for a forwarded
+access (the hypercall input/output pages and the overlay MSRs); those are
+guarded separately ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md) section 8).
+What stays open: the image copy's code and statics are read-only but still
+readable by the guest; execute-only EPT (capability bit 0) or a tiny
+visible trampoline for the callback would let the code be hidden too (see
+section 10, EPT split views).
 
 ## 10. What is not covered yet
 
-- **Hiding Aleph0's own pages** (section 9). Each of them must become not
-  present in EPT, with the access redirected or a #PF injected, or be
-  mapped to a zero-filled shadow page. Aleph0 then has to track every page
-  it allocates.
 - **EPT split views** (ROADMAP section 6): one GPA mapped to one host page
   for execution (execute-only, cap bit 0, which Hyper-V has) and to another
   for reads.
@@ -595,9 +628,6 @@ section 10).
   flush them. A performance feature, independent of EPT.
 - **INVEPT before VMXOFF**: the EPT pages are never freed, so cached
   translations of them cannot point at reused memory.
-- **Hiding the tables**: since #23 the EPT tables are
-  `RUNTIME_SERVICES_DATA`, which the OS keeps ([RESIDENT.md](RESIDENT.md)),
-  but the identity map still shows them to the guest.
 
 ## Cheat sheet
 

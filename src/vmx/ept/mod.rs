@@ -49,6 +49,15 @@
 //! [`ProtectedPage::grant_write`] makes its page writable when that page's
 //! violation arrives.
 //!
+//! Aleph0's own pages are then hidden from the guest ([`TypeTables::hide`]),
+//! so a guest with kernel rights can neither read them nor rewrite Aleph0's
+//! EPT tables or exit handler: each data page (EPT tables, VMCS, host
+//! GDT/TSS, stacks) is redirected to a shared zero page, and each code page
+//! (the image copy) kept read-only but executable, since the
+//! `ExitBootServices` callback runs in the guest from it. The region a
+//! hidden page lies in is kept a PT so a later MTRR retype cannot re-expose
+//! it ([`pt_pinned`]).
+//!
 //! Any other EPT violation, and every EPT misconfiguration, means the map
 //! is wrong: `walk.rs` follows the GPA through the tables as the CPU does,
 //! and names what the CPU refuses in each entry, so the exit handler can
@@ -71,7 +80,7 @@ use uefi::mem::memory_map::MemoryMap;
 use super::instruction::{VmxFail, vmx_asm};
 use super::msr::ControlCapability;
 use super::mtrr::{MemoryType, MtrrCapabilities, Mtrrs};
-use super::page::{PAGE_SIZE, allocate_zeroed_pages};
+use super::page::{Allocation, PAGE_SIZE, allocate_zeroed_pages};
 use super::vmcs::fields::SECONDARY_ENABLE_EPT;
 
 use self::level::{Level, Pd, Pdpt, Pml4, Pt, TableLevel};
@@ -178,6 +187,16 @@ pub enum EptError {
     RangeTooLarge { end: u64, limit: u64 },
     /// The page to protect lies outside the identity map.
     ProtectedPageOutsideMap,
+    /// A page Aleph0 keeps, to hide from the guest ([`TypeTables::hide`]),
+    /// lies outside the part of the map mapped through PDs, where it cannot
+    /// be redirected a 4 KiB page at a time. Every page Aleph0 allocates is
+    /// below the memory map's end, so this means the map is wrong.
+    HiddenPageOutsideMap { gpa: u64 },
+    /// Hiding Aleph0's pages ran out of the PTs [`Ept::build`] set aside for
+    /// it ([`HIDE_PTS`]): more 2 MiB regions hold Aleph0's pages than
+    /// expected. Raising `HIDE_PTS` fixes it; the launch is refused rather
+    /// than leaving a page of Aleph0 readable by the guest.
+    NoHidePt,
     /// UEFI could not provide the table pages.
     AllocationFailed,
     /// An EPT was already built and its protected pages published; the exit
@@ -861,6 +880,14 @@ pub fn spare_pts(mtrr: MtrrCapabilities) -> usize {
     mtrr.variable_count() + usize::from(mtrr.fixed())
 }
 
+/// How many PTs [`Ept::build`] sets aside for hiding Aleph0's own pages
+/// ([`TypeTables::hide`]): one per distinct 2 MiB region that holds a page
+/// Aleph0 keeps and is not already mapped through a PT. The test VM makes
+/// about 27 allocations in a handful of clusters, so this is generous; if a
+/// build ever needs more, `hide` refuses the launch with
+/// [`EptError::NoHidePt`] rather than leave a page exposed.
+pub const HIDE_PTS: usize = 64;
+
 /// How many 2 MiB regions of the first `pd_gibs` GiB need a PT
 /// ([`large_page_type`] is `None`): how many PTs [`fill_identity_map`]
 /// takes. At least one, for the region holding a protected page (two
@@ -947,6 +974,95 @@ fn fill_pt(pt: &mut [EptEntry<Pt>; ENTRIES], region: u64, types: &EptTypes<'_>) 
     }
 }
 
+/// What [`TypeTables::hide`] hid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Hidden {
+    /// Data pages of Aleph0 redirected to the shadow page.
+    pub data_pages: usize,
+    /// Code pages of Aleph0 (the image copy, the guest's pages) kept
+    /// read-only and executable instead of redirected.
+    pub code_pages: usize,
+    /// 2 MiB regions split into a PT to hide a page in them, taking one of
+    /// the [`HIDE_PTS`].
+    pub regions_split: usize,
+}
+
+/// The tables [`TypeTables::hide`] redirects pages in, as [`Retype`] is for
+/// retyping: the PDs and PTs, the free PTs to split a region with, the
+/// first PT's physical address, the shadow page, and the memory types for a
+/// freshly split region's other pages.
+struct Hiding<'a> {
+    pds: &'a mut [EptEntry<Pd>],
+    pts: &'a mut [[EptEntry<Pt>; ENTRIES]],
+    free: FreePts<'a>,
+    pts_address: u64,
+    shadow: u64,
+    types: EptTypes<'a>,
+}
+
+/// Hides the 4 KiB page at GPA `page` from the guest ([`TypeTables::hide`]).
+/// A data page (`code` false) is redirected to the shadow page, read-write,
+/// so the guest reaches the shadow instead of Aleph0's memory; its memory
+/// type is write-back, the shadow being RAM. A code page (`code` true) is
+/// kept at its own address, read-only and executable, so the guest can
+/// neither rewrite it nor have it modified, while the `ExitBootServices`
+/// event callback can still run from the image copy.
+///
+/// Splits the region into a PT first if it still maps as one 2 MiB page,
+/// taking a free PT and filling it as the identity map so the region's other
+/// pages keep their real mappings. The hidden entry is not full RWX, so
+/// [`retype`] keeps the region a PT (see [`pt_pinned`]).
+fn hide_page(tables: &mut Hiding<'_>, page: u64, code: bool, hidden: &mut Hidden) -> Result<(), EptError> {
+    let region_number = (page / SIZE_2M) as usize;
+    let region = region_number as u64 * SIZE_2M;
+    let pd = tables
+        .pds
+        .get_mut(region_number)
+        .ok_or(EptError::HiddenPageOutsideMap { gpa: page })?;
+    let index = match pd.mapping() {
+        RegionMapping::Pt => {
+            pt_index(*pd, tables.pts_address, tables.pts.len()).ok_or(EptError::HiddenPageOutsideMap { gpa: page })?
+        }
+        RegionMapping::LargePage(_) => {
+            let index = tables.free.take().ok_or(EptError::NoHidePt)?;
+            fill_pt(&mut tables.pts[index], region, &tables.types);
+            *pd = EptEntry::table(tables.pts_address + (index * PAGE_SIZE) as u64);
+            hidden.regions_split += 1;
+            index
+        }
+        // A 1 GiB page or an empty entry: the page is not in the part of the
+        // map mapped through PDs, which every page Aleph0 keeps is.
+        RegionMapping::HugePage(_) | RegionMapping::Invalid => {
+            return Err(EptError::HiddenPageOutsideMap { gpa: page });
+        }
+    };
+    let hidden_entry = if code {
+        EptEntry::page(page, EPT_READ | EPT_EXECUTE, tables.types.page_type(page))
+    } else {
+        EptEntry::page(tables.shadow, EPT_READ | EPT_WRITE, MemoryType::WriteBack)
+    };
+    let entry = &mut tables.pts[index][Pt::index(page)];
+    if *entry != hidden_entry {
+        *entry = hidden_entry;
+        if code {
+            hidden.code_pages += 1;
+        } else {
+            hidden.data_pages += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `pt` holds a page that is not full RWX, so its region must stay
+/// a PT: a page Aleph0 hid ([`TypeTables::hide`]) — a data page redirected
+/// to the shadow (R+W) or a code page kept read-only (R+X) — or the
+/// protected page (R only). Collapsing such a region to one 2 MiB RWX page
+/// would re-expose or re-arm the page. A region `build` or `retype` fills
+/// as the identity map has only RWX pages, so it is not pinned here.
+fn pt_pinned(pt: &[EptEntry<Pt>; ENTRIES]) -> bool {
+    pt.iter().any(|entry| entry.raw & EPT_RWX != EPT_RWX)
+}
+
 /// One EPT identity map. Its table pages are never freed: the CPU walks them
 /// on every guest access for as long as the VMCS points at them.
 pub struct Ept {
@@ -962,10 +1078,12 @@ impl Ept {
     /// Builds the identity map from the UEFI memory map, laid out for the
     /// CPU's `support` ([`MapLayout`]), with the memory types of `mtrrs` for
     /// its RAM and UC for everything else ([`EptTypes`]), each of
-    /// `protected_pages` read-only, and `spare_pts` more PTs set aside
-    /// ([`spare_pts`]). Publishes the [`ProtectedPage`]s the exit handler
-    /// needs later, and returns, with the map, the [`TypeTables`] it needs to
-    /// change memory types. Refuses a second build with
+    /// `protected_pages` read-only, `spare_pts` more PTs set aside for the
+    /// guest's MTRR writes ([`spare_pts`]) and [`HIDE_PTS`] more for hiding
+    /// Aleph0's own pages ([`TypeTables::hide`]), and a shadow page allocated
+    /// for them. Publishes the [`ProtectedPage`]s the exit handler needs
+    /// later, and returns, with the map, the [`TypeTables`] it needs to change
+    /// memory types and to hide Aleph0's pages. Refuses a second build with
     /// [`EptError::AlreadyBuilt`]: the handler keeps a fixed, small set
     /// ([`MAX_PROTECTED`]).
     ///
@@ -1006,7 +1124,15 @@ impl Ept {
         let types = EptTypes { mtrrs, ram };
 
         let split_regions = split_regions(&types, layout.pd_gibs, protected_pages);
-        let pt_count = split_regions + spare_pts;
+        // The spare PTs for the guest's MTRR writes, then [`HIDE_PTS`] more
+        // for redirecting Aleph0's own pages to the shadow ([`hide`]). Both
+        // pools are the free PTs past the `split_regions` the map uses now.
+        let pt_count = split_regions + spare_pts + HIDE_PTS;
+        // One zero-filled page the guest sees in place of every page Aleph0
+        // keeps: reads return its zeros (or another hidden page's leftovers),
+        // writes land in it and never reach Aleph0 ([`hide`]). Resident like
+        // the tables, so it too is hidden from the guest at its own GPA.
+        let shadow = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
         let pml4 = allocate_zeroed_pages(1, EptError::AllocationFailed)?.as_ptr() as u64;
         let pdpts = allocate_zeroed_pages(layout.pdpts(), EptError::AllocationFailed)?.as_ptr() as u64;
         let pds = allocate_zeroed_pages(layout.pd_gibs, EptError::AllocationFailed)?.as_ptr() as u64;
@@ -1075,6 +1201,7 @@ impl Ept {
             free,
             free_len,
             protected_regions,
+            shadow,
             ram: ram.ranges().as_ptr(),
             ram_len: ram.ranges().len(),
             eptp: ept.eptp,
@@ -1162,6 +1289,11 @@ pub struct TypeTables {
     /// The 2 MiB regions holding the protected pages, which keep their PTs;
     /// unused slots hold a region index no map has ([`Ept::build`]).
     protected_regions: [usize; MAX_PROTECTED],
+    /// The shared zero page Aleph0's data pages are redirected to
+    /// ([`hide`]), or 0 before [`hide`] runs. The redirect (and a read-only
+    /// code page) is not full RWX, so [`retype`] pins its region as a PT
+    /// ([`pt_pinned`]) and never collapses it to re-expose the real page.
+    shadow: u64,
     /// The ranges of the [`RamMap`] `build` gathered: `ram_len` of them.
     ram: *const (u64, u64),
     ram_len: usize,
@@ -1217,6 +1349,75 @@ impl TypeTables {
             unsafe { invalidate(self.invept, self.eptp) }?;
         }
         Ok(retyped)
+    }
+
+    /// Hides every page in `allocations` that Aleph0 keeps — all but the
+    /// shadow page itself and the pages in `visible` — from the guest: each
+    /// one's EPT entry is redirected to the shared zero page, read-write, so
+    /// the guest can neither read Aleph0's memory (code, stacks, VMXON
+    /// region, VMCS, host GDT/TSS, the EPT tables) nor rewrite it. A 2 MiB
+    /// region that still maps as one page is split into a PT first, taking
+    /// one of the [`HIDE_PTS`] `build` set aside; the redirect then keeps
+    /// that region a PT, so [`retype`] never collapses it back (it is not
+    /// full RWX, see [`pt_pinned`]). `mtrrs` gives a freshly split PT its
+    /// pages' memory types.
+    ///
+    /// `visible` names Aleph0 pages the guest's own hardware reads through
+    /// EPT and so must keep seeing: the in-place firmware guest runs on
+    /// Aleph0's context GDT and TSS, which the CPU walks on every interrupt
+    /// and segment load. Redirecting them to the shadow would feed the CPU a
+    /// zeroed descriptor table and triple-fault the guest. They stay
+    /// identity-mapped; the guest may read or rewrite its own descriptor
+    /// tables, which grants it nothing it does not already have.
+    ///
+    /// Runs once, before the first VMLAUNCH, so it needs no INVEPT: the CPU
+    /// has not yet walked these tables, so nothing is cached. Returns what
+    /// it hid, or [`EptError::NoHidePt`] if the pool was too small, in which
+    /// case the caller must refuse to launch.
+    ///
+    /// # Safety
+    ///
+    /// Single-threaded context with [`Ept::build`]'s tables in place, the
+    /// guest not running and the CPU not yet having walked the EPT, so these
+    /// slices are not aliased and no translation is stale.
+    pub unsafe fn hide(
+        &mut self,
+        allocations: impl Iterator<Item = Allocation>,
+        mtrrs: &Mtrrs,
+        visible: &[Allocation],
+    ) -> Result<Hidden, EptError> {
+        debug_assert!(self.shadow != 0, "the shadow page was not allocated");
+        // SAFETY: as `apply`: the PDs, PTs, free stack and RAM ranges
+        // `build` allocated, exclusive here while the guest is stopped.
+        let mut tables = unsafe {
+            Hiding {
+                pds: core::slice::from_raw_parts_mut(self.pds, self.regions),
+                pts: core::slice::from_raw_parts_mut(self.pts.cast::<[EptEntry<Pt>; ENTRIES]>(), self.pt_count),
+                free: FreePts {
+                    stack: core::slice::from_raw_parts_mut(self.free, self.pt_count),
+                    len: &mut self.free_len,
+                },
+                pts_address: self.pts_address,
+                shadow: self.shadow,
+                types: EptTypes {
+                    mtrrs,
+                    ram: RamMap {
+                        ranges: core::slice::from_raw_parts(self.ram, self.ram_len),
+                    },
+                },
+            }
+        };
+        let mut hidden = Hidden::default();
+        for allocation in allocations {
+            for i in 0..allocation.pages {
+                let page = allocation.address + (i * PAGE_SIZE) as u64;
+                if page == self.shadow || visible.iter().any(|v| v.contains(page)) {
+                    continue;
+                }
+                hide_page(&mut tables, page, allocation.code, &mut hidden)?;
+            }
+        }
+        Ok(hidden)
     }
 
     /// The INVEPT type [`apply`](Self::apply) uses.
@@ -1454,7 +1655,14 @@ fn retype(tables: &mut Retype<'_>, types: &EptTypes<'_>) -> Retyped {
     for (i, entry) in tables.pds.iter_mut().enumerate() {
         let region = i as u64 * SIZE_2M;
         let pt = pt_index(*entry, tables.pts_address, tables.pts.len());
-        let changed = match (entry.mapping(), wanted(i)) {
+        // A region whose PT holds a page Aleph0 hid (not full RWX) stays a
+        // PT: collapsing it to a 2 MiB RWX page would re-expose that page.
+        let want = if pt.and_then(|index| tables.pts.get(index)).is_some_and(pt_pinned) {
+            None
+        } else {
+            wanted(i)
+        };
+        let changed = match (entry.mapping(), want) {
             (RegionMapping::LargePage(current), Some(memory_type)) => {
                 let change = current != memory_type;
                 if change {

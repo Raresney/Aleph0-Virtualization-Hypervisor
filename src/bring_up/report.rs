@@ -8,7 +8,7 @@ use uefi::boot::MemoryType;
 use super::PassthroughState;
 use crate::vmx;
 use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
-use crate::vmx::ept::{Ept, EptSupport, TypeTables, WalkEnd};
+use crate::vmx::ept::{Ept, EptSupport, Hidden, TypeTables, WalkEnd};
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::{GuestEntry, GuestState};
@@ -200,11 +200,22 @@ pub(super) fn host_environment(host: &HostEnvironment, firmware_cr3: u64) {
 /// Prints one resident allocation with the type the memory map gives it
 /// (`None`: no region holds it).
 pub(super) fn resident_allocation(allocation: Allocation, memory_type: Option<MemoryType>) {
-    let Allocation { address, pages } = allocation;
+    let Allocation { address, pages, .. } = allocation;
     match memory_type {
         Some(memory_type) => log!("Resident allocation at {address:#018x}: {pages} page(s), {memory_type:?}."),
         None => log!("Resident allocation at {address:#018x}: {pages} page(s), in no memory-map region."),
     }
+}
+
+/// Prints how many of Aleph0's own pages EPT now hides from the guest.
+pub(super) fn hidden(hidden: Hidden) {
+    log!(
+        "Aleph0 pages hidden from the guest: {} data page(s) redirected to the EPT shadow, \
+         {} code page(s) read-only, {} region(s) split into a PT.",
+        hidden.data_pages,
+        hidden.code_pages,
+        hidden.regions_split,
+    );
 }
 
 /// Prints how the current page tables, which the guest will share, map the
