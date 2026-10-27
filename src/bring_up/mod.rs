@@ -135,6 +135,28 @@ struct ContextTables {
     firmware_gdtr: DescriptorTable,
 }
 
+impl ContextTables {
+    /// The GDT and TSS pages, which the in-place firmware guest runs on and
+    /// the CPU reads through EPT, so hiding must keep them visible
+    /// ([`TypeTables::hide`]). The TSS is a single 64-bit TSS (one page); the
+    /// GDT spans its base through its limit.
+    fn guest_visible_tables(&self) -> [page::Allocation; 2] {
+        let pages = |base: u64, bytes: u64| {
+            let start = base & !(page::PAGE_SIZE as u64 - 1);
+            page::Allocation {
+                address: start,
+                pages: (base + bytes - start).div_ceil(page::PAGE_SIZE as u64) as usize,
+                code: false,
+            }
+        };
+        [
+            pages(self.gdtr.base, u64::from(self.gdtr.limit) + 1),
+            // The TSS is one page, allocated page-aligned (`TssRegion`).
+            pages(self.tss_base, page::PAGE_SIZE as u64),
+        ]
+    }
+}
+
 // The CPU uses these pages while `run` is in progress, and some of them after
 // it returns: the TSS through TR, and the VMXON region and VMCS if VMXOFF
 // failed. Freeing them on drop would hand memory the CPU still uses back to
@@ -198,6 +220,8 @@ pub fn run() -> Result<GuestRun, BringUpError> {
         controls,
         firmware,
         vmx_operation,
+        mtrrs,
+        types,
     } = entry;
 
     // From here on every path goes through teardown before returning.
@@ -205,7 +229,11 @@ pub fn run() -> Result<GuestRun, BringUpError> {
     // operation; outside it the VMCS instructions would raise #UD.
     let vmcs = unsafe { VmcsRegion::create_current() }.map_err(vmcs_step("creation"));
     let result = match &vmcs {
-        Ok(_) => launch_guest(&controls, &vmexit_stack, &guest, &ept, &host, &bitmaps, &context_tables),
+        // Every page Aleph0 keeps is now allocated: finalize the memory
+        // (check it is resident, hide it from the guest, publish the type
+        // tables), then launch.
+        Ok(_) => finalize_memory(mtrrs, types, &context_tables)
+            .and_then(|()| launch_guest(&controls, &vmexit_stack, &guest, &ept, &host, &bitmaps, &context_tables)),
         Err(error) => Err(*error),
     };
     // This already runs as the guest: the firmware gets the CPU back
@@ -237,6 +265,10 @@ struct VmxEntry {
     controls: VmcsControlMsrs,
     firmware: FirmwareState,
     vmx_operation: VmxOperation,
+    /// The guest's MTRRs and the EPT type tables, published to the exit
+    /// handler in `launch_guest` after `hide` runs.
+    mtrrs: MtrrState,
+    types: TypeTables,
 }
 
 /// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack and the guest's
@@ -251,10 +283,11 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         vmexit_stack.top()
     );
 
-    // shortcut: the firmware guest gets the test guest's pages too, since
-    // `Ept::build` protects their data page, and they are resident so that no
-    // OS writes it; drop them once EPT protects a list of pages (hiding
-    // Aleph0's pages, ROADMAP section 5).
+    // shortcut: the firmware guest gets the test guest's pages too, to give
+    // `Ept::build` a page to protect; they are resident, and `finalize_memory`
+    // now hides them from the guest (code read-only, data to the shadow) like
+    // the rest of Aleph0, so no OS reaches them. Drop them once `Ept::build`
+    // no longer needs a protected page of its own.
     let guest = GuestMemory::allocate()?;
     log!(
         "Guest memory allocated: code={:#018x} ({} bytes copied) stack top={:#018x}.",
@@ -305,7 +338,10 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
 
     let bitmaps = ExitBitmaps::allocate()?;
     report::exit_bitmaps(&bitmaps, capabilities);
-    vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
+    // `mtrrs` and `types` are published to the exit handler only in
+    // `launch_guest`, once every page Aleph0 keeps is allocated and `hide`
+    // has redirected them to the shadow: no exit, which is the only reader,
+    // happens before VMLAUNCH.
     let hyperv = vmx::hyperv::Detection::read();
     report::hyperv(&hyperv);
     vmx::hyperv::publish(hyperv.offers_interface());
@@ -339,6 +375,8 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         controls,
         firmware,
         vmx_operation,
+        mtrrs,
+        types,
     })
 }
 
@@ -455,7 +493,6 @@ fn launch_guest(
             idtr: context_tables.idtr,
         },
     };
-    check_resident_memory()?;
     prepare_vmcs(controls, vmexit_stack, ept, host, bitmaps, kind, entry)?;
     check_context_tables_preserved(context_tables)?;
 
@@ -463,6 +500,29 @@ fn launch_guest(
         GuestKind::BuiltInTest => run_test_guest(vmexit_stack),
         GuestKind::Firmware => virtualize_firmware(),
     }
+}
+
+/// With every page Aleph0 keeps now allocated: checks they all lie in
+/// memory the OS preserves ([`check_resident_memory`]), hides them from the
+/// guest in EPT ([`hide_resident_memory`]), and hands the guest's MTRRs and
+/// the type tables to the exit handler (`publish_guest_mtrrs`). The last
+/// step before the launch; no exit, the only reader, has happened yet.
+fn finalize_memory(
+    mtrrs: MtrrState,
+    mut types: TypeTables,
+    context_tables: &ContextTables,
+) -> Result<(), BringUpError> {
+    check_resident_memory()?;
+    // The built-in test guest runs from Aleph0's own resident pages (its
+    // code, stack, IDT and data are `GuestMemory`), so hiding them would
+    // hide the guest from itself; it tests the exit machinery, not hiding.
+    // The firmware, and an OS, run from their own memory, which is not
+    // resident, so hiding Aleph0's pages never touches the guest.
+    if !matches!(GuestKind::SELECTED, GuestKind::BuiltInTest) {
+        hide_resident_memory(&mut types, mtrrs.mtrrs(), context_tables)?;
+    }
+    vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
+    Ok(())
 }
 
 /// Checks, in the UEFI memory map, that every resident allocation
@@ -498,6 +558,29 @@ fn check_resident_memory() -> Result<(), BringUpError> {
         }
         unlisted => Err(BringUpError::ResidentAllocationsUnlisted(unlisted)),
     }
+}
+
+/// Redirects every page Aleph0 keeps to the EPT shadow page, so the guest
+/// can neither read Aleph0's memory nor rewrite its EPT or exit handler
+/// ([`TypeTables::hide`]). Runs after [`check_resident_memory`], which has
+/// already confirmed the allocation list is complete (no unlisted
+/// allocation, which would leave a page exposed), and before VMLAUNCH.
+///
+/// The in-place firmware guest runs on Aleph0's context GDT and TSS, which
+/// the CPU reads through EPT on every interrupt and segment load, so those
+/// pages are kept visible: hiding them would feed the CPU a zeroed
+/// descriptor table and triple-fault the guest.
+fn hide_resident_memory(
+    types: &mut TypeTables,
+    mtrrs: &vmx::mtrr::Mtrrs,
+    context_tables: &ContextTables,
+) -> Result<(), BringUpError> {
+    let visible = context_tables.guest_visible_tables();
+    // SAFETY: still single-threaded with the guest not launched, so the CPU
+    // has not walked the EPT and `build`'s tables are not aliased.
+    let hidden = unsafe { types.hide(page::resident_allocations(), mtrrs, &visible) }?;
+    report::hidden(hidden);
+    Ok(())
 }
 
 /// Creates the `ExitBootServices` event, then launches the firmware in

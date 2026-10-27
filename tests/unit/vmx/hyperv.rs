@@ -144,3 +144,25 @@ fn the_recovery_points_sit_on_the_instructions() {
     assert_eq!(rdmsr, [0x0F, 0x32]);
     assert_eq!(wrmsr, [0x0F, 0x30]);
 }
+
+#[test]
+fn an_overlay_msr_write_names_the_page_it_overlays() {
+    // Enable bit set: the GPA is bits 63:12 of the value, page-aligned.
+    assert_eq!(overlay_gpa(0x4000_0001, 0x7f60_b001), Some(0x7f60_b000));
+    assert_eq!(overlay_gpa(0x4000_0083, 0x1_2345_6001), Some(0x1_2345_6000));
+    // Enable bit clear: the write disables the overlay, so no GPA to guard.
+    assert_eq!(overlay_gpa(0x4000_0001, 0x7f60_b000), None);
+    // An MSR that overlays nothing (a synthetic timer): never a GPA.
+    assert_eq!(overlay_gpa(0x4000_00b0, 0x7f60_b001), None);
+}
+
+#[test]
+fn a_non_fast_hypercall_names_its_input_and_output_pages() {
+    // Call code 0x5c, not fast (bit 16 clear): RDX and R8 are GPAs.
+    assert_eq!(
+        hypercall_gpas(0x005c, 0x1000_0040, 0x2000_0080),
+        [Some(0x1000_0000), Some(0x2000_0000)]
+    );
+    // Fast (bit 16 set): the data is in registers, not at GPAs.
+    assert_eq!(hypercall_gpas(0x1_005c, 0x1000_0040, 0x2000_0080), [None, None]);
+}

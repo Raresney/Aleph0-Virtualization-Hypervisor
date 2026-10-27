@@ -360,17 +360,19 @@ directory of its own; it is not part of the repository.
 - **Isolation.** The forwarded MSRs and hypercalls act on Aleph0's own
   virtual processor: the guest can set its VP assist page, its SynIC or the
   partition's reset MSR, as it could without Aleph0. Keeping the guest from
-  Hyper-V's state of Aleph0's processor comes after the first boot, with
-  hiding Aleph0's pages.
-- **Guest addresses Hyper-V acts on, past EPT.** A hypercall's output page
-  (R8) and the overlay MSRs (`0x40000001` the hypercall page, the SynIC's
-  message and event pages, the VP assist page) name GPAs that Hyper-V
-  writes or overlays in Aleph0's own address space, where EPT does not
-  apply. A guest that writes `0x40000001` with the address of Aleph0's exit
-  handler and the enable bit gets Hyper-V's hypercall code laid over it.
-  Today the identity map already lets the guest write Aleph0's pages, so
-  this opens nothing new; before Aleph0 hides its pages, these GPAs must be
-  checked against its resident allocations and refused with #GP.
+  Hyper-V's state of Aleph0's processor comes after the first boot.
+- **Guest addresses Hyper-V acts on, past EPT.** A hypercall's input and
+  output pages (RDX, R8 for a non-fast call) and the overlay MSRs
+  (`0x40000001` the hypercall page, `0x40000021` the reference TSC page,
+  `0x40000073` the VP assist page, `0x40000083`/`0x40000084` the SynIC's
+  message and event pages) name GPAs that Hyper-V reads, writes or overlays
+  in Aleph0's own address space, where EPT does not apply. A guest that
+  writes `0x40000001` with the address of Aleph0's exit handler and the
+  enable bit would get Hyper-V's hypercall code laid over it. Issue #51 now
+  checks each such GPA against Aleph0's resident allocations
+  (`hyperv::hypercall_gpas`, `hyperv::overlay_gpa`, `page::is_resident`) and
+  refuses it with #GP at the guest's instruction, instead of forwarding, so
+  the guest cannot aim Hyper-V at Aleph0's pages even once they are hidden.
 - **Whether Linux boots on the forwarded interface:** #28. The harness of
   #23 now gets through `ExitBootServices`, during which the firmware's
   VMBus drivers post a message (`0x5c`), zero the synthetic timers and mask

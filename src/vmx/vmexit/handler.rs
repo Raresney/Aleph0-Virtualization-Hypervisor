@@ -40,6 +40,7 @@ use crate::vmx::hyperv::{self, HypercallRegisters};
 use crate::vmx::instruction::VmxFail;
 use crate::vmx::msr;
 use crate::vmx::mtrr::MtrrMsr;
+use crate::vmx::page;
 use crate::vmx::vmcs::fields::{
     EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, GUEST_SS_ACCESS_RIGHTS,
     IDT_VECTORING_ERROR_CODE, IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN,
@@ -550,6 +551,16 @@ impl EmulationOutcome {
     }
 }
 
+/// Whether the hypercall with input value `input` names a page of Aleph0's
+/// own memory as its input or output ([`hyperv::hypercall_gpas`]), which
+/// Hyper-V would read or write past EPT, so the forwarder must refuse it.
+fn hypercall_names_aleph0(input: u64, frame: &RegisterFrame) -> bool {
+    hyperv::hypercall_gpas(input, frame.rdx, frame.r8)
+        .into_iter()
+        .flatten()
+        .any(page::is_resident)
+}
+
 /// Executes `emulation` in root operation and writes its result into the
 /// guest's registers in `frame`. Only an access to the guest's MTRRs can
 /// fail; one Hyper-V refuses comes back as [`EmulationOutcome::Refused`],
@@ -641,6 +652,16 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
             }
             EmulationOutcome::Out { port, size, value }
         }
+        Emulation::Hypercall { input } if hypercall_names_aleph0(input, frame) => {
+            // The hypercall names an Aleph0 page as its input or output: Hyper-V
+            // would read or write Aleph0's own memory past EPT (HYPERV_INTERFACE.md
+            // section 8). Refuse it as Hyper-V refuses a bad hypercall, with #GP
+            // at the guest's VMCALL, instead of forwarding.
+            EmulationOutcome::Refused {
+                emulation,
+                exception: InterruptionInfo::GENERAL_PROTECTION,
+            }
+        }
         Emulation::Hypercall { input } => {
             let mut registers = HypercallRegisters {
                 rcx: input,
@@ -683,6 +704,15 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
                     emulation,
                     exception: InterruptionInfo::GENERAL_PROTECTION,
                 },
+            }
+        }
+        Emulation::SyntheticWrite { msr, value } if hyperv::overlay_gpa(msr, value).is_some_and(page::is_resident) => {
+            // The guest asks Hyper-V to overlay one of its pages at a GPA that
+            // falls in Aleph0's own memory (HYPERV_INTERFACE.md section 8):
+            // refuse with #GP at the guest's WRMSR instead of forwarding.
+            EmulationOutcome::Refused {
+                emulation,
+                exception: InterruptionInfo::GENERAL_PROTECTION,
             }
         }
         Emulation::SyntheticWrite { msr, value } => {
